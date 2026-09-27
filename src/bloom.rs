@@ -1,0 +1,90 @@
+use crate::{codec::*, error::corrupt, Result};
+
+pub(crate) struct Bloom {
+    bits: Vec<u8>,
+    probes: u32,
+}
+// Stable, versioned hashing: the on-disk format never depends on RandomState.
+fn hash(key: &[u8]) -> (u64, u64) {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in key {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    (h, h.rotate_left(31).wrapping_mul(0xc4ceb9fe1a85ec53) | 1)
+}
+impl Bloom {
+    pub fn new(count: u64, bits_per_key: usize) -> Self {
+        // Capping filter size changes only false-positive rate, never correctness.
+        let bytes = (count.saturating_mul(bits_per_key as u64).div_ceil(8))
+            .clamp(8, 8 * 1024 * 1024) as usize;
+        Self {
+            bits: vec![0; bytes],
+            probes: ((bits_per_key as f64 * 0.69) as u32).clamp(1, 20),
+        }
+    }
+    pub fn insert(&mut self, key: &[u8]) {
+        let (mut h, delta) = hash(key);
+        let n = self.bits.len() as u64 * 8;
+        for _ in 0..self.probes {
+            let bit = (h % n) as usize;
+            self.bits[bit / 8] |= 1 << (bit % 8);
+            h = h.wrapping_add(delta);
+        }
+    }
+    pub fn contains(&self, key: &[u8]) -> bool {
+        let (mut h, delta) = hash(key);
+        let n = self.bits.len() as u64 * 8;
+        for _ in 0..self.probes {
+            let bit = (h % n) as usize;
+            if self.bits[bit / 8] & (1 << (bit % 8)) == 0 {
+                return false;
+            }
+            h = h.wrapping_add(delta);
+        }
+        true
+    }
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        put_u32(out, self.probes);
+        put_u32(out, self.bits.len() as u32);
+        out.extend(&self.bits);
+    }
+    pub fn decode(c: &mut Cursor<'_>) -> Result<Self> {
+        let probes = c.u32()?;
+        let len = c.u32()? as usize;
+        if !(1..=20).contains(&probes) || !(8..=8 * 1024 * 1024).contains(&len) {
+            return Err(corrupt("invalid Bloom filter"));
+        }
+        Ok(Self {
+            bits: c.take(len)?.to_vec(),
+            probes,
+        })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn no_false_negatives_and_bounded_false_positives() {
+        let mut b = Bloom::new(10000, 10);
+        for i in 0u64..10000 {
+            b.insert(&i.to_le_bytes());
+        }
+        for i in 0u64..10000 {
+            assert!(b.contains(&i.to_le_bytes()));
+        }
+        let fp = (10000u64..20000)
+            .filter(|i| b.contains(&i.to_le_bytes()))
+            .count();
+        assert!(fp < 300, "false positives: {fp}");
+        let mut bytes = vec![];
+        b.encode(&mut bytes);
+        let round = Bloom::decode(&mut Cursor { b: &bytes }).unwrap();
+        for i in 0u64..10000 {
+            assert!(round.contains(&i.to_le_bytes()));
+        }
+    }
+}
