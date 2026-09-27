@@ -1,49 +1,56 @@
-# Validation record
+# Tests
 
-Local validation date: 2026-09-27. Rust 1.98.1, Linux x86_64, container overlayfs. Tests use actual filesystem operations and real subprocess termination. Source forbids unsafe Rust; dependencies may contain their own unsafe implementations.
+Run the regular suite:
 
-## Commands and observed results
+```bash
+cargo test --locked --all-features
+cargo test --locked --release --all-features
+```
 
-| Check | Result |
-|---|---|
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed without warnings |
-| `cargo test --locked --all-features` | 34 tests/doctests passed; one extended stress test intentionally excluded |
-| `cargo test --locked --release --all-features -- --include-ignored` | 35 tests/doctests, including five-million-write stress |
-| Crash and linearizability integration suites repeated 25 times | All repetitions passed |
-| `cargo run --locked --release --example bench_report` | Executed; recorded CSV and p50/p99 |
-| `cargo bench --locked --bench engine` | All three workloads executed |
+Run the five-million-write test:
 
-GitHub Actions defines independent Linux/macOS checks. A workflow definition is not evidence of a passing remote run; consult the linked PR/Actions results for the current commit. The recorded local run covers Linux only.
+```bash
+cargo test --locked --release --all-features --test stress -- --ignored --nocapture
+```
 
 ## Coverage
 
-| Area | Independent behavior exercised |
+| File | Checks |
 |---|---|
-| API | Missing keys; empty/binary keys and values; overwrites; repeated deletion; reinsert after deletion; volatile mode; shared clones |
-| Limits | Invalid options, maximum key/value boundaries, a 1 MiB value spanning ordinary block/memory thresholds |
-| Persistence | Repeated reopen, WAL-only recovery, multiple flushed generations, value/tombstone resolution, sequence continuity after empty compaction |
-| Model comparison | 100,000 mixed operations against an independent ordered map, with full comparisons and compact/reopen every 2,000 operations; five more fixed seeds × 10,000 operations |
-| Concurrency | Ten writers + ten readers; overlapping hot-key writes/deletes; concurrent manual flush/compact; recovery comparison after join |
-| Linearizability | 60 histories per run, three threads × four overlapping operations on one key; exhaustive model search respects call/return real-time precedence |
-| Memory/backpressure | Bounded active/frozen accounting under 5,000 writes and WAL reclamation after a flush barrier |
-| Compaction | Deduplication, deletion without resurrection, empty run reopen, continuous overwrite acceptance |
-| Bloom/cache | No Bloom false negatives in deterministic set; bounded false positives; 5,000 absent probes skip most reads; warm block reuse; cache budget and disabled cache |
-| Corruption | Every byte flipped in a small complete WAL, manifest, and SST fixture; every truncation of a small SST; missing referenced SST and manifest; 1,000 checksum-valid malformed WAL payloads; oversized frame length |
-| Torn writes | Every truncation offset in the final WAL record; recovery followed by further writes/reopen; incomplete new-generation headers; nonfinal torn WAL rejected |
-| Process crashes | Twelve WAL/flush publication boundaries; eight compaction boundaries; eight actual SIGKILL trials while writes/flush/compaction run |
-| I/O faults | Seven injected write/sync/publication/cleanup failures; engine halts; acknowledged prior data survives reopen |
-| Ownership/lifecycle | Same-process clone lifetime lock; cross-process exclusive open; lock cleanup after crashes and last drop |
-| Extended acceptance | 100 keys × 50,000 synced overwrites = 5,000,000 writes; compact to exactly 100 records; reopen and verify final generation; delete all, compact to zero, reopen |
+| `src/memtable.rs`, `src/bloom.rs` | Memory accounting, tombstones, Bloom filter membership and false positives |
+| `tests/engine.rs` | API, reopen, limits, shared handles, cache, background flush, compaction, directory locks |
+| `tests/corruption.rs` | Byte flips, truncation, malformed records, missing files, torn WAL recovery |
+| `tests/crash.rs` | Process kills, crash points during publication, I/O errors, cross-process locking |
+| `tests/linearizability.rs` | Concurrent histories checked against a sequential model |
+| `tests/stress.rs` | Five million synced writes, compaction, reopen, deletion, and another reopen |
 
-The 25-run repeat batch exercised 1,500 concurrent histories, 200 SIGKILL trials, 500 named crash-boundary cases, and 175 injected I/O-error cases. It was added to investigate an intermittent immediate-reopen lock failure during parallel child-process creation. Explicitly unlocking at final engine teardown fixed the observed issue; the repeated batch did not reproduce it.
+The model tests run 100,000 mixed operations plus five 10,000-operation seeds against a `BTreeMap`. They compare values after compaction and reopening.
 
-## Fault injection
+Concurrency tests use ten writers and ten readers, contended keys, and concurrent flush/compact calls. The history checker tries valid sequential orders for 60 histories of 12 operations each, preserving call/return ordering.
 
-Compile with `--features fault-injection` to enable named hooks in `fault.rs`. `KV_FAILPOINT` selects the stage; default action exits the process with code 86 without Rust destructors. `KV_FAIL_ACTION=error` instead injects an I/O error. Integration tests set these variables only inside isolated subprocesses after opening the database, so parallel tests do not share global injection state.
+Corruption tests flip every byte in small WAL, manifest, and SST fixtures; truncate the SST at every offset; and try 1,000 checksum-valid malformed WAL records. Torn-tail tests cut the final WAL record at every offset, recover, write again, and reopen.
 
-The SIGKILL test reads acknowledgements from the child only after `put` returns. Every acknowledged key must survive; extra unacknowledged keys are permitted by the durability contract. No graceful drop/close is used to simulate a crash.
+## Crash tests
 
-## Limits of the evidence
+`fault-injection` enables the `crash_worker` binary. Tests set these variables in child processes:
 
-Passing tests are evidence for the exercised cases, not a proof of arbitrary executions or production readiness. SIGKILL retains the OS cache and does not emulate power failure or every torn-sector/write-reordering behavior. Actual durability depends on the filesystem and hardware honoring sync/rename ordering. Injected errors do not emulate all possible ENOSPC/device behaviors. Checksums detect corruption but do not repair it; backups remain necessary for media loss. Physical-media power-cut testing, long-duration soak tests on deployment hardware, and scalable multi-level compaction are not included.
+| Variable | Effect |
+|---|---|
+| `KV_FAILPOINT` | Select a named hook in the write or maintenance path |
+| `KV_FAIL_ACTION=error` | Return an I/O error instead of exiting |
+
+The default action exits with code 86 without running destructors. The suite covers 12 WAL/flush crash points, eight compaction crash points, and seven I/O errors.
+
+The SIGKILL test kills a writer during writes, flushes, and compaction in eight trials. Acknowledgements are printed only after `put()` succeeds. Recovery must retain every acknowledged write; unacknowledged writes may also be present.
+
+## Recorded runs
+
+2026-09-27, Rust 1.98.1:
+
+- Linux container: 34 regular tests/doctests passed; 35 with the stress test included.
+- Crash and history suites: 25 consecutive runs passed, covering 1,500 histories, 200 SIGKILL trials, 500 crash points, and 175 injected I/O errors.
+- [GitHub CI](https://github.com/Parkryan0128/rust-kv-storage-engine/actions/runs/36337265086): Linux x86_64 and macOS ARM64 passed formatting, Clippy, debug/release tests, and benchmark compilation.
+
+The repeat run followed a lock-release fix: a concurrently forked child could briefly retain the database file lock. `Disk::drop` now unlocks it explicitly.
+
+SIGKILL leaves the OS cache intact. Power loss, torn sectors, and device write reordering have not been tested. I/O injection covers named hooks, not every possible filesystem failure.

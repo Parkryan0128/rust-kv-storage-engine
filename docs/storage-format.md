@@ -1,4 +1,4 @@
-# Storage format and recovery protocol
+# Storage format
 
 All numeric fields use little-endian encoding. Keys are sorted lexicographically by unsigned byte value. File names are canonical 20-digit nonzero decimal IDs; one monotonic allocator serves both WALs and SSTables.
 
@@ -72,6 +72,32 @@ If interrupted before manifest publication, old files and WALs remain sufficient
 
 Manifest writes, flushes, and compactions are serialized. Foreground writes use a separate mutex; they do not hold the state write lock across WAL I/O. Full-run compaction is prioritized at its threshold so a continuous flush workload cannot starve merging. The frozen-table limit applies backpressure when the worker lags.
 
-## Failure semantics
+## Recovery notes
 
-An error around sync or manifest publication can occur after the operation is durable. The engine therefore halts after write/maintenance I/O failure and requires recovery, rather than attempting to roll back an uncertain filesystem outcome. Automatic recovery does not repair checksum-corrupt committed data; keep backups for media failure. Tests distinguish process crashes from power-loss guarantees of the underlying filesystem/hardware.
+- An error during sync or manifest publication can leave the operation on disk. Failed writes may appear after recovery.
+- Write or maintenance I/O errors halt the engine. Drop all handles and reopen it to recover.
+- Read corruption returns an error. Recovery does not repair checksum-corrupt data.
+- File and directory sync, and atomic rename, must be supported by the local filesystem. Network filesystems are unsupported; physical power loss has not been tested.
+- Keep `LOCK` in place while the database is open. Do not use inherited engine handles after `fork()`.
+- Format version `01` has no migration path yet.
+
+## Runtime options
+
+Pass an `Options` value to `Engine::open_with_options()`.
+
+| Option | Default | Use |
+|---|---:|---|
+| `memtable_size_limit` | 4 MiB | Rotate when accounted memory or WAL bytes reach this size |
+| `max_immutable_memtables` | 2 | Pause writers when the frozen queue is full |
+| `block_size` | 16 KiB | Target block size; one larger record is allowed |
+| `block_cache_capacity` | 8 MiB | Cache budget; zero disables it |
+| `bloom_filter_bits_per_key` | 10 | Filter bits per key; range 1–30 |
+| `compaction_file_threshold` | 4 | Merge all SSTs at this count; minimum 2 |
+| `max_key_size` | 1 MiB | Maximum key length |
+| `max_value_size` | 16 MiB | Maximum value length |
+
+Key/value limits plus the 17-byte record header must fit within 32 MiB. Block targets range from 64 bytes to 32 MiB. Bloom filters are capped at 8 MiB per table; metadata frames at 64 MiB.
+
+Memory accounting allows one oversized record per memtable. Indexes, filters, merge buffers, allocator overhead, and values held by callers are separate from the memtable/cache budgets.
+
+`stats()` reports sequence, memory usage, frozen-table count, SST files/records, block reads, cache hits, and Bloom negatives. SST record counts include duplicates and tombstones before compaction. Block reads count engine calls, including reads served by the OS cache.
