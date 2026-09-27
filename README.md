@@ -1,313 +1,116 @@
 # rust-kv-storage-engine
 
-An embedded LSM-tree key-value storage engine built from scratch in Rust.
+An embedded LSM-tree key-value storage engine built from scratch in Rust, with synchronous write durability, background flushing and compaction, checksummed storage, Bloom filters, and a bounded block cache.
 
-**Stack:** Rust · POSIX filesystem · single- or multi-threaded I/O  
-**Status:** Pre-Milestone 1 (not yet initialized — `cargo init` pending)
+**Status:** Milestones 1–6 implemented. The repository includes model-based, concurrent, corruption, subprocess-crash, and extended stress tests, plus executable benchmarks. This is a small single-node storage engine; see the explicit guarantees and limits below.
 
----
+## Quick start
 
-## Overview
+```rust
+use rust_kv_storage_engine::Engine;
 
-This project implements a durable, concurrent KV store using the log-structured merge-tree (LSM-tree) pattern. Writes are buffered in memory, persisted to a write-ahead log (WAL), flushed to immutable on-disk tables (SSTables), and periodically compacted to reclaim space and control read amplification.
-
-### High-Level Data Flow
-
-```
-put / delete
-    │
-    ▼
-┌─────────┐     fsync      ┌─────────┐
-│   WAL   │ ─────────────► │  disk   │
-└─────────┘                └─────────┘
-    │
-    ▼
-┌─────────────┐  threshold   ┌──────────────────┐  background   ┌─────────┐
-│  MemTable   │ ───────────► │ ImmutableMemTable │ ────────────► │  .sst   │
-│  (active)   │              │   (frozen)        │               │  files  │
-└─────────────┘              └──────────────────┘               └─────────┘
-    ▲                                                                  │
-    │                              compaction                          │
-    └──────────────── merge / dedup / tombstone GC ◄───────────────────┘
-
-get: MemTable → ImmutableMemTable(s) → SSTables (newest → oldest) → Bloom filter → block cache
+fn main() -> rust_kv_storage_engine::Result<()> {
+    let db = Engine::open("./data")?;
+    db.put(b"name", b"Ryan")?; // WAL sync completes before success
+    assert_eq!(db.get(b"name")?.as_deref(), Some(&b"Ryan"[..]));
+    db.delete(b"name")?;
+    db.flush()?;              // optional: wait for SST coverage of preceding writes
+    db.compact()?;            // optional: flush, merge, deduplicate, collect tombstones
+    Ok(())
+}
 ```
 
-### Milestone Dependency Order
+`Engine::new()` remains available as a **volatile, in-memory** engine. Use `Engine::open(path)` or `Engine::open_with_options(path, options)` for persistence. Keys and values are arbitrary bytes, including empty bytes, within configured size limits. A missing key and a deleted key both return `Ok(None)` to callers; the internal read path distinguishes them.
 
-| # | Milestone | Depends On |
-|---|-----------|------------|
-| 1 | In-Memory Engine & Synchronization | — |
-| 2 | Durability & Crash Recovery (WAL) | 1 |
-| 3 | Memory Flushing & SSTable Creation | 1, 2 |
-| 4 | Hierarchical Reading & Optimizations | 3 |
-| 5 | Background Merging & Compaction | 3, 4 |
-| 6 | Validation, Benchmarks & Auditing | 1–5 |
+`Engine` is cheaply cloneable. Clones share the writer, memory state, cache, worker, and directory lock. `KvEngine` also exposes the three data operations as a trait. The last clone's drop joins the worker and releases the lock; it need not flush because every acknowledged persistent mutation is already in a synced WAL.
 
----
+## Guarantees
 
-## Public API
+- **Durability:** every successful persistent `put` or `delete` has a checksummed WAL record synced with `File::sync_all()` before it becomes visible in memory. Newly created files and atomic renames also sync their parent directory.
+- **Ordering:** a serialized writer assigns monotonically increasing sequence numbers. Concurrent point reads observe a consistent layer snapshot; newest sequence wins. SST compaction retains the newest version of each key.
+- **Deletion:** tombstones shadow older records across all layers. They are removed only when merging **all** live disk tables; all active/frozen memory generations contain newer mutations.
+- **Crash recovery:** the manifest determines the live SST set and durable WAL checkpoint. Recovery replays later WAL generations in order. An incomplete final WAL frame is truncated; an intact frame with a bad checksum is an error. Unacknowledged writes may or may not appear after recovery.
+- **Exclusive open:** an OS advisory lock permits one engine per database directory across processes. Use clones for concurrent access within that engine.
+- **Failure handling:** write/maintenance I/O failures halt the engine; reopen to recover. Read corruption is returned as an error. A failed write is not a promise that the record is absent after reopening.
 
-The engine exposes exactly three operations over arbitrary byte-slice keys and values:
+These guarantees assume a local POSIX filesystem that implements file/directory sync and atomic same-directory rename correctly. The tests exercise process crashes and injected I/O failures, not physical power loss. Hardware that lies about sync, external deletion/editing of live files, network filesystems, and shared use of an inherited engine after `fork()` are outside the guarantee. Do not delete the `LOCK` file while the database is open.
 
-| Method | Signature | Behavior |
-|--------|-----------|----------|
-| `put` | `(key: &[u8], value: &[u8]) -> Result<()>` | Upsert a key-value pair |
-| `get` | `(key: &[u8]) -> Result<Option<Bytes>>` | Return the newest value, or `None` if absent or deleted |
-| `delete` | `(key: &[u8]) -> Result<()>` | Logically remove a key (tombstone) |
+## Architecture
 
-**Planned crate dependencies:** `bytes`, `parking_lot`, `crossbeam`  
-**Later milestones add:** `crc32fast` (or equivalent), `criterion` (dev/bench)
+Writes: serialized writer → synced per-generation WAL → active `BTreeMap` memtable. When its accounted size or WAL size reaches the threshold, the **next mutation** rotates to a new WAL and freezes the prior memtable. Explicit `flush()` also freezes it.
 
----
+Reads: active memtable → frozen memtables newest first → live SSTables. SST lookups check the Bloom filter, binary-search the block index, then consult the shared LRU block cache. Disk-table candidates are resolved by sequence number. Disk I/O runs outside the memory-state and cache locks.
 
-## Cross-Cutting Design Decisions
+One maintenance thread flushes frozen tables and performs **single-tier full-run compaction** at the configured SST count. Compaction uses a heap merge with one decoded block per input, rather than loading the full database. SST publication and manifest replacement are serialized, while foreground operations continue; sustained overload applies writer backpressure.
 
-These conventions apply across all milestones and should be decided early:
+Compaction policy deliberately favors simple, auditable deletion and recovery rules. Rewriting the entire base run has substantial write amplification as the database grows. This is not a multi-level RocksDB replacement or a sustained large-dataset throughput claim.
 
-| Decision | Choice |
-|----------|--------|
-| Key ordering | Lexicographic byte order (`[u8]` comparison) |
-| Conflict resolution | **Newest wins** — each mutation carries a monotonically increasing **sequence number**; higher sequence overrides lower across all layers |
-| Tombstone semantics | Deletes write a tombstone marker; tombstones shadow older values until compaction drops them at the lowest tier |
-| Concurrency model | `Arc<RwLock<MemTable>>` — multiple concurrent readers; writers block readers during `put`/`delete` |
-| Durability guarantee | WAL record is `fsync`'d **before** MemTable is updated (write-ahead, not write-behind) |
-| Value type | `bytes::Bytes` internally to avoid unnecessary cloning |
-
----
-
-## On-Disk Layout
-
-### Directory Structure (planned)
-
-```
-<data_dir>/
-├── current.wal          # active write-ahead log
-├── MANIFEST             # metadata: list of SST files, sequence counter, compaction state
-└── sst/
-    ├── 000001.sst
-    ├── 000002.sst
-    └── ...
+```text
+data/
+  LOCK
+  MANIFEST
+  wal/00000000000000000001.wal
+  sst/00000000000000000003.sst
 ```
 
-### WAL Record Format
+File IDs are shared across WAL/SST creation, so gaps are normal. Temporary files are never authoritative. See [the on-disk format and crash ordering](docs/storage-format.md).
 
-```
-[CRC32: 4B][Key Len: 4B][Val Len: 4B][Key Bytes][Value Bytes]
-```
+## Options and observability
 
-- Deletion: special value-length sentinel (`-1` as `i32`, or explicit enum tag — pick one and document)
-- Recovery: scan from byte 0, verify CRC32 per record, replay valid entries into MemTable
+| Option | Default | Meaning |
+|---|---:|---|
+| `memtable_size_limit` | 4 MiB | Rotation threshold for accounted memory or WAL bytes |
+| `max_immutable_memtables` | 2 | Writer backpressure when the frozen queue is full |
+| `block_size` | 16 KiB | Target data-block size; a single larger record is allowed |
+| `block_cache_capacity` | 8 MiB | Accounted resident block-cache budget; zero disables caching |
+| `bloom_filter_bits_per_key` | 10 | Filter accuracy/space tradeoff; allowed range 1–30 |
+| `compaction_file_threshold` | 4 | Full-run merge trigger; minimum two |
+| `max_key_size` | 1 MiB | Maximum key length |
+| `max_value_size` | 16 MiB | Maximum value length |
 
-### SSTable File Format
+The combined configured key/value limits plus the 17-byte record header cannot exceed 32 MiB. Block targets must be 64 bytes to 32 MiB. Filters are capped at 8 MiB per table and metadata frames at 64 MiB; very large runs should use a more scalable compaction/index design.
 
-```
-┌──────────────────────────────────────┐
-│  Data Blocks (sorted KV records)     │
-├──────────────────────────────────────┤
-│  Bloom Filter                        │
-├──────────────────────────────────────┤
-│  Index Block (key → block offset)    │
-└──────────────────────────────────────┘
-```
+The active/frozen memtable budget is approximate, allowing one oversized record per generation. SST indexes/filters, merge buffers, allocator overhead, and values retained by callers are additional memory; the memtable/cache limits are **not a process RSS cap**. Backpressure is necessary when storage cannot keep up with writers.
 
-- Keys sorted lexicographically within blocks and across the file
-- Tombstones persisted as first-class records inside data blocks
-- Bloom filter checked before loading data blocks on `get`
+`stats()` reports sequence, active/frozen bytes, frozen count, live SST count, physical SST record count (including duplicates/tombstones before compaction), block-read calls, cache hits, Bloom negatives, and resident cache bytes. `block_reads` counts engine data-block reads; it does not distinguish OS page-cache hits from hardware I/O.
 
----
-
-## Configuration & Tunables
-
-| Parameter | Default (suggested) | Used In |
-|-----------|-------------------|---------|
-| `memtable_size_limit` | 4 MB | Milestone 3 — triggers freeze + flush |
-| `block_cache_capacity` | TBD | Milestone 4 — LRU cache size |
-| `bloom_filter_bits_per_key` | TBD | Milestone 4 — false-positive rate trade-off |
-| `compaction_file_threshold` | TBD | Milestone 5 — files per level before merge |
-| `compaction_strategy` | Size-tiered or leveled | Milestone 5 — pick one |
-
----
-
-## Planned Module Structure
-
-```
-src/
-├── lib.rs              # public API surface
-├── engine.rs           # orchestrates all subsystems
-├── memtable.rs         # active + immutable in-memory tables
-├── wal/
-│   ├── mod.rs
-│   ├── writer.rs
-│   └── reader.rs
-├── sstable/
-│   ├── mod.rs
-│   ├── writer.rs
-│   ├── reader.rs
-│   └── bloom.rs
-├── cache/
-│   └── block_cache.rs  # LRU block cache
-├── compaction/
-│   ├── mod.rs
-│   └── merge.rs        # multi-way merge iterator
-└── manifest.rs         # on-disk metadata tracking
-```
-
----
-
-## Glossary
-
-| Term | Definition |
-|------|------------|
-| **MemTable** | Mutable in-memory sorted buffer for recent writes |
-| **ImmutableMemTable** | Frozen MemTable awaiting flush to disk |
-| **WAL** | Append-only log ensuring durability before memory update |
-| **SSTable** | Immutable, sorted on-disk key-value file |
-| **Tombstone** | Delete marker that logically removes a key |
-| **Bloom filter** | Probabilistic structure to skip SSTables/blocks on negative lookups |
-| **Compaction** | Background merge of SSTables to deduplicate and garbage-collect tombstones |
-| **Manifest** | Authoritative list of live SST files and engine metadata |
-
----
-
-## Non-Goals (Out of Scope)
-
-- Distributed replication / consensus
-- Multi-key transactions or ACID isolation levels
-- Range scans / iterators (may be a future stretch goal)
-- Compression (Snappy/LZ4) — not in initial milestones
-- Column families or multiple namespaces
-
----
-
-## Development
+## Build and validation
 
 ```bash
-cargo build
-cargo test
-cargo bench          # after Milestone 6 (criterion integration)
+cargo build --locked
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo test --locked --release --all-features
+
+# Extended acceptance: 100 keys × 50,000 overwrites, then delete/compact/reopen
+cargo test --locked --release --all-features --test stress -- --ignored --nocapture
+
+cargo bench --locked --bench engine
+cargo run --locked --release --example bench_report
 ```
 
----
+The `fault-injection` feature exists for subprocess testing only. It enables the `crash_worker` binary and named environment-controlled crash/I/O-error hooks. Leave it disabled in applications.
+
+GitHub Actions runs formatting, warning-free Clippy, debug/release tests, and benchmark compilation on Linux and macOS. A manual workflow run additionally executes the five-million-write stress test. See [validation coverage and local results](docs/validation.md).
+
+## Benchmarks
+
+[Recorded results and methodology](docs/benchmarks.md) include throughput and per-operation p50/p99 for synced writes, warm-cache reads, reads with the engine block cache disabled, and a mixed workload. [Raw CSV](docs/benchmark-results.csv) is generated by `examples/bench_report.rs`. Criterion provides a separate, growing-dataset benchmark.
+
+The recorded environment uses container overlayfs. Its sync latency is **not representative of durable physical media**, and cache-disabled reads can still hit the OS cache. Re-run on the intended filesystem before making performance claims.
 
 ## Milestones
 
-Each milestone follows the same template: **Objective → Steps → Definition of Done → Tests**.
+| Milestone | Implemented deliverables |
+|---|---|
+| 1 — Memory and synchronization | Byte API, shared engine handles, sorted memtable, serialized writers/concurrent readers |
+| 2 — Durability and recovery | Versioned, checksummed WAL generations; sequence recovery; torn-tail handling; exclusive open |
+| 3 — Flush and SST creation | Bounded frozen queue, background flushing, sorted/indexed SSTs, tombstone persistence |
+| 4 — Hierarchical reads | All-layer resolution, per-table Bloom filter, bounded thread-safe LRU block cache, read counters |
+| 5 — Compaction | Streaming multi-way full-run merge, newest-wins deduplication, tombstone GC, atomic manifest publication |
+| 6 — Validation and measurements | Differential testing, concurrent history checking, corruption/crash/I/O fault tests, stress, Criterion, p50/p99 report |
 
----
+## Scope
 
-### Milestone 1 — In-Memory Engine & Synchronization
-
-**Objective:** Buffer writes in memory, define the public API, and handle concurrent access safely.
-
-| Step | Task |
-|------|------|
-| 1.1 | `cargo init --lib`; add deps (`bytes`, `parking_lot`, `crossbeam`); define `put` / `get` / `delete` |
-| 1.2 | Implement `MemTable` with ordered concurrent skip list or synchronized `BTreeMap`; store entries as `bytes::Bytes` |
-| 1.3 | Wrap state in `Arc<RwLock<MemTable>>`; readers concurrent, writers exclusive |
-
-**Definition of Done**
-- [ ] `cargo build` succeeds
-- [ ] Concurrent `put` / `get` without deadlocks or data races
-- [ ] `get` returns the value from the most recent `put` for a key
-
-**Tests**
-- Unit: put-then-get, get on missing key, delete-then-get → `None`
-- Stress: 10 writer threads + 10 reader threads on unique keys; no corruption under `cargo test`
-
----
-
-### Milestone 2 — Durability & Crash Recovery (WAL)
-
-**Objective:** Persist every mutation to disk before updating memory so the store survives crashes.
-
-| Step | Task |
-|------|------|
-| 2.1 | Define WAL binary format (see [On-Disk Layout](#on-disk-layout)) |
-| 2.2 | `WalWriter` — sequential append + `sync_all()` before MemTable update |
-| 2.3 | `WalReader` — auto-replay on engine init; CRC32 validation per record |
-
-**Definition of Done**
-- [ ] Every mutation is WAL-persisted before returning success
-- [ ] Engine fully reconstructs state from `.wal` after process crash
-
-**Tests**
-- Crash recovery: put 1,000 keys → kill instance → reopen same path → all 1,000 keys readable
-- Corruption: inject bad bytes mid-log → CRC failure → controlled error, no panic or polluted state
-
----
-
-### Milestone 3 — Memory Flushing & SSTable Creation
-
-**Objective:** Flush saturated MemTables to immutable on-disk SSTables to bound memory growth.
-
-| Step | Task |
-|------|------|
-| 3.1 | Define SSTable binary spec (data blocks + index block at tail) |
-| 3.2 | On size threshold, freeze MemTable → spawn new active MemTable; background worker writes `.sst` |
-| 3.3 | Persist tombstones in flushed SSTables |
-
-**Definition of Done**
-- [ ] MemTable → immutable transition without rejecting or stalling writes
-- [ ] Flushed `.sst` files contain fully sorted keys with valid index
-
-**Tests**
-- Flush threshold: set limit to 64 KB, trigger multiple flushes, verify `.sst` files on disk and RAM plateaus
-- Logical delete: insert → flush → delete → flush → `get` returns `None`
-
----
-
-### Milestone 4 — Hierarchical Reading & Performance Optimizations
-
-**Objective:** Efficient `get` path spanning memory and disk with minimal I/O.
-
-| Step | Task |
-|------|------|
-| 4.1 | Search router: active MemTable → immutable MemTable(s) → SSTables newest-first via index blocks |
-| 4.2 | Per-SSTable Bloom filter; skip data-block reads on negative lookup |
-| 4.3 | Thread-safe LRU `BlockCache` for parsed SSTable blocks |
-
-**Definition of Done**
-- [ ] `get` resolves newest record or tombstone across all layers
-- [ ] Non-existent key lookups avoid physical reads in most cases (Bloom filter)
-
-**Tests**
-- Multi-generation: Key-A in SST → updated in newer SST → updated in MemTable → `get` returns MemTable value; delete in MemTable → `get` returns `None` despite older SST values
-- I/O elimination: 5,000 random non-existent keys; instrument fd reads; verify Bloom filter minimizes disk I/O
-
----
-
-### Milestone 5 — Background Merging & Compaction
-
-**Objective:** Merge fragmented SSTables, deduplicate, and garbage-collect tombstones in the background.
-
-| Step | Task |
-|------|------|
-| 5.1 | Compaction manager — monitor SST count per layer; trigger when threshold exceeded |
-| 5.2 | Multi-way merge iterator over sorted SSTables; keep newest sequence; drop tombstones at lowest tier |
-| 5.3 | Atomic manifest swap to new merged SST; delete deprecated files |
-
-**Definition of Done**
-- [ ] Compaction runs in background without blocking foreground reads/writes
-- [ ] Stale duplicates and redundant tombstones purged after compaction
-
-**Tests**
-- Continuous overwrite: 100 keys × 50,000 overwrites → many small SSTs → compaction reduces file count to one record per key
-
----
-
-### Milestone 6 — Validation, Benchmarks & Performance Auditing
-
-**Objective:** Prove correctness under extreme load and measure throughput/latency.
-
-| Step | Task |
-|------|------|
-| 6.1 | Differential fuzz harness — random `put`/`get`/`delete` interleaves vs `HashMap` reference |
-| 6.2 | `criterion` benchmarks — sequential writes, random reads, mixed workloads; report ops/sec and p50/p99 latency |
-
-**Definition of Done**
-- [ ] Extended concurrent fuzz tests pass with zero mismatches
-- [ ] Reproducible performance matrix (p50, p99) across load profiles
-
-**Tests**
-- Final acceptance: 100,000 fuzz iterations with active compaction worker; zero inconsistencies
+Linux/macOS local POSIX filesystems; one database directory and point operations. No distributed replication, transactions, range scans, compression, column families, snapshots, or Windows support. The disk format is versioned `01`; no upgrade/migration mechanism is provided yet.

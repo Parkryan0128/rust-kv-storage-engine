@@ -1,73 +1,55 @@
+use bytes::Bytes;
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
-
-/// A single key's state inside the memtable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Entry {
-    Value(Bytes),
-    Tombstone,
+pub(crate) struct Record {
+    pub seq: u64,
+    pub value: Option<Bytes>,
 }
-
-/// In-memory sorted buffer for recent writes. Single-threaded for now.
-pub struct MemTable {
-    data: BTreeMap<Vec<u8>, Entry>,
+impl Record {
+    pub fn size(&self, key: &[u8]) -> usize {
+        48 + key.len() + self.value.as_ref().map_or(0, Bytes::len)
+    }
 }
-
+#[derive(Default)]
+pub(crate) struct MemTable {
+    pub data: BTreeMap<Vec<u8>, Record>,
+    pub bytes: usize,
+}
 impl MemTable {
-    pub fn new() -> Self {
-        Self {
-            data: BTreeMap::new(),
+    pub fn insert(&mut self, key: Vec<u8>, record: Record) {
+        self.bytes += record.size(&key);
+        if let Some(old) = self.data.insert(key.clone(), record) {
+            self.bytes -= old.size(&key);
         }
     }
-
-    pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.data
-            .insert(key.to_vec(), Entry::Value(Bytes::copy_from_slice(value)));
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
-        match self.data.get(key)? {
-            Entry::Value(value) => Some(value.clone()),
-            Entry::Tombstone => None,
-        }
-    }
-
-    pub fn delete(&mut self, key: &[u8]) {
-        self.data.insert(key.to_vec(), Entry::Tombstone);
+    pub fn get(&self, key: &[u8]) -> Option<Record> {
+        self.data.get(key).cloned()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn put_then_get() {
-        let mut table = MemTable::new();
-        table.put(b"key", b"value");
-        assert_eq!(table.get(b"key"), Some(Bytes::from_static(b"value")));
-    }
-
-    #[test]
-    fn get_missing_key() {
-        let table = MemTable::new();
-        assert_eq!(table.get(b"missing"), None);
-    }
-
-    #[test]
-    fn delete_then_get() {
-        let mut table = MemTable::new();
-        table.put(b"key", b"value");
-        table.delete(b"key");
-        assert_eq!(table.get(b"key"), None);
-    }
-
-    #[test]
-    fn put_overwrites_previous_value() {
-        let mut table = MemTable::new();
-        table.put(b"key", b"first");
-        table.put(b"key", b"second");
-        assert_eq!(table.get(b"key"), Some(Bytes::from_static(b"second")));
+    fn accounting_and_tombstones() {
+        let mut m = MemTable::default();
+        m.insert(
+            b"k".to_vec(),
+            Record {
+                seq: 1,
+                value: Some(Bytes::from_static(b"123")),
+            },
+        );
+        assert_eq!(m.bytes, 52);
+        m.insert(
+            b"k".to_vec(),
+            Record {
+                seq: 2,
+                value: None,
+            },
+        );
+        assert_eq!(m.bytes, 49);
+        assert_eq!(m.get(b"k").unwrap().value, None);
+        assert_eq!(m.get(b"absent"), None);
     }
 }
