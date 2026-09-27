@@ -51,7 +51,6 @@ fn possible(
 }
 #[test]
 fn concurrent_histories_admit_a_sequential_order_respecting_real_time() {
-    // Exhaustive independent model checking of each recorded 12-operation history.
     for round in 0..60u64 {
         let d = tempfile::tempdir().unwrap();
         let e = Engine::open_with_options(

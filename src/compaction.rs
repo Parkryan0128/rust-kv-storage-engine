@@ -4,7 +4,6 @@ use crate::{
     Result,
 };
 use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
-// One decoded block per input plus one heap entry per file; never materialize the DB.
 pub(crate) struct Merge {
     iters: Vec<TableIter>,
     heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
@@ -58,7 +57,7 @@ impl Iterator for Merge {
                     return self.next();
                 }
             }
-            // All live disk tables participate. All memory records are newer than disk.
+            // Safe to drop tombstones: every disk table is included in this merge.
             if newest.value.is_some() {
                 return Some(Ok((key, newest)));
             }

@@ -1,4 +1,3 @@
-//! Fixed-seed single-client latency measurements, including maintenance contention.
 use rust_kv_storage_engine::{Engine, Options};
 use std::time::Instant;
 fn next(r: &mut u64) -> u64 {

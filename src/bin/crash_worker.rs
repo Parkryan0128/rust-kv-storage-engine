@@ -1,4 +1,3 @@
-//! Subprocess driver for deterministic crash and injected I/O tests; never built by default.
 use rust_kv_storage_engine::{Engine, EngineError, Options};
 use std::io::{self, Write};
 fn main() {

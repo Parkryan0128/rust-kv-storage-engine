@@ -4,7 +4,7 @@ pub(crate) struct Bloom {
     bits: Vec<u8>,
     probes: u32,
 }
-// Stable, versioned hashing: the on-disk format never depends on RandomState.
+// Bloom format depends on this hash; bump the version if it changes.
 fn hash(key: &[u8]) -> (u64, u64) {
     let mut h = 0xcbf29ce484222325u64;
     for b in key {
@@ -18,7 +18,6 @@ fn hash(key: &[u8]) -> (u64, u64) {
 }
 impl Bloom {
     pub fn new(count: u64, bits_per_key: usize) -> Self {
-        // Capping filter size changes only false-positive rate, never correctness.
         let bytes = (count.saturating_mul(bits_per_key as u64).div_ceil(8))
             .clamp(8, 8 * 1024 * 1024) as usize;
         Self {

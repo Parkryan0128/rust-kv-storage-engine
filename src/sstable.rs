@@ -220,7 +220,7 @@ impl Table {
             return Ok(None);
         }
         let n = p - 1;
-        // Do not hold the cache lock during I/O.
+        // Drop the cache lock before reading from disk.
         let cached = { cache.lock().get((self.id, n), counters) };
         let block = if let Some(b) = cached {
             b

@@ -84,7 +84,7 @@ pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<u64> {
     w.write_all(payload)?;
     Ok((HEADER + payload.len()) as u64)
 }
-// Only a physically incomplete final frame is recoverable. Intact but invalid CRCs are errors.
+// A torn tail is recoverable; a complete frame with a bad CRC is not.
 pub(crate) fn read_frame(r: &mut impl Read, allow_tail: bool) -> Result<Option<Vec<u8>>> {
     let mut head = [0u8; HEADER];
     let mut n = 0;

@@ -25,7 +25,6 @@ use std::{
 };
 pub type Result<T> = std::result::Result<T, EngineError>;
 
-/// Thread-safe byte-oriented key/value operations. Successful durable writes are synced.
 pub trait KvEngine {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
@@ -33,14 +32,14 @@ pub trait KvEngine {
 }
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Approximate payload/accounting limit per memtable, also limits WAL growth.
+    /// Rotation threshold for memory or WAL bytes.
     pub memtable_size_limit: usize,
-    /// Backpressure starts when this many frozen tables await flushing.
+    /// Writers wait when this queue is full.
     pub max_immutable_memtables: usize,
     pub block_size: usize,
     pub block_cache_capacity: usize,
     pub bloom_filter_bits_per_key: usize,
-    /// Full-run compaction triggers at this many live SSTs (minimum two).
+    /// SST count that triggers compaction; minimum 2.
     pub compaction_file_threshold: usize,
     pub max_key_size: usize,
     pub max_value_size: usize,
@@ -112,8 +111,7 @@ struct Disk {
 }
 impl Drop for Disk {
     fn drop(&mut self) {
-        // Release explicitly: another thread may have forked a child which briefly
-        // inherited this open-file description before exec closes CLOEXEC handles.
+        // Explicit unlock avoids retaining the lock in a child between fork and exec.
         let _ = FileExt::unlock(&self._lock);
     }
 }
@@ -134,7 +132,6 @@ struct Handle {
     core: Arc<Core>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
-/// Clones share one engine, worker and directory lock. The last drop joins the worker.
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<Handle>,
@@ -145,7 +142,7 @@ impl Default for Engine {
     }
 }
 impl Engine {
-    /// Volatile in-memory engine. Use `open` for crash durability.
+    /// In-memory only; use `open` to persist data.
     pub fn new() -> Self {
         Self::build(
             Options::default(),
@@ -171,7 +168,7 @@ impl Engine {
         let dir = path.as_ref();
         fs::create_dir_all(dir)?;
         let dir = fs::canonicalize(dir)?;
-        // Persist newly created directories up the path; requires POSIX directory fsync.
+        // Sync parents too, since create_dir_all may have created them.
         for ancestor in dir.ancestors() {
             sync_dir(ancestor)?;
         }
@@ -248,7 +245,7 @@ impl Engine {
             active = Some(Wal::create(&wal_path(&dir, id), id)?);
             sync_dir(&dir.join("wal"))?;
         }
-        // Only discard unreferenced files after the authoritative manifest was validated.
+        // Validate the manifest before deleting files.
         let live: HashSet<_> = manifest.tables.iter().copied().collect();
         for id in sst_ids {
             if !live.contains(&id) {
@@ -374,7 +371,7 @@ impl Engine {
         }
         Ok(newest.and_then(|r| r.value))
     }
-    /// Wait until all mutations preceding this call's writer barrier have SST coverage.
+    /// Flush all writes before this call's writer barrier to SSTs.
     pub fn flush(&self) -> Result<()> {
         let c = &self.inner.core;
         if c.disk.is_none() {
@@ -409,7 +406,7 @@ impl Engine {
         }
         result
     }
-    /// Flush a writer barrier, then merge all live SSTs using bounded streaming memory.
+    /// Flush, then merge all live SSTs.
     pub fn compact(&self) -> Result<()> {
         self.flush()?;
         let c = &self.inner.core;
@@ -535,7 +532,7 @@ impl Core {
         }
         let mut w = self.writer.lock();
         self.wait_room()?;
-        // Rotate before the next write, so no post-ack maintenance failure changes its result.
+        // Rotate first so a rotation error cannot fail an already-applied write.
         if self.disk.is_some()
             && (self.state.read().mem.bytes >= self.options.memtable_size_limit
                 || w.as_ref()

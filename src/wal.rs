@@ -34,8 +34,7 @@ impl Wal {
         last_seq: &mut u64,
     ) -> Result<(Self, MemTable)> {
         let mut file = OpenOptions::new().write(true).read(true).open(path)?;
-        // A newly created last generation can be interrupted before its header is complete.
-        // No mutation can have been acknowledged in such a file.
+        // Incomplete newest header: no writes could have been acknowledged yet.
         if allow_tail && file.metadata()?.len() < 8 {
             file.set_len(0)?;
             file.write_all(MAGIC)?;
