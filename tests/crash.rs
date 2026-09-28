@@ -186,3 +186,70 @@ fn second_process_cannot_open_a_locked_database() {
         .unwrap()
         .success());
 }
+
+#[test]
+fn partial_compaction_crashes_and_io_errors_preserve_unselected_files() {
+    use rust_kv_storage_engine::Options;
+    for mode in ["tiered", "tiered-error"] {
+        for point in [
+            "sst_before_sync",
+            "sst_after_sync",
+            "sst_after_rename",
+            "manifest_before_sync",
+            "manifest_after_sync",
+            "manifest_after_rename",
+            "manifest_after_dir_sync",
+            "compaction_before_old_delete",
+            "compaction_after_old_delete",
+            "compaction_after_dir_sync",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let o = Options {
+                memtable_size_limit: 8 * 1024 * 1024,
+                compaction_file_threshold: 10000,
+                ..Options::default()
+            };
+            let e = Engine::open_with_options(d.path(), o.clone()).unwrap();
+            for k in 0..512u64 {
+                e.put(&k.to_be_bytes(), &[1; 128]).unwrap();
+            }
+            e.flush().unwrap();
+            let cold = files(&d.path().join("sst"), "sst")[0].clone();
+            let original = std::fs::read(&cold).unwrap();
+            for generation in 2..5u8 {
+                e.delete(&0u64.to_be_bytes()).unwrap();
+                for k in 1..16u64 {
+                    e.put(&k.to_be_bytes(), &[generation; 128]).unwrap();
+                }
+                e.flush().unwrap();
+            }
+            drop(e);
+            let out = worker()
+                .arg(d.path())
+                .arg(mode)
+                .arg(point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(if mode == "tiered" { 86 } else { 0 }),
+                "{mode}/{point}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(std::fs::read(&cold).unwrap(), original, "{point}");
+            let e = Engine::open_with_options(d.path(), o).unwrap();
+            assert_eq!(e.get(b"must-reject").unwrap(), None);
+            assert_eq!(e.get(&0u64.to_be_bytes()).unwrap(), None, "{point}");
+            for k in 1..512u64 {
+                let v = if k < 16 { 4 } else { 1 };
+                assert_eq!(
+                    e.get(&k.to_be_bytes()).unwrap().as_deref(),
+                    Some(&[v; 128][..]),
+                    "{point}/{k}"
+                );
+            }
+            e.compact().unwrap();
+            assert_eq!(e.stats().sst_records, 511);
+        }
+    }
+}

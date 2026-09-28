@@ -374,7 +374,14 @@ fn background_flush_bounds_memory_and_reclaims_wals() {
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
-    assert!(e.stats().sst_files <= 4);
+    let mut buckets = std::collections::BTreeMap::new();
+    for path in files(&d.path().join("sst"), "sst") {
+        let size = std::fs::metadata(path).unwrap().len();
+        *buckets.entry(size.max(1).ilog2()).or_insert(0usize) += 1;
+    }
+    assert!(buckets
+        .values()
+        .all(|&n| n < options().compaction_file_threshold));
     e.compact().unwrap();
     assert_eq!(e.stats().sst_records, 5000);
 }

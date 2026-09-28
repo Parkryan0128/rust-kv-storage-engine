@@ -4,7 +4,7 @@ fn main() {
     let a: Vec<_> = std::env::args().collect();
     let dir = &a[1];
     let mode = &a[2];
-    let opts = Options {
+    let mut opts = Options {
         memtable_size_limit: 1024 * 1024,
         compaction_file_threshold: 10000,
         ..Options::default()
@@ -13,7 +13,26 @@ fn main() {
         assert!(matches!(Engine::open(dir), Err(EngineError::Locked)));
         return;
     }
+    if mode == "tiered" || mode == "tiered-error" {
+        opts.compaction_file_threshold = 3;
+        std::env::set_var("KV_FAILPOINT", &a[3]);
+        if mode == "tiered-error" {
+            std::env::set_var("KV_FAIL_ACTION", "error");
+        }
+    }
     let e = Engine::open_with_options(dir, opts).unwrap();
+    if mode == "tiered" {
+        e.flush().unwrap();
+        panic!("partial compaction did not hit failpoint");
+    }
+    if mode == "tiered-error" {
+        assert!(e.flush().is_err());
+        assert!(matches!(
+            e.put(b"must-reject", b"v"),
+            Err(EngineError::Background(_))
+        ));
+        return;
+    }
     if a.len() > 3 {
         std::env::set_var("KV_FAILPOINT", &a[3]);
     }
