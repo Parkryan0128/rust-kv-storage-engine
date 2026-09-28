@@ -4,6 +4,7 @@ use crate::{
     compaction::{self, CompactionStyle, Merge},
     error::{corrupt, EngineError},
     fault,
+    inspection::{Inspection, MemtableInfo, RecordPreview, TableInfo},
     manifest::Manifest,
     memtable::{MemTable, Record},
     sstable::{sync_dir, Table},
@@ -429,6 +430,61 @@ impl Engine {
             c.poison(e);
         }
         result
+    }
+    /// Consistent metadata snapshot; previews contain at most 32 records and 128 bytes per field.
+    pub fn inspect(&self) -> Result<Inspection> {
+        let s = self.inner.core.state.read();
+        check(&s)?;
+        let memory = |mem: &MemTable, wal_id| MemtableInfo {
+            wal_id,
+            bytes: mem.bytes,
+            records: mem.data.len(),
+            preview: mem
+                .data
+                .iter()
+                .take(32)
+                .map(|(k, r)| RecordPreview::new(k, r))
+                .collect(),
+        };
+        Ok(Inspection {
+            sequence: s.sequence,
+            active: memory(&s.mem, None),
+            frozen: s
+                .immutable
+                .iter()
+                .map(|f| memory(&f.mem, Some(f.id)))
+                .collect(),
+            tables: s
+                .tables
+                .iter()
+                .map(|t| TableInfo {
+                    id: t.id,
+                    bytes: t.file_bytes,
+                    records: t.count,
+                    max_sequence: t.max_seq,
+                })
+                .collect(),
+        })
+    }
+    /// Samples an immutable table without holding the state lock during file reads.
+    pub fn inspect_table(&self, id: u64) -> Result<Vec<RecordPreview>> {
+        let table = {
+            let s = self.inner.core.state.read();
+            check(&s)?;
+            s.tables
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+                .ok_or_else(|| EngineError::InvalidConfig("table is no longer live".into()))?
+        };
+        table
+            .iter()
+            .take(32)
+            .map(|item| {
+                let (key, record) = item?;
+                Ok(RecordPreview::new(&key, &record))
+            })
+            .collect()
     }
     pub fn stats(&self) -> Stats {
         let c = &self.inner.core;
