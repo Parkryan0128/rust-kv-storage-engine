@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Storage Lab · Rust KV</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%23197958%27/%3E%3Cpath d=%27M8 9h16M8 16h16M8 23h16%27 stroke=%27white%27 stroke-width=%273%27/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/"
+        ><span class="logo">▥</span> storage<span class="brand-light">lab</span
+        ><span class="tag">RUST KV</span></a
+      >
+      <div class="connection">
+        <span id="dot" class="dot"></span
+        ><span id="connection">Connecting to local engine</span>
+      </div>
+    </header>
+    <main>
+      <div class="intro">
+        <div>
+          <p class="eyebrow">AN EMBEDDED DATABASE, OPENED UP</p>
+          <h1>See where your data goes.</h1>
+          <p class="subtitle">
+            Write a value. Follow it from memory to disk. Watch compaction do
+            its work.
+          </p>
+        </div>
+        <div class="intro-note">
+          <span>01 / EXPLORE THE ENGINE</span>
+          <p>Real Rust. Real files.<br />A sandbox on your machine.</p>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="Workspace">
+        <button class="tab active" data-tab="explorer" aria-selected="true">
+          Engine explorer <span>01</span></button
+        ><button class="tab" data-tab="comparison" aria-selected="false">
+          Compaction comparison <span>02</span>
+        </button>
+      </nav>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <section id="explorer" class="workspace">
+        <div class="metrics">
+          <article>
+            <span>Latest sequence</span><strong id="sequence">—</strong
+            ><small>monotonic write version</small>
+          </article>
+          <article>
+            <span>Active memory</span><strong id="mem-bytes">—</strong
+            ><small id="mem-caption">64 KiB flush threshold</small>
+          </article>
+          <article>
+            <span>Live SST files</span><strong id="sst-count">—</strong
+            ><small id="sst-size">— on disk</small>
+          </article>
+          <article>
+            <span>SST bytes written</span><strong id="written">—</strong
+            ><small>flush + compaction since open</small>
+          </article>
+        </div>
+        <div class="explore-grid">
+          <aside class="panel console">
+            <div class="panel-title">
+              <h2>Work with a key</h2>
+              <span class="small-tag">PLAYGROUND</span>
+            </div>
+            <form id="kv-form">
+              <label for="key">Key</label
+              ><input
+                id="key"
+                name="key"
+                value="user:1"
+                maxlength="128"
+                autocomplete="off"
+                spellcheck="false"
+              /><label for="value">Value</label
+              ><textarea
+                id="value"
+                name="value"
+                maxlength="1024"
+                rows="3"
+                spellcheck="false"
+              >
+Ryan</textarea
+              ><button class="primary" type="submit">
+                Save value <span>↗</span>
+              </button>
+              <div class="button-pair">
+                <button type="button" id="get">Read key</button
+                ><button type="button" id="delete">Delete key</button>
+              </div>
+            </form>
+            <div class="result-box">
+              <span class="eyebrow">LAST READ</span>
+              <pre id="read-result">Read a key to see its value.</pre>
+            </div>
+            <div class="divider"></div>
+            <h3>Move the data</h3>
+            <p class="help">
+              Writes reach the WAL before they appear in memory. Flush moves
+              memory records into sorted files.
+            </p>
+            <button class="wide" id="batch">+ Write 64 sample records</button>
+            <div class="button-pair">
+              <button id="flush">Flush to disk</button
+              ><button id="compact">Full compact</button>
+            </div>
+            <button class="wide" id="reopen">↻ Close & reopen database</button>
+            <p class="fine">
+              Reopen uses the same files. It is a clean close, not a crash test.
+              Runtime counters restart.
+            </p>
+          </aside>
+          <div class="storage-stack">
+            <article class="panel pipeline">
+              <div class="panel-title">
+                <h2>The write path</h2>
+                <span class="live-label"
+                  ><span class="dot"></span> LIVE STATE</span
+                >
+              </div>
+              <div class="path">
+                <div>
+                  <span class="step">01</span><strong>WAL</strong
+                  ><small id="wal-label">Recovery log</small>
+                </div>
+                <span class="arrow">→</span>
+                <div>
+                  <span class="step">02</span><strong>Memtable</strong
+                  ><small id="active-label">Sorted in memory</small>
+                </div>
+                <span class="arrow">→</span>
+                <div>
+                  <span class="step">03</span><strong>SSTables</strong
+                  ><small>Immutable on disk</small>
+                </div>
+              </div>
+              <p class="fine">
+                State is sampled after operations; arrows describe ordering, not
+                a timed replay.
+              </p>
+            </article>
+            <article class="panel">
+              <div class="panel-title">
+                <h2>Memory records</h2>
+                <span id="frozen-label" class="small-tag"
+                  >0 WAITING TO FLUSH</span
+                >
+              </div>
+              <div class="meter"><div id="memory-fill"></div></div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>KEY</th>
+                      <th>VALUE / TOMBSTONE</th>
+                      <th>SEQ</th>
+                    </tr>
+                  </thead>
+                  <tbody id="memory-rows"></tbody>
+                </table>
+              </div>
+              <div id="frozen-preview"></div>
+              <p class="fine">
+                First 32 records per memtable. Field previews are capped at 128
+                bytes.
+              </p>
+            </article>
+            <article class="panel">
+              <div class="panel-title">
+                <div>
+                  <h2>Files on disk</h2>
+                  <p class="help">
+                    Select an SST to inspect the records inside it.
+                  </p>
+                </div>
+                <span class="small-tag accent-tag">SIZE-TIERED</span>
+              </div>
+              <div id="sst-files" class="file-list"></div>
+              <p class="fine">
+                Bars share a linear size scale. Four files in the same
+                power-of-two size bucket become eligible for a merge.
+              </p>
+              <div id="table-detail" hidden>
+                <div class="divider"></div>
+                <h3 id="table-detail-title"></h3>
+                <div class="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>KEY</th>
+                        <th>STORED VALUE</th>
+                        <th>SEQ</th>
+                      </tr>
+                    </thead>
+                    <tbody id="disk-rows"></tbody>
+                  </table>
+                </div>
+                <p class="fine">
+                  These are physical records. An older value may still exist
+                  here after a newer write or deletion.
+                </p>
+              </div>
+            </article>
+          </div>
+        </div>
+        <article class="panel activity">
+          <div class="panel-title">
+            <h2>Operation log</h2>
+            <span class="small-tag">LATEST 40</span>
+          </div>
+          <div id="events"></div>
+        </article>
+        <div class="session-footer">
+          <p>
+            Temporary local sandbox · text keys and values · 10,000 writes per
+            session
+          </p>
+          <button id="reset" class="text-button">Start a new sandbox</button>
+        </div>
+      </section>
+      <section id="comparison" class="workspace" hidden>
+        <div class="comparison-intro">
+          <div>
+            <h2>Same writes. Different work.</h2>
+            <p>
+              Two real databases receive identical updates. Compare how much
+              each policy rewrites.
+            </p>
+          </div>
+          <button id="compare-start" class="primary">
+            Run comparison <span>↗</span>
+          </button>
+        </div>
+        <div class="comparison-controls">
+          <span id="compare-status" role="status" aria-live="polite"
+            >Ready · 1,024 seeded keys · 24 batches of 64 updates</span
+          ><button id="compare-pause" hidden>Pause after this batch</button>
+        </div>
+        <div class="compare-grid">
+          <article class="panel policy full">
+            <div class="panel-title">
+              <h2>Full compaction</h2>
+              <span class="small-tag">BASELINE</span>
+            </div>
+            <strong class="big-number" id="full-total">—</strong>
+            <p class="help">Cumulative SST bytes written</p>
+            <div id="full-files" class="mini-files"></div>
+            <div class="policy-stats" id="full-stats">
+              Every eligible merge rewrites all live SSTs.
+            </div>
+          </article>
+          <article class="panel policy tiered">
+            <div class="panel-title">
+              <h2>Size-tiered compaction</h2>
+              <span class="small-tag accent-tag">CURRENT ENGINE</span>
+            </div>
+            <strong class="big-number" id="tiered-total">—</strong>
+            <p class="help">Cumulative SST bytes written</p>
+            <div id="tiered-files" class="mini-files"></div>
+            <div class="policy-stats" id="tiered-stats">
+              Small files merge together; large files can stay untouched.
+            </div>
+          </article>
+        </div>
+        <article class="panel chart-panel">
+          <div class="panel-title">
+            <div>
+              <h2>Writing less to disk</h2>
+              <p class="help">
+                Actual SST file bytes, including flushes and compaction output.
+              </p>
+            </div>
+            <strong id="saving" class="saving">—</strong>
+          </div>
+          <div class="legend">
+            <span><i class="full-key"></i>Full</span
+            ><span><i class="tiered-key"></i>Size-tiered</span>
+          </div>
+          <svg
+            id="chart"
+            viewBox="0 0 900 250"
+            role="img"
+            aria-label="Cumulative SST bytes written by each compaction policy"
+          ></svg>
+          <div class="chart-caption">
+            <span>0 batches</span><span>24 batches</span>
+          </div>
+        </article>
+        <div class="explain-grid">
+          <article>
+            <h3>Why this workload?</h3>
+            <p>
+              A larger existing dataset is followed by small updates to 128
+              keys. This makes repeated rewriting of cold data visible.
+            </p>
+          </article>
+          <article>
+            <h3>What is the tradeoff?</h3>
+            <p>
+              Size tiers can retain more old versions and use more disk space.
+              Reads may need more work. Lower write volume is not a universal
+              speedup.
+            </p>
+          </article>
+          <article>
+            <h3>What is measured?</h3>
+            <p>
+              SST output bytes since opening, including seeding. WAL, manifest
+              and device amplification are excluded. Values are checked after
+              each batch.
+            </p>
+          </article>
+        </div>
+      </section>
+      <footer>
+        <span>RUST KV STORAGE ENGINE</span
+        ><span
+          >WAL · BTreeMap · SSTables · Bloom filters · Size-tiered
+          compaction</span
+        >
+      </footer>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

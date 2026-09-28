@@ -24,6 +24,8 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo test --locked --release --all-features
       - run: cargo bench --locked --bench engine --no-run
+      - run: cargo build --locked --release --example demo
+      - run: python3 scripts/test_demo.py
   extended-stress:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

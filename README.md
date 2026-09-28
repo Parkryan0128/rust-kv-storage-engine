@@ -49,6 +49,16 @@ Background compaction uses size tiers to avoid rewriting large SSTs with every s
 
 [Storage format and configuration](docs/storage-format.md)
 
+## Local demo
+
+Explore real writes, memory records, SST files, and a side-by-side compaction comparison in your browser:
+
+```bash
+cargo run --locked --release --example demo
+```
+
+Open **http://127.0.0.1:8080**. Everything runs locally in a temporary sandbox. [Walkthrough and screenshots](docs/demo.md).
+
 ## Project structure
 
 ```text
@@ -56,7 +66,7 @@ src/        Engine, memtable, WAL, SSTables, compaction, and cache
 src/bin/    Crash-test subprocess
 tests/      API, recovery, corruption, concurrency, and stress tests
 benches/    Criterion benchmarks
-examples/   Latency and compaction comparison reports
+examples/   Local browser demo, latency and compaction reports
 docs/       Storage format, test notes, and benchmark results
 ```
 
