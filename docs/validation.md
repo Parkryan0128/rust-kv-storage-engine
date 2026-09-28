@@ -21,6 +21,7 @@ cargo test --locked --release --all-features --test stress -- --ignored --nocapt
 | `tests/engine.rs` | API, reopen, limits, shared handles, cache, background flush, compaction, directory locks |
 | `tests/corruption.rs` | Byte flips, truncation, malformed records, missing files, torn WAL recovery |
 | `tests/crash.rs` | Process kills, crash points during publication, I/O errors, cross-process locking |
+| `tests/tiered.rs`, `src/compaction.rs` | Size buckets, bounded fan-in, cold-file preservation, tombstones, policy switching, cascading merges with mixed record sizes |
 | `tests/linearizability.rs` | Concurrent histories checked against a sequential model |
 | `tests/stress.rs` | Five million synced writes, compaction, reopen, deletion, and another reopen |
 
@@ -39,7 +40,7 @@ Corruption tests flip every byte in small WAL, manifest, and SST fixtures; trunc
 | `KV_FAILPOINT` | Select a named hook in the write or maintenance path |
 | `KV_FAIL_ACTION=error` | Return an I/O error instead of exiting |
 
-The default action exits with code 86 without running destructors. The suite covers 12 WAL/flush crash points, eight compaction crash points, and seven I/O errors.
+The default action exits with code 86 without running destructors. The original suite covers 12 WAL/flush crash points, eight full-compaction crash points, and seven I/O errors. Partial compaction adds ten boundaries tested both as process exits and I/O errors, including interruption between old-file deletions and after directory sync. These fixtures retain an unselected large SST containing an older value; recovery must preserve its bytes and keep a newer tombstone effective.
 
 The SIGKILL test kills a writer during writes, flushes, and compaction in eight trials. Acknowledgements are printed only after `put()` succeeds. Recovery must retain every acknowledged write; unacknowledged writes may also be present.
 
@@ -54,3 +55,13 @@ The SIGKILL test kills a writer during writes, flushes, and compaction in eight 
 The repeat run followed a lock-release fix: a concurrently forked child could briefly retain the database file lock. `Disk::drop` now unlocks it explicitly.
 
 SIGKILL leaves the OS cache intact. Power loss, torn sectors, and device write reordering have not been tested. I/O injection covers named hooks, not every possible filesystem failure.
+
+2026-09-28 UTC, size-tiered compaction, Rust 1.98.1 on Linux x86_64/overlayfs:
+
+- 40 regular tests/doctests passed in both debug and release; the separate five-million-write acceptance test also passed.
+- Crash, history, and tiered-model suites passed 25 consecutive release runs: 1,500 concurrent histories, 200 SIGKILL trials, 750 injected process exits, and 425 injected I/O errors.
+- The mixed-size tiered model test uses three seeds, 60 flush rounds per seed, and 80 mutations per round, checking all 192 keys after each round and after periodic reopen.
+- Formatting, all-target/all-feature Clippy with warnings denied, and Criterion compilation passed. The Criterion workloads and the three-workload policy comparison also ran successfully.
+- [Compaction measurements and raw results](compaction.md) include write-byte accounting, latency, retained disk space, and workload limitations.
+
+The five-million-write case repeatedly overwrites 100 keys; it does not represent five million distinct keys. Partial-compaction tests additionally verify that an unselected large file is unchanged while selected files containing newer values and tombstones are replaced.

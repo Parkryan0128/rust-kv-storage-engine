@@ -4,7 +4,7 @@ An embedded key-value storage engine written in Rust.
 
 It writes changes to a log before updating memory, flushes sorted tables to disk, and merges them in the background. Reads use Bloom filters and a block cache.
 
-[Benchmark results](docs/benchmarks.md)
+[Benchmark results](docs/benchmarks.md) · [Compaction comparison](docs/compaction.md)
 
 ## How it works
 
@@ -15,7 +15,7 @@ The engine:
 3. Rotates to a new memtable before the next write once the memory or WAL limit is reached.
 4. Flushes frozen memtables to sorted SSTables in a background thread.
 5. Checks memory first on reads, then uses Bloom filters, block indexes, and the LRU cache to find records in SSTables.
-6. Merges SSTables, keeping the newest value for each key and removing tombstones.
+6. Merges similarly sized SSTables, keeping the newest record per key. Partial merges retain tombstones; full merges can remove them.
 7. Recovers on open by loading the manifest and replaying newer WAL records.
 
 Open a database directory:
@@ -45,7 +45,7 @@ db.compact()?;
 
 Persistent writes are synced to the WAL before returning. After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
 
-Compaction currently merges all SSTables, so its write cost grows with the dataset. Transactions, range scans, and replication are not implemented.
+Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` for the original policy. Size tiers trade lower write amplification for more retained versions and potentially slower reads. Transactions, range scans, and replication are not implemented.
 
 [Storage format and configuration](docs/storage-format.md)
 
@@ -56,7 +56,7 @@ src/        Engine, memtable, WAL, SSTables, compaction, and cache
 src/bin/    Crash-test subprocess
 tests/      API, recovery, corruption, concurrency, and stress tests
 benches/    Criterion benchmarks
-examples/   Latency report generator
+examples/   Latency and compaction comparison reports
 docs/       Storage format, test notes, and benchmark results
 ```
 
@@ -109,6 +109,12 @@ Print throughput and p50/p99 latency as CSV:
 
 ```bash
 cargo run --locked --release --example bench_report
+```
+
+Compare compaction policies on append, hot-set, and delete-heavy workloads:
+
+```bash
+cargo run --locked --release --example compaction_report -- 3
 ```
 
 ## Contact

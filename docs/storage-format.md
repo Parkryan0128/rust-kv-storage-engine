@@ -62,15 +62,15 @@ Flush:
 
 Compaction:
 
-1. Snapshot all live SSTs under the maintenance lock; reads keep file handles alive.
-2. Stream-merge records; retain the highest sequence per key and drop tombstones.
-3. Sync/rename the new SST and publish a manifest replacing the input list.
+1. Select input SSTs under the maintenance lock; reads keep file handles alive.
+2. Stream-merge records, retaining the highest sequence per key. Drop tombstones only when every live SST is included.
+3. Sync/rename the new SST and publish a manifest replacing only the selected inputs; unselected SSTs remain live.
 4. Publish the new table set in memory.
 5. Unlink old SSTs and sync `sst/`. POSIX open file handles keep old read snapshots valid.
 
 If interrupted before manifest publication, old files and WALs remain sufficient. If interrupted after publication, the new SSTs were already synced. Startup removes unreferenced SSTs, checkpointed WALs, and temporary SST/WAL files. It never rebuilds a missing manifest from guessed file contents.
 
-Manifest writes, flushes, and compactions are serialized. Foreground writes use a separate mutex; they do not hold the state write lock across WAL I/O. Full-run compaction is prioritized at its threshold so a continuous flush workload cannot starve merging. The frozen-table limit applies backpressure when the worker lags.
+Manifest writes, flushes, and compactions are serialized. Foreground writes use a separate mutex; they do not hold the state write lock across WAL I/O. Eligible compaction jobs run before the next flush. Size-tiered jobs select the oldest IDs in the smallest ready power-of-two file-size bucket; each job takes exactly `compaction_file_threshold` files. Full mode selects all live SSTs at that threshold. The frozen-table limit applies backpressure when the worker lags.
 
 ## Recovery notes
 
@@ -92,7 +92,8 @@ Pass an `Options` value to `Engine::open_with_options()`.
 | `block_size` | 16 KiB | Target block size; one larger record is allowed |
 | `block_cache_capacity` | 8 MiB | Cache budget; zero disables it |
 | `bloom_filter_bits_per_key` | 10 | Filter bits per key; range 1–30 |
-| `compaction_file_threshold` | 4 | Merge all SSTs at this count; minimum 2 |
+| `compaction_style` | `SizeTiered` | Similar-size merges; `Full` selects the original all-file policy |
+| `compaction_file_threshold` | 4 | Files per bucket before merging (total files for Full); minimum 2 |
 | `max_key_size` | 1 MiB | Maximum key length |
 | `max_value_size` | 16 MiB | Maximum value length |
 
@@ -101,3 +102,13 @@ Key/value limits plus the 17-byte record header must fit within 32 MiB. Block ta
 Memory accounting allows one oversized record per memtable. Indexes, filters, merge buffers, allocator overhead, and values held by callers are separate from the memtable/cache budgets.
 
 `stats()` reports sequence, memory usage, frozen-table count, SST files/records, block reads, cache hits, and Bloom negatives. SST record counts include duplicates and tombstones before compaction. Block reads count engine calls, including reads served by the OS cache.
+
+## Compaction policy and metrics
+
+Size tiers use `floor(log2(file_bytes))`: files in one bucket differ in size by less than a factor of two. After scheduled work settles, every bucket contains fewer than the threshold number of files. This bounds file count per bucket, not the total database size or individual job bytes. Adjacent bucket boundaries can separate nearly equal files. The policy favors small ready buckets and does not implement leveled key-range partitioning or an age-based cleanup policy.
+
+`flush()` persists writes before its writer barrier and completes currently eligible compactions before returning. It may therefore take longer than an SST write alone. `compact()` additionally requests one full merge, including when a single SST still contains tombstones. Partial compaction conservatively keeps tombstones even when an individual key happens to have no older version elsewhere. Use a full merge to reclaim cold obsolete versions that do not reach a size-tier threshold.
+
+The manifest/SST/WAL formats are unchanged. Selection uses existing file lengths and does not require persistent level metadata. The policy can change on reopen. Existing Rust callers that enumerate every `Options` field must add `compaction_style` or use `..Options::default()`.
+
+Additional stats: `sst_bytes` is the sum of live SST file lengths. `flush_bytes`, `compaction_input_bytes`, `compaction_output_bytes`, and `compactions` count successfully published operations since open. Input bytes sum selected file lengths; output bytes include framing, indexes, and Bloom filters. These are logical file accounting, not device I/O measurements; WAL, manifest, filesystem amplification, and failed/orphan writes are excluded. Counters reset on reopen and are not an atomic multi-field snapshot.
