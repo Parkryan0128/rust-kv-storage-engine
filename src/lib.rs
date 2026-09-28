@@ -20,5 +20,6 @@ mod manifest;
 mod memtable;
 mod sstable;
 mod wal;
+pub use compaction::CompactionStyle;
 pub use engine::{Engine, KvEngine, Options, Result, Stats};
 pub use error::EngineError;

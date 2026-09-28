@@ -16,6 +16,10 @@ struct Entry {
 #[derive(Default)]
 pub(crate) struct Counters {
     pub reads: AtomicU64,
+    pub flush_bytes: AtomicU64,
+    pub compaction_input_bytes: AtomicU64,
+    pub compaction_output_bytes: AtomicU64,
+    pub compactions: AtomicU64,
     pub hits: AtomicU64,
     pub bloom_negatives: AtomicU64,
 }

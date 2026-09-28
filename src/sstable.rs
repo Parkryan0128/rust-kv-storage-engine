@@ -28,6 +28,7 @@ pub(crate) struct Table {
     index: Vec<Index>,
     bloom: Bloom,
     pub count: u64,
+    pub file_bytes: u64,
     pub max_seq: u64,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -174,6 +175,7 @@ impl Table {
             index,
             bloom,
             count,
+            file_bytes: len,
             max_seq,
         })
     }

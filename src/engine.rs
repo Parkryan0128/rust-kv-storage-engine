@@ -1,7 +1,7 @@
 use crate::{
     cache::{Cache, Counters},
     codec::MAX_RECORD,
-    compaction::Merge,
+    compaction::{self, CompactionStyle, Merge},
     error::{corrupt, EngineError},
     fault,
     manifest::Manifest,
@@ -39,7 +39,8 @@ pub struct Options {
     pub block_size: usize,
     pub block_cache_capacity: usize,
     pub bloom_filter_bits_per_key: usize,
-    /// SST count that triggers compaction; minimum 2.
+    pub compaction_style: CompactionStyle,
+    /// Files per size bucket (or all files for Full); minimum 2.
     pub compaction_file_threshold: usize,
     pub max_key_size: usize,
     pub max_value_size: usize,
@@ -52,6 +53,7 @@ impl Default for Options {
             block_size: 16 * 1024,
             block_cache_capacity: 8 * 1024 * 1024,
             bloom_filter_bits_per_key: 10,
+            compaction_style: CompactionStyle::default(),
             compaction_file_threshold: 4,
             max_key_size: 1024 * 1024,
             max_value_size: 16 * 1024 * 1024,
@@ -91,6 +93,12 @@ pub struct Stats {
     pub cache_hits: u64,
     pub bloom_negatives: u64,
     pub cache_bytes: usize,
+    pub sst_bytes: u64,
+    /// Bytes of completed SST publications since this engine was opened.
+    pub flush_bytes: u64,
+    pub compaction_input_bytes: u64,
+    pub compaction_output_bytes: u64,
+    pub compactions: u64,
 }
 struct Frozen {
     id: u64,
@@ -312,10 +320,9 @@ impl Engine {
                                 if c.state.read().fatal.is_some() {
                                     break;
                                 }
-                                let work = if c.state.read().tables.len()
-                                    >= c.options.compaction_file_threshold
-                                {
-                                    c.compact_all()
+                                let inputs = c.compaction_inputs();
+                                let work = if !inputs.is_empty() {
+                                    c.compact_tables(inputs)
                                 } else if !c.state.read().immutable.is_empty() {
                                     c.flush_one()
                                 } else {
@@ -371,7 +378,7 @@ impl Engine {
         }
         Ok(newest.and_then(|r| r.value))
     }
-    /// Flush all writes before this call's writer barrier to SSTs.
+    /// Flush writes before the writer barrier, then drain eligible compactions.
     pub fn flush(&self) -> Result<()> {
         let c = &self.inner.core;
         if c.disk.is_none() {
@@ -392,14 +399,16 @@ impl Engine {
         let result = (|| loop {
             let s = c.state.read();
             check(&s)?;
-            if s.manifest.wal_floor >= goal {
-                return Ok(());
-            }
+            let flushed = s.manifest.wal_floor >= goal;
             drop(s);
-            if c.state.read().tables.len() >= c.options.compaction_file_threshold {
-                c.compact_all()?;
+            let inputs = c.compaction_inputs();
+            if !inputs.is_empty() {
+                c.compact_tables(inputs)?;
+            } else if flushed {
+                return Ok(());
+            } else {
+                c.flush_one()?;
             }
-            c.flush_one()?;
         })();
         if let Err(e) = &result {
             c.poison(e);
@@ -435,6 +444,11 @@ impl Engine {
             cache_hits: c.counters.hits.load(Ordering::Relaxed),
             bloom_negatives: c.counters.bloom_negatives.load(Ordering::Relaxed),
             cache_bytes: c.cache.lock().bytes(),
+            sst_bytes: s.tables.iter().map(|t| t.file_bytes).sum(),
+            flush_bytes: c.counters.flush_bytes.load(Ordering::Relaxed),
+            compaction_input_bytes: c.counters.compaction_input_bytes.load(Ordering::Relaxed),
+            compaction_output_bytes: c.counters.compaction_output_bytes.load(Ordering::Relaxed),
+            compactions: c.counters.compactions.load(Ordering::Relaxed),
         }
     }
 }
@@ -608,6 +622,9 @@ impl Core {
         manifest.max_seq = manifest.max_seq.max(table.max_seq);
         manifest.tables.push(id);
         manifest.save(dir)?;
+        self.counters
+            .flush_bytes
+            .fetch_add(table.file_bytes, Ordering::Relaxed);
         {
             let mut s = self.state.write();
             s.manifest = manifest;
@@ -620,35 +637,59 @@ impl Core {
         sync_dir(&dir.join("wal"))?;
         Ok(())
     }
+    fn compaction_inputs(&self) -> Vec<Arc<Table>> {
+        compaction::pick(
+            &self.state.read().tables,
+            self.options.compaction_file_threshold,
+            self.options.compaction_style,
+        )
+    }
     fn compact_all(&self) -> Result<()> {
         let tables = self.state.read().tables.clone();
+        self.compact_tables(tables)
+    }
+    fn compact_tables(&self, tables: Vec<Arc<Table>>) -> Result<()> {
         if tables.is_empty() {
             return Ok(());
         }
         let dir = &self.disk.as_ref().unwrap().dir;
         let id = self.allocate()?;
         let estimate = tables.iter().map(|t| t.count).sum();
+        let selected: HashSet<_> = tables.iter().map(|t| t.id).collect();
+        let drop_tombstones = selected.len() == self.state.read().tables.len();
+        let input_bytes = tables.iter().map(|t| t.file_bytes).sum();
         let merged = Arc::new(Table::write(
             &sst_path(dir, id),
             id,
-            Merge::new(&tables)?,
+            Merge::new(&tables, drop_tombstones)?,
             estimate,
             self.options.block_size,
             self.options.bloom_filter_bits_per_key,
         )?);
         let mut manifest = self.state.read().manifest.clone();
-        manifest.tables = vec![id];
+        manifest.tables.retain(|id| !selected.contains(id));
+        manifest.tables.push(id);
         manifest.save(dir)?;
+        self.counters
+            .compaction_input_bytes
+            .fetch_add(input_bytes, Ordering::Relaxed);
+        self.counters
+            .compaction_output_bytes
+            .fetch_add(merged.file_bytes, Ordering::Relaxed);
+        self.counters.compactions.fetch_add(1, Ordering::Relaxed);
         {
             let mut s = self.state.write();
             s.manifest = manifest;
-            s.tables = vec![merged];
+            s.tables.retain(|t| !selected.contains(&t.id));
+            s.tables.push(merged);
         }
         fault::hit("compaction_before_old_delete")?;
         for old in tables {
             fs::remove_file(sst_path(dir, old.id))?;
+            fault::hit("compaction_after_old_delete")?;
         }
         sync_dir(&dir.join("sst"))?;
+        fault::hit("compaction_after_dir_sync")?;
         Ok(())
     }
 }
