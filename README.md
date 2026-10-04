@@ -36,6 +36,15 @@ fn main() -> Result<()> {
 
 `Engine::new()` creates an in-memory store. `Engine::clone()` shares the same database and can be used across threads. Only one engine can open a database directory at a time.
 
+Use it as a Rust library by adding the repository to your application's `Cargo.toml` (pin a reviewed commit for deployment):
+
+```toml
+[dependencies]
+rust-kv-storage-engine = { git = "https://github.com/Parkryan0128/rust-kv-storage-engine" }
+```
+
+There is no general-purpose `put/get/delete` CLI. The executable targets are the browser demo, benchmark reports, and a test-only crash worker.
+
 Flush pending records to SSTables and merge them explicitly:
 
 ```rust
@@ -88,11 +97,19 @@ cargo test --locked --all-features
 cargo test --locked --release --all-features
 ```
 
-Run the five-million-write stress test, which repeatedly overwrites 100 keys:
+Run the extended tests: five million overwrites of 100 keys, and growth to one million distinct keys with reopen, update, delete, and compaction checks:
 
 ```bash
 cargo test --locked --release --all-features --test stress -- --ignored --nocapture
 ```
+
+To run the growing-database test on a chosen local disk, set `KV_STRESS_DIR` to an existing scratch directory on that disk:
+
+```bash
+KV_STRESS_DIR=/mnt/test-disk/kv-scratch cargo test --locked --release --test stress million_distinct_keys -- --ignored --nocapture
+```
+
+The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. CI runs the million-distinct-key test in a separate Linux job.
 
 Check formatting and lints:
 

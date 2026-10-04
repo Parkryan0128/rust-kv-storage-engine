@@ -1,4 +1,4 @@
-use rust_kv_storage_engine::{Engine, EngineError, Options};
+use rust_kv_storage_engine::{Engine, Options};
 
 fn key(id: u8) -> Vec<u8> {
     let mut key = vec![0; 1024 * 1024];
@@ -39,10 +39,7 @@ fn large_keys_compact_past_one_metadata_frame_and_recover() {
     assert_eq!(db.get(&key(0)).unwrap(), None);
     assert_eq!(db.get(&key(63)).unwrap().as_deref(), Some(&b"updated"[..]));
     // Successful maintenance must not leave the engine in its fatal state.
-    assert!(!matches!(
-        db.put(b"after-compaction", b"healthy"),
-        Err(EngineError::Background(_))
-    ));
+    db.put(b"after-compaction", b"healthy").unwrap();
     assert_eq!(
         db.get(b"after-compaction").unwrap().as_deref(),
         Some(&b"healthy"[..])
