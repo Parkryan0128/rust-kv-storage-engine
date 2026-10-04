@@ -4,7 +4,7 @@ An embedded key-value storage engine written in Rust.
 
 It writes changes to a log before updating memory, flushes sorted tables to disk, and merges them in the background. Reads use Bloom filters and a block cache.
 
-[Benchmark results](docs/benchmarks.md) · [Compaction comparison](docs/compaction.md)
+[Benchmarks and compaction results](docs/benchmarks.md)
 
 ## How it works
 
@@ -57,7 +57,7 @@ Use the browser demo to write keys, inspect memory and SST files, and compare co
 cargo run --locked --release --example demo
 ```
 
-Open **http://127.0.0.1:8080**. Everything runs locally in a temporary sandbox. [Demo walkthrough](docs/demo.md).
+Open **http://127.0.0.1:8080**. The server binds to loopback and uses a temporary database for each launch. **Close & reopen database** keeps the current files; stopping the server ends the session.
 
 ## Project structure
 
@@ -67,7 +67,7 @@ src/bin/    Crash-test subprocess
 tests/      API, recovery, corruption, concurrency, and stress tests
 benches/    Criterion benchmarks
 examples/   Local browser demo, latency and compaction reports
-docs/       Storage format, test notes, and benchmark results
+docs/       Storage format and benchmark results
 ```
 
 ## Build
@@ -88,7 +88,7 @@ cargo test --locked --all-features
 cargo test --locked --release --all-features
 ```
 
-Run the five-million-write stress test:
+Run the five-million-write stress test, which repeatedly overwrites 100 keys:
 
 ```bash
 cargo test --locked --release --all-features --test stress -- --ignored --nocapture
@@ -101,7 +101,14 @@ cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-The `fault-injection` feature is for tests; leave it disabled in applications. [Test coverage and recorded runs](docs/validation.md).
+Check the local demo:
+
+```bash
+cargo build --locked --release --example demo
+python3 scripts/test_demo.py
+```
+
+Tests cover crash recovery, corruption, concurrent operations, and compaction. Process-kill tests leave the OS cache intact; physical power loss has not been tested. The `fault-injection` feature is for tests; leave it disabled in applications.
 
 ## Benchmarks
 
