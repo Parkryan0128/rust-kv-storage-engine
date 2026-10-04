@@ -45,19 +45,19 @@ db.compact()?;
 
 Persistent writes are synced to the WAL before returning. After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
 
-Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` for the original policy. Size tiers trade lower write amplification for more retained versions and potentially slower reads. Transactions, range scans, and replication are not implemented.
+Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads. Transactions, range scans, and replication are not implemented.
 
 [Storage format and configuration](docs/storage-format.md)
 
 ## Local demo
 
-Explore real writes, memory records, SST files, and a side-by-side compaction comparison in your browser:
+Use the browser demo to write keys, inspect memory and SST files, and compare compaction policies:
 
 ```bash
 cargo run --locked --release --example demo
 ```
 
-Open **http://127.0.0.1:8080**. Everything runs locally in a temporary sandbox. [Walkthrough and screenshots](docs/demo.md).
+Open **http://127.0.0.1:8080**. Everything runs locally in a temporary sandbox. [Demo walkthrough](docs/demo.md).
 
 ## Project structure
 
@@ -77,15 +77,11 @@ Requirements:
 - Rust 1.85 or newer
 - Linux or macOS with a local filesystem
 
-Build the project:
-
 ```bash
 cargo build --locked
 ```
 
 ## Tests
-
-Run the test suite:
 
 ```bash
 cargo test --locked --all-features
@@ -129,7 +125,4 @@ cargo run --locked --release --example compaction_report -- 3
 
 ## Contact
 
-- **Name:** Ryan Park
-- **Email:** [parkryan0128@gmail.com](mailto:parkryan0128@gmail.com)
-- **LinkedIn:** [linkedin.com/in/parkryan0128](https://www.linkedin.com/in/parkryan0128)
-- **GitHub:** [github.com/Parkryan0128](https://github.com/Parkryan0128)
+Ryan Park · [Email](mailto:parkryan0128@gmail.com) · [LinkedIn](https://www.linkedin.com/in/parkryan0128) · [GitHub](https://github.com/Parkryan0128)
