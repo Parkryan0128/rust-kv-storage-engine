@@ -301,7 +301,9 @@ fn read_index(
     if off != *end
         || bl as usize > MAX_FRAME + HEADER
         || bl < HEADER as u32
-        || off.checked_add(bl as u64).is_none_or(|e| e > metadata_offset)
+        || off
+            .checked_add(bl as u64)
+            .is_none_or(|e| e > metadata_offset)
         || index.last().is_some_and(|p| p.first >= first)
     {
         return Err(corrupt("SST index bounds/order"));
