@@ -36,6 +36,8 @@ fn main() -> Result<()> {
 
 `Engine::new()` creates an in-memory store. `Engine::clone()` shares the same database and can be used across threads. Only one engine can open a database directory at a time.
 
+In-memory deletes remove keys immediately. Persistent deletes retain tombstones until compaction can safely discard them, so older on-disk values do not reappear.
+
 Use it as a Rust library by adding the repository to your application's `Cargo.toml` (pin a reviewed commit for deployment):
 
 ```toml
@@ -125,7 +127,9 @@ cargo build --locked --release --example demo
 python3 scripts/test_demo.py
 ```
 
-Tests cover crash recovery, corruption, concurrent operations, and compaction. Process-kill tests leave the OS cache intact; physical power loss has not been tested. The `fault-injection` feature is for tests; leave it disabled in applications.
+Tests cover crash recovery, corruption, concurrent operations, and compaction, including a merge that encounters corrupt input without publishing partial output or deleting its sources. They also check memory reclamation, cache eviction and accounting, interrupted/short I/O, empty keys and values, and directory locks through symlinks. CI checks all targets and features with Rust 1.85.0 in addition to stable Rust on Linux and macOS.
+
+Process-kill tests leave the OS cache intact; physical power loss has not been tested. The `fault-injection` feature is for tests; leave it disabled in applications.
 
 ## Benchmarks
 

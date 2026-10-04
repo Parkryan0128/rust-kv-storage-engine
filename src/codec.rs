@@ -124,3 +124,92 @@ pub(crate) fn read_frame(r: &mut impl Read, allow_tail: bool) -> Result<Option<V
     }
     Ok(Some(b))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EngineError;
+    use std::io::{self, ErrorKind};
+
+    // Alternate interruptions and short transfers, including within the payload.
+    struct Fragmented<T> {
+        inner: T,
+        interrupt: bool,
+    }
+    impl<T: Read> Read for Fragmented<T> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(3);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+    impl<T: Write> Write for Fragmented<T> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            self.inner.write(&buf[..buf.len().min(3)])
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    struct FailedRead;
+    impl Read for FailedRead {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(ErrorKind::PermissionDenied.into())
+        }
+    }
+
+    #[test]
+    fn frames_survive_short_and_interrupted_io() {
+        let payload = b"a payload longer than one transfer";
+        let mut writer = Fragmented {
+            inner: Vec::new(),
+            interrupt: false,
+        };
+        assert_eq!(
+            write_frame(&mut writer, payload).unwrap(),
+            (HEADER + payload.len()) as u64
+        );
+        write_frame(&mut writer, b"").unwrap();
+        let mut reader = Fragmented {
+            inner: writer.inner.as_slice(),
+            interrupt: false,
+        };
+        assert_eq!(read_frame(&mut reader, false).unwrap().unwrap(), payload);
+        assert_eq!(read_frame(&mut reader, false).unwrap(), Some(vec![]));
+        assert_eq!(read_frame(&mut reader, false).unwrap(), None);
+    }
+
+    #[test]
+    fn io_errors_are_not_mistaken_for_recoverable_tails() {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, b"payload").unwrap();
+        for cut in 0..frame.len() {
+            for allow_tail in [false, true] {
+                let mut reader = (&frame[..cut]).chain(FailedRead);
+                assert!(matches!(
+                    read_frame(&mut reader, allow_tail),
+                    Err(EngineError::Io(e)) if e.kind() == ErrorKind::PermissionDenied
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_writes_are_reported_as_errors() {
+        let payload = b"payload";
+        for capacity in 0..HEADER + payload.len() {
+            let mut storage = vec![0; capacity];
+            assert!(matches!(
+                write_frame(&mut storage.as_mut_slice(), payload),
+                Err(EngineError::Io(e)) if e.kind() == ErrorKind::WriteZero
+            ));
+        }
+    }
+}

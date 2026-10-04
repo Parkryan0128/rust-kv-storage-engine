@@ -26,6 +26,13 @@ jobs:
       - run: cargo bench --locked --bench engine --no-run
       - run: cargo build --locked --release --example demo
       - run: python3 scripts/test_demo.py
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --locked --all-targets --all-features
   growing-database:
     runs-on: ubuntu-latest
     timeout-minutes: 30
