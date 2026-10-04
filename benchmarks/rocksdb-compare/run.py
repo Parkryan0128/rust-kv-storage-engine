@@ -36,9 +36,9 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     binaries = {name: Path("comparison-bin", name).resolve() for name in ("engine", "rocksdb")}
     metadata = {
-        "commit": capture("git", "rev-parse", "HEAD"),
+        "commit": os.environ.get("KV_BENCH_COMMIT") or capture("git", "rev-parse", "HEAD"),
         "platform": platform.platform(),
-        "rust": capture("rustc", "--version"),
+        "rust": os.environ.get("KV_BENCH_RUST") or capture("rustc", "--version"),
         "cpu": capture("lscpu"),
         "host_memory": Path("/proc/meminfo").read_text(),
         "binaries": {

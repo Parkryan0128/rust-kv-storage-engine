@@ -74,9 +74,8 @@ fn process_memory() -> Value {
 fn cgroup_memory() -> Result<Value> {
     let root = std::env::var("KV_BENCH_CGROUP")?;
     let root = Path::new(&root);
-    let read = |name: &str| -> Result<u64> {
-        Ok(fs::read_to_string(root.join(name))?.trim().parse()?)
-    };
+    let read =
+        |name: &str| -> Result<u64> { Ok(fs::read_to_string(root.join(name))?.trim().parse()?) };
     let stat = fs::read_to_string(root.join("memory.stat"))?;
     let field = |name: &str| -> Option<u64> {
         stat.lines().find_map(|line| {
