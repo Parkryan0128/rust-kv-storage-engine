@@ -231,23 +231,31 @@ fn corrupt_compaction_input_does_not_publish_or_delete_live_files() {
     let db = Engine::open_with_options(dir.path(), opts.clone()).unwrap();
     db.put(b"a", &[1; 64]).unwrap();
     db.put(b"b", &[2; 64]).unwrap();
+    db.put(b"c", &[3; 64]).unwrap();
+    db.put(b"d", &[4; 64]).unwrap();
     db.flush().unwrap();
     let damaged = files(&dir.path().join("sst"), "sst").pop().unwrap();
     db.put(b"z", b"healthy").unwrap();
     db.flush().unwrap();
     drop(db);
 
-    // Damage the second data block so the merge starts successfully, then fails.
+    // Fail after enough records to have written a data block to the temporary SST.
     let mut bytes = fs::read(&damaged).unwrap();
-    let first_payload = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let second_payload = 8 + 12 + first_payload + 12;
-    bytes[second_payload] ^= 1;
+    let mut offset = 8;
+    for _ in 0..3 {
+        let payload = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 12 + payload as usize;
+    }
+    bytes[offset + 12] ^= 1;
     fs::write(&damaged, bytes).unwrap();
     let manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
     let live = files(&dir.path().join("sst"), "sst");
     let contents: Vec<_> = live.iter().map(|p| fs::read(p).unwrap()).collect();
     let db = Engine::open_with_options(dir.path(), opts.clone()).unwrap();
     assert!(matches!(db.compact(), Err(EngineError::Corruption(_))));
+    let partial = files(&dir.path().join("sst"), "tmp");
+    assert_eq!(partial.len(), 1);
+    assert!(fs::metadata(&partial[0]).unwrap().len() > 8);
     assert!(matches!(
         db.put(b"must-reject", b"value"),
         Err(EngineError::Background(_))
@@ -262,8 +270,8 @@ fn corrupt_compaction_input_does_not_publish_or_delete_live_files() {
     let db = Engine::open_with_options(dir.path(), opts).unwrap();
     assert_eq!(db.get(b"z").unwrap().unwrap(), "healthy");
     assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&[1; 64][..]));
-    assert!(matches!(db.get(b"b"), Err(EngineError::Corruption(_))));
-    assert_eq!(db.stats().sequence, 3);
+    assert!(matches!(db.get(b"d"), Err(EngineError::Corruption(_))));
+    assert_eq!(db.stats().sequence, 5);
     assert_eq!(files(&dir.path().join("sst"), "sst"), live);
     assert!(files(&dir.path().join("sst"), "tmp").is_empty());
 }
