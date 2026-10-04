@@ -137,13 +137,20 @@ fn value_for(buffer: &mut [u8], key: u64, updated: bool) {
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
-    assert_eq!(args.len(), 4, "usage: resource_report NEW_DIR KEYS VALUE_BYTES");
+    assert_eq!(
+        args.len(),
+        4,
+        "usage: resource_report NEW_DIR KEYS VALUE_BYTES"
+    );
     let keys: usize = args[2].parse().expect("positive key count");
     let value_bytes: usize = args[3].parse().expect("value size in bytes");
     assert!(keys > 0 && keys % 4 == 0);
     assert!((9..=16 * 1024 * 1024).contains(&value_bytes));
     let dir = Path::new(&args[1]);
-    assert!(!dir.exists(), "use a fresh database directory for every run");
+    assert!(
+        !dir.exists(),
+        "use a fresh database directory for every run"
+    );
     let run = Run {
         dir,
         keys,
@@ -222,7 +229,13 @@ fn main() -> Result<()> {
             }
         },
     )?;
-    run.report("verify_after_reopen", &db, keys * 3 / 4, verify, Duration::ZERO)?;
+    run.report(
+        "verify_after_reopen",
+        &db,
+        keys * 3 / 4,
+        verify,
+        Duration::ZERO,
+    )?;
     println!("RESOURCE_VERIFIED keys={keys} value_bytes={value_bytes}");
     Ok(())
 }
