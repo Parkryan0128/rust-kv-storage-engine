@@ -92,7 +92,7 @@ Pass an `Options` value to `Engine::open_with_options()`.
 | `block_size` | 16 KiB | Target block size; one larger record is allowed |
 | `block_cache_capacity` | 8 MiB | Cache budget; zero disables it |
 | `bloom_filter_bits_per_key` | 10 | Filter bits per key; range 1–30 |
-| `compaction_style` | `SizeTiered` | Similar-size merges; `Full` selects the original all-file policy |
+| `compaction_style` | `SizeTiered` | Similar-size merges; `Full` merges all live SSTs |
 | `compaction_file_threshold` | 4 | Files per bucket before merging (total files for Full); minimum 2 |
 | `max_key_size` | 1 MiB | Maximum key length |
 | `max_value_size` | 16 MiB | Maximum value length |
@@ -109,6 +109,6 @@ Size tiers use `floor(log2(file_bytes))`: files in one bucket differ in size by 
 
 `flush()` persists writes before its writer barrier and completes currently eligible compactions before returning. It may therefore take longer than an SST write alone. `compact()` additionally requests one full merge, including when a single SST still contains tombstones. Partial compaction conservatively keeps tombstones even when an individual key happens to have no older version elsewhere. Use a full merge to reclaim cold obsolete versions that do not reach a size-tier threshold.
 
-The manifest/SST/WAL formats are unchanged. Selection uses existing file lengths and does not require persistent level metadata. The policy can change on reopen. Existing Rust callers that enumerate every `Options` field must add `compaction_style` or use `..Options::default()`.
+Compaction selection uses existing SST file lengths and does not store level metadata. Both policies use the same manifest, SST, and WAL formats. You can change `compaction_style` when reopening a database.
 
-Additional stats: `sst_bytes` is the sum of live SST file lengths. `flush_bytes`, `compaction_input_bytes`, `compaction_output_bytes`, and `compactions` count successfully published operations since open. Input bytes sum selected file lengths; output bytes include framing, indexes, and Bloom filters. These are logical file accounting, not device I/O measurements; WAL, manifest, filesystem amplification, and failed/orphan writes are excluded. Counters reset on reopen and are not an atomic multi-field snapshot.
+Storage statistics: `sst_bytes` is the sum of live SST file lengths. `flush_bytes`, `compaction_input_bytes`, `compaction_output_bytes`, and `compactions` count successfully published operations since open. Input bytes sum selected file lengths; output bytes include framing, indexes, and Bloom filters. These are logical file accounting, not device I/O measurements; WAL, manifest, filesystem amplification, and failed/orphan writes are excluded. Counters reset on reopen and are not an atomic multi-field snapshot.
