@@ -47,7 +47,11 @@ After a write or maintenance I/O error, drop all engine handles and reopen the d
 
 Records store a sequence number, a value/deletion tag, and key/value lengths and bytes. Empty values and deleted keys have different tags. Numbers use little-endian encoding; CRC32 checksums detect damaged frames.
 
-Frames are capped at 64 MiB and records at 32 MiB. Format version `01` has no migration support yet.
+Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST02`: a metadata summary frame followed by checksummed index pages targeting 1 MiB each. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit. This allows the total index to grow past one frame without stopping compaction.
+
+The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
+
+Existing `RKVSST01` SSTables remain readable, including in the same database as version `02` files. Flush and compaction write version `02`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read the new SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
 
 Exact layouts: [records](../src/codec.rs), [WAL](../src/wal.rs), [SSTables](../src/sstable.rs), [manifest](../src/manifest.rs).
 
@@ -67,7 +71,7 @@ Pass an `Options` value to `Engine::open_with_options()`.
 | `max_key_size` | 1 MiB | Maximum key length |
 | `max_value_size` | 16 MiB | Maximum value length |
 
-The key, value, and 17-byte record header must fit within 32 MiB. A single record can exceed the memtable or block target. Cache and memtable budgets do not cover all process memory.
+The key, value, and 17-byte record header must fit within 32 MiB. A single record can exceed the memtable or block target. Cache and memtable budgets do not cover all process memory. Index pages bound the serialization buffer, not the in-memory index: all SST indexes and Bloom filters are still loaded at open.
 
 SizeTiered applies the threshold per size group; Full counts all live files. The policy can change on reopen. [Option validation](../src/engine.rs).
 
