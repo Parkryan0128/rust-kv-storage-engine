@@ -83,3 +83,65 @@ impl Cache {
         self.bytes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn block(value_len: usize) -> Arc<Block> {
+        Arc::new(vec![(
+            b"k".to_vec(),
+            Record {
+                seq: 1,
+                value: Some(Bytes::from(vec![42; value_len])),
+            },
+        )])
+    }
+
+    #[test]
+    fn hits_promote_blocks_and_eviction_preserves_outstanding_readers() {
+        let mut cache = Cache::new(256);
+        let counters = Counters::default();
+        let first = block(15); // 128 accounted bytes, including cache overhead.
+        cache.insert((1, 0), first.clone());
+        cache.insert((1, 1), block(15));
+        let reader = cache.get((1, 0), &counters).unwrap();
+        assert!(Arc::ptr_eq(&reader, &first));
+        cache.insert((2, 0), block(15));
+        assert!(cache.get((1, 1), &counters).is_none());
+        assert!(cache.get((1, 0), &counters).is_some());
+        assert!(cache.get((2, 0), &counters).is_some());
+        assert_eq!(counters.hits.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.bytes(), 256);
+        cache.insert((3, 0), block(15));
+        assert!(cache.get((1, 0), &counters).is_none());
+        assert_eq!(reader[0].1.value.as_deref(), Some(&[42; 15][..]));
+    }
+
+    #[test]
+    fn replacements_oversized_blocks_and_disabled_cache_respect_capacity() {
+        let mut cache = Cache::new(256);
+        let counters = Counters::default();
+        cache.insert((1, 0), block(15));
+        cache.insert((2, 0), block(15));
+        let smaller = block(0);
+        cache.insert((1, 0), smaller.clone());
+        assert_eq!(cache.bytes(), 241);
+        assert!(Arc::ptr_eq(
+            &cache.get((1, 0), &counters).unwrap(),
+            &smaller
+        ));
+        cache.insert((3, 0), block(256));
+        assert_eq!(cache.bytes(), 241);
+        assert!(cache.get((3, 0), &counters).is_none());
+        cache.insert((2, 0), block(100));
+        assert_eq!(cache.bytes(), 213);
+        assert!(cache.get((1, 0), &counters).is_none());
+        assert!(cache.get((2, 0), &counters).is_some());
+        let mut disabled = Cache::new(0);
+        disabled.insert((1, 0), block(0));
+        assert_eq!(disabled.bytes(), 0);
+        assert!(disabled.get((1, 0), &counters).is_none());
+    }
+}

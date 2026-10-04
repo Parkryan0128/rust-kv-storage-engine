@@ -11,7 +11,7 @@ use crate::{
     wal::Wal,
 };
 use bytes::Bytes;
-use crossbeam::channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Sender};
 use fs2::FileExt;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
@@ -134,7 +134,7 @@ struct Core {
     counters: Counters,
     notify: Sender<()>,
     stop: AtomicBool,
-    progress: Mutex<u64>,
+    progress: Mutex<()>,
     changed: Condvar,
 }
 struct Handle {
@@ -228,7 +228,6 @@ impl Engine {
             tables.push(Arc::new(table));
         }
         wal_ids.retain(|id| *id > manifest.wal_floor);
-        wal_ids.sort_unstable();
         let mut sequence = manifest.max_seq;
         let mut immutable = VecDeque::new();
         let mut mem = MemTable::default();
@@ -300,7 +299,7 @@ impl Engine {
             counters: Counters::default(),
             notify: tx,
             stop: AtomicBool::new(false),
-            progress: Mutex::new(0),
+            progress: Mutex::new(()),
             changed: Condvar::new(),
         });
         let worker = if persistent {
@@ -565,8 +564,7 @@ impl Core {
         let _ = self.notify.try_send(());
     }
     fn progress(&self) {
-        let mut p = self.progress.lock();
-        *p = p.wrapping_add(1);
+        let _guard = self.progress.lock();
         self.changed.notify_all();
     }
     fn poison(&self, e: &EngineError) {
@@ -631,7 +629,12 @@ impl Core {
             }
         }
         let mut s = self.state.write();
-        s.mem.insert(key.to_vec(), record);
+        if self.disk.is_none() && record.value.is_none() {
+            // No older on-disk values exist to hide in a volatile engine.
+            s.mem.remove(key);
+        } else {
+            s.mem.insert(key.to_vec(), record);
+        }
         s.sequence = seq;
         Ok(())
     }
