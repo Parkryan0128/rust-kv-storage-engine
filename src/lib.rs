@@ -20,6 +20,8 @@ mod fault;
 mod inspection;
 mod manifest;
 mod memtable;
+#[cfg(test)]
+mod read_fixture;
 mod sstable;
 mod wal;
 pub use compaction::CompactionStyle;

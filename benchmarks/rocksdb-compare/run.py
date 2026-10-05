@@ -1,4 +1,4 @@
-"""Linux paired comparison; run with cgroup v2 write access on a disposable runner."""
+"""Random-read-only comparison; fixture creation is outside measured processes."""
 import hashlib
 import json
 import os
@@ -7,38 +7,39 @@ import platform
 import subprocess
 import sys
 import tempfile
-import uuid
+
+BASELINE = "c5fe790d5352bdea9df921419ff855938fd13aa9"
 
 
 def capture(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def create_group():
-    root = Path("/sys/fs/cgroup")
-    if "memory" not in (root / "cgroup.subtree_control").read_text().split():
-        (root / "cgroup.subtree_control").write_text("+memory")
-    group = root / ("kvcompare-" + uuid.uuid4().hex)
-    group.mkdir()
-    # Fail before benchmarking if the requested accounting is unavailable.
-    for name in ("memory.current", "memory.peak", "memory.stat", "memory.swap.current"):
-        (group / name).read_text()
-    return group
+def warm_files(path):
+    # Explicitly warm only the OS file cache, outside the measured child process.
+    for file in path.rglob("*"):
+        if file.is_file():
+            with file.open("rb") as source:
+                while source.read(1024 * 1024):
+                    pass
 
 
 def main():
-    if sys.argv[1:] == ["--check-cgroup"]:
-        group = create_group()
-        group.rmdir()
-        print("COMPARE_CGROUP_READY", flush=True)
-        return
     output = Path(sys.argv[1] if len(sys.argv) > 1 else "comparison-results")
     output.mkdir(parents=True, exist_ok=True)
-    binaries = {name: Path("comparison-bin", name).resolve() for name in ("engine", "rocksdb")}
+    names = ("baseline", "engine", "rocksdb")
+    binaries = {name: Path("comparison-bin", name).resolve() for name in names}
+    smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
+    queries = 1000 if smoke else 500_000
+    trials = 1 if smoke else 6
+    cases = [(100, 128, 1)] if smoke else [
+        (100_000, 128, 1), (1_000_000, 128, 5), (100_000, 1024, 5)
+    ]
     metadata = {
-        "commit": os.environ.get("KV_BENCH_COMMIT") or capture("git", "rev-parse", "HEAD"),
+        "commit": capture("git", "rev-parse", "HEAD"),
+        "baseline_commit": BASELINE,
         "platform": platform.platform(),
-        "rust": os.environ.get("KV_BENCH_RUST") or capture("rustc", "--version"),
+        "rust": capture("rustc", "--version"),
         "cpu": capture("lscpu"),
         "host_memory": Path("/proc/meminfo").read_text(),
         "binaries": {
@@ -47,75 +48,87 @@ def main():
         },
         "settings": {
             "rocksdb": "11.8.1 (rust-rocksdb 0.25.0)",
-            "write_buffer_bytes": 4 * 1024 * 1024,
-            "max_write_buffers": 3,
             "block_cache_bytes": 8 * 1024 * 1024,
-            "block_size": 16 * 1024,
+            "block_bytes": 16 * 1024,
             "bloom_bits_per_key": 10,
             "compression": "none",
-            "writes": "WAL enabled; sync per operation; fsync",
-            "compaction": "engine default size-tiered; RocksDB default leveled",
+            "queries_per_pass": queries,
+            "trials": trials,
+            "cases": cases,
         },
         "notes": [
-            "One client thread. Identical workload source, separate release executables.",
-            "Fresh process and database per trial. Engine order alternates between trials.",
-            "RSS includes harness/allocator. Cgroup memory includes charged anon/file/kernel pages.",
-            "Shared pages can be charged elsewhere; unique DB files are created after entering cgroup.",
-            "Do not add RSS and cgroup file bytes: mapped pages can overlap.",
-            "Memory budgets are configuration targets, not hard process limits.",
-            "Reopen keeps OS cache and allocator state; neither read pass is a cold-disk test.",
-            "Values are deterministic/compressible; compression is disabled for both engines.",
-            "Throughput includes verification and final flush/background compaction wait.",
-            "Operation latency sampled at most 10000 times per phase; excludes end-of-phase flush.",
-            "Disk allocation includes regular DB files, excluding directory metadata.",
-            "fsync calls on a hosted CI filesystem are not a power-loss durability test.",
+            "Only random Get is measured; every returned value is checked.",
+            "No write/update/delete/compaction or sequential verification phases.",
+            "Fixtures: production engine SST writer and RocksDB SstFileWriter/ingestion.",
+            "Both use the specified number of disjoint equally divided SST files.",
+            "Fixture construction and OS-cache warming are outside measured processes.",
+            "Each trial is a fresh process/block cache; two identical seeded random passes.",
+            "Read-only fixed layouts: engine compaction trigger 64; RocksDB read-only open.",
+            "Backend order rotates; six trials balance each backend's position twice.",
+            "RSS belongs to the read process only; setup peaks and charged file cache are excluded.",
+            "Results are not directly comparable with earlier organically generated layouts.",
+            "Baseline and current engine read the same fixture bytes with the same harness.",
+            "Latency samples time Get only; throughput includes RNG, validation and value release.",
+            "This is a single-client OS-cache-warm hit workload, not a physical-disk or write test.",
         ],
     }
-    cases = [(100_000, 128, trial) for trial in range(1, 4)]
-    cases += [(1_000_000, 128, trial) for trial in range(1, 3)]
-    cases += [(100_000, 1024, 1)]
-    if os.environ.get("KV_COMPARE_SMOKE") == "1":
-        cases = [(100, 128, 1)]
-    with tempfile.TemporaryDirectory(prefix="kvcompare-", dir=os.environ.get("KV_BENCH_DIR")) as root:
-        metadata["filesystem"] = capture("findmnt", "-T", root, "-o", "SOURCE,FSTYPE,OPTIONS")
+    with tempfile.TemporaryDirectory(prefix="kvread-", dir=os.environ.get("KV_BENCH_DIR")) as root:
+        root = Path(root)
+        metadata["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
         (output / "environment.json").write_text(json.dumps(metadata, indent=2))
-        print("COMPARE_ENV " + json.dumps(metadata), flush=True)
+        print("READ_ENV " + json.dumps(metadata), flush=True)
+        verified_count = 0
         with (output / "results.jsonl").open("w") as result_file:
-            for keys, size, trial in cases:
-                order = ("engine", "rocksdb") if trial % 2 else ("rocksdb", "engine")
-                for position, name in enumerate(order, 1):
-                    case = f"{keys}-{size}-{trial}-{name}"
-                    group = create_group()
-                    print(f"COMPARE_CASE {case}", flush=True)
-                    env = dict(os.environ, KV_BENCH_CGROUP=str(group))
-
-                    def enter_group():
-                        # Parent has no threads; move before exec/DB allocation.
-                        (group / "cgroup.procs").write_text(str(os.getpid()))
-
-                    verified = False
-                    try:
-                        command = [str(binaries[name]), str(Path(root) / case), str(keys), str(size)]
-                        with (output / f"{case}.log").open("w") as raw:
-                            with subprocess.Popen(command, stdout=subprocess.PIPE, text=True,
-                                                  env=env, preexec_fn=enter_group) as process:
-                                for line in process.stdout:
-                                    raw.write(line)
-                                    raw.flush()
-                                    if line.startswith("COMPARE_REPORT "):
-                                        record = json.loads(line.removeprefix("COMPARE_REPORT "))
-                                        record.update(engine=name, trial=trial, order=position)
-                                        result_file.write(json.dumps(record) + "\n")
-                                        result_file.flush()
-                                        print("COMPARE_RESULT " + json.dumps(record), flush=True)
-                                    else:
-                                        verified |= line.startswith("COMPARE_VERIFIED ")
-                                        print(line.rstrip(), flush=True)
-                                if process.wait() != 0 or not verified:
-                                    raise RuntimeError(f"workload {case} failed")
-                    finally:
-                        group.rmdir()
-    print("COMPARE_COMPLETE", flush=True)
+            for keys, size, tables in cases:
+                case = f"{keys}-{size}-{tables}"
+                engine_dir = root / (case + "-engine")
+                rocks_dir = root / (case + "-rocksdb")
+                print(f"READ_PREPARE {case}", flush=True)
+                env = dict(os.environ, KV_READ_FIXTURE_DIR=str(engine_dir),
+                           KV_READ_FIXTURE_KEYS=str(keys), KV_READ_FIXTURE_VALUE_BYTES=str(size),
+                           KV_READ_FIXTURE_TABLES=str(tables))
+                subprocess.run(
+                    ["cargo", "test", "--locked", "--release", "--lib",
+                     "read_fixture::write_read_benchmark_fixture", "--",
+                     "--ignored", "--exact", "--nocapture", "--test-threads=1"],
+                    env=env, check=True, timeout=180,
+                )
+                subprocess.run(
+                    [str(binaries["rocksdb"]), "prepare", str(rocks_dir),
+                     str(keys), str(size), str(tables)], check=True, timeout=180,
+                )
+                for trial in range(1, trials + 1):
+                    rotation = (trial - 1) % len(names)
+                    order = names[rotation:] + names[:rotation]
+                    seed = 0xACE123 + trial * 104729
+                    for position, name in enumerate(order, 1):
+                        directory = rocks_dir if name == "rocksdb" else engine_dir
+                        warm_files(directory)
+                        label = f"{case}-{trial}-{name}"
+                        print(f"READ_CASE {label}", flush=True)
+                        command = [str(binaries[name]), "read", str(directory), str(keys),
+                                   str(size), str(tables), str(queries), str(seed)]
+                        completed = subprocess.run(command, text=True, capture_output=True,
+                                                   check=True, timeout=120)
+                        (output / f"{label}.log").write_text(completed.stdout + completed.stderr)
+                        seen = []
+                        for line in completed.stdout.splitlines():
+                            if line.startswith("READ_REPORT "):
+                                record = json.loads(line.removeprefix("READ_REPORT "))
+                                assert record["keys"] == keys and record["value_bytes"] == size
+                                assert record["tables"] == tables and record["operations"] == queries
+                                record.update(engine=name, trial=trial, order=position)
+                                seen.append(record["stage"])
+                                result_file.write(json.dumps(record) + "\n")
+                                result_file.flush()
+                                print("READ_RESULT " + json.dumps(record), flush=True)
+                            else:
+                                print(line, flush=True)
+                        assert seen == ["random_read_first_pass", "random_read_repeat"]
+                        assert f"READ_VERIFIED queries={queries * 2} keys={keys}" in completed.stdout
+                        verified_count += 1
+        assert verified_count == len(cases) * trials * len(names)
+        print(f"READ_COMPLETE verified_processes={verified_count}", flush=True)
 
 
 if __name__ == "__main__":

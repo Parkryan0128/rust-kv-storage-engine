@@ -26,6 +26,14 @@ the allocated frame/index capacities and an allowance for cache bookkeeping;
 it is not a hard bound on process RSS. Iteration and compaction still decode
 complete blocks. The on-disk format is unchanged, including legacy SST support.
 
+Point reads share an immutable table-list snapshot. The block cache tracks LRU
+order through indexed links rather than a tree. When a miss requires eviction,
+an unshared victim's frame and offset buffers can be reused for the incoming
+block; outstanding readers retain their original immutable block. Oversized
+misses do not evict useful entries for recycling. Every reused frame and record
+is validated again before being cached. Cache charges include allocated buffer
+capacities and a per-entry allowance; no separate spare-buffer pool is retained.
+
 ## Combining files
 
 Compaction merges SSTables and keeps the newest record for each key.

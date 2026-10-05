@@ -13,10 +13,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: rocksdb-comparison-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
@@ -25,35 +28,47 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check memory accounting
-        run: sudo python3 benchmarks/rocksdb-compare/run.py --check-cgroup
+      - name: Check formatting
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+      - name: Validate engine
+        run: cargo test --locked --release --all-features
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - uses: actions/cache@v4
         with:
           path: benchmarks/rocksdb-compare/target
           key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
-      - name: Check formatting
-        run: cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
-      - name: Validate engine before benchmarking
-        run: |
-          cargo fmt --check
-          cargo test --locked --release --all-features
-      - name: Build both engines
+      - name: Check out the fixed pre-change baseline
+        uses: actions/checkout@v4
+        with:
+          ref: c5fe790d5352bdea9df921419ff855938fd13aa9
+          path: baseline-source
+      - name: Build identical random-read harnesses
         run: |
           mkdir -p comparison-bin
+          cp benchmarks/rocksdb-compare/Cargo.toml benchmarks/rocksdb-compare/Cargo.lock baseline-source/benchmarks/rocksdb-compare/
+          cp benchmarks/rocksdb-compare/src/*.rs baseline-source/benchmarks/rocksdb-compare/src/
+          cargo build --locked --release --manifest-path baseline-source/benchmarks/rocksdb-compare/Cargo.toml --target-dir benchmarks/rocksdb-compare/target
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --features rocks
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
-      - name: Verify small workload
-        run: sudo env KV_BENCH_COMMIT="$(git rev-parse HEAD)" KV_BENCH_RUST="$(rustc --version)" KV_COMPARE_SMOKE=1 KV_BENCH_DIR="$RUNNER_TEMP" python3 benchmarks/rocksdb-compare/run.py comparison-smoke
-      - name: Run paired measurements
-        run: sudo env KV_BENCH_COMMIT="$(git rev-parse HEAD)" KV_BENCH_RUST="$(rustc --version)" KV_BENCH_DIR="$RUNNER_TEMP" python3 benchmarks/rocksdb-compare/run.py comparison-results
+      - name: Verify small random workload
+        run: python3 benchmarks/rocksdb-compare/run.py comparison-smoke
+        env:
+          KV_COMPARE_SMOKE: '1'
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Measure random reads
+        run: python3 benchmarks/rocksdb-compare/run.py comparison-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rocksdb-comparison
+          name: rocksdb-random-read
           path: |
             comparison-results/
             comparison-smoke/

@@ -8,11 +8,22 @@ pub(crate) struct ReadBlock {
 }
 
 impl ReadBlock {
+    #[cfg(test)]
     pub fn decode(bytes: Vec<u8>, first: &[u8], next: Option<&[u8]>, max_seq: u64) -> Result<Self> {
+        Self::decode_reusing(bytes, Vec::new(), first, next, max_seq)
+    }
+
+    pub fn decode_reusing(
+        bytes: Vec<u8>,
+        mut offsets: Vec<u32>,
+        first: &[u8],
+        next: Option<&[u8]>,
+        max_seq: u64,
+    ) -> Result<Self> {
         let payload = frame_payload(&bytes)?;
         let mut c = Cursor { b: payload };
         let mut previous: Option<&[u8]> = None;
-        let mut offsets = Vec::new();
+        offsets.clear();
         while !c.b.is_empty() {
             let offset = bytes.len() - c.b.len();
             let r = decode_record_ref(&mut c)?;
@@ -25,6 +36,12 @@ impl ReadBlock {
             if previous.is_none() && r.key != first {
                 return Err(corrupt("SST first key mismatch"));
             }
+            if previous.is_none() && offsets.capacity() == 0 {
+                // A bounded hint from an already validated record avoids repeated
+                // small reallocations without trusting an on-disk record count.
+                let record_bytes = bytes.len() - c.b.len() - offset;
+                offsets.reserve((payload.len() / record_bytes).min(256));
+            }
             // Frames are limited to MAX_FRAME + HEADER, well below u32::MAX.
             offsets.push(offset as u32);
             previous = Some(r.key);
@@ -33,6 +50,19 @@ impl ReadBlock {
             return Err(corrupt("SST first key mismatch"));
         }
         Ok(Self { bytes, offsets })
+    }
+
+    pub fn into_buffers(self) -> (Vec<u8>, Vec<u32>) {
+        (self.bytes, self.offsets)
+    }
+
+    pub fn frame_capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    #[cfg(test)]
+    pub fn buffer_addresses(&self) -> (*const u8, *const u32) {
+        (self.bytes.as_ptr(), self.offsets.as_ptr())
     }
 
     fn key(&self, offset: u32) -> &[u8] {

@@ -108,7 +108,7 @@ struct Frozen {
 struct State {
     mem: MemTable,
     immutable: VecDeque<Arc<Frozen>>,
-    tables: Vec<Arc<Table>>,
+    tables: Arc<Vec<Arc<Table>>>,
     manifest: Manifest,
     sequence: u64,
     next_id: u64,
@@ -160,7 +160,7 @@ impl Engine {
             State {
                 mem: MemTable::default(),
                 immutable: VecDeque::new(),
-                tables: vec![],
+                tables: Arc::new(vec![]),
                 manifest: Manifest::default(),
                 sequence: 0,
                 next_id: 1,
@@ -277,7 +277,7 @@ impl Engine {
         let state = State {
             mem,
             immutable,
-            tables,
+            tables: Arc::new(tables),
             manifest,
             sequence,
             next_id,
@@ -369,7 +369,7 @@ impl Engine {
         let tables = s.tables.clone();
         drop(s);
         let mut newest: Option<Record> = None;
-        for table in tables {
+        for table in tables.iter() {
             if let Some(r) = table.get(key, &c.cache, &c.counters)? {
                 if newest.as_ref().is_none_or(|old| r.seq > old.seq) {
                     newest = Some(r);
@@ -687,7 +687,7 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
-            s.tables.push(table);
+            Arc::make_mut(&mut s.tables).push(table);
             s.immutable.pop_front();
         }
         self.progress();
@@ -705,7 +705,7 @@ impl Core {
     }
     fn compact_all(&self) -> Result<()> {
         let tables = self.state.read().tables.clone();
-        self.compact_tables(tables)
+        self.compact_tables(tables.as_ref().clone())
     }
     fn compact_tables(&self, tables: Vec<Arc<Table>>) -> Result<()> {
         if tables.is_empty() {
@@ -739,8 +739,9 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
-            s.tables.retain(|t| !selected.contains(&t.id));
-            s.tables.push(merged);
+            let tables = Arc::make_mut(&mut s.tables);
+            tables.retain(|t| !selected.contains(&t.id));
+            tables.push(merged);
         }
         fault::hit("compaction_before_old_delete")?;
         for old in tables {

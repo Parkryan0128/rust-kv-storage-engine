@@ -1,6 +1,6 @@
 use crate::{block::ReadBlock, memtable::Record};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -8,10 +8,14 @@ use std::{
 };
 pub(crate) type Block = Vec<(Vec<u8>, Record)>;
 type Key = (u64, usize);
+const NONE: usize = usize::MAX;
+const ENTRY_OVERHEAD: usize = 96;
 struct Entry {
+    key: Key,
     block: Arc<ReadBlock>,
     size: usize,
-    stamp: u64,
+    prev: usize,
+    next: usize,
 }
 #[derive(Default)]
 pub(crate) struct Counters {
@@ -26,59 +30,105 @@ pub(crate) struct Counters {
 pub(crate) struct Cache {
     capacity: usize,
     bytes: usize,
-    clock: u64,
-    entries: HashMap<Key, Entry>,
-    order: BTreeMap<u64, Key>,
+    entries: HashMap<Key, usize>,
+    slots: Vec<Option<Entry>>,
+    free: Vec<usize>,
+    head: usize,
+    tail: usize,
 }
 impl Cache {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
             bytes: 0,
-            clock: 0,
             entries: HashMap::new(),
-            order: BTreeMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: NONE,
+            tail: NONE,
         }
     }
-    fn tick(&mut self) -> u64 {
-        if self.clock == u64::MAX {
-            self.entries.clear();
-            self.order.clear();
-            self.bytes = 0;
-            self.clock = 0;
+    fn unlink(&mut self, index: usize) {
+        let e = self.slots[index].as_ref().unwrap();
+        let (prev, next) = (e.prev, e.next);
+        if prev == NONE {
+            self.head = next;
+        } else {
+            self.slots[prev].as_mut().unwrap().next = next;
         }
-        self.clock += 1;
-        self.clock
+        if next == NONE {
+            self.tail = prev;
+        } else {
+            self.slots[next].as_mut().unwrap().prev = prev;
+        }
+    }
+    fn link_front(&mut self, index: usize) {
+        let e = self.slots[index].as_mut().unwrap();
+        e.prev = NONE;
+        e.next = self.head;
+        if self.head == NONE {
+            self.tail = index;
+        } else {
+            self.slots[self.head].as_mut().unwrap().prev = index;
+        }
+        self.head = index;
+    }
+    fn remove(&mut self, index: usize) -> Entry {
+        self.unlink(index);
+        let e = self.slots[index].take().unwrap();
+        self.entries.remove(&e.key);
+        self.bytes -= e.size;
+        self.free.push(index);
+        e
     }
     pub fn get(&mut self, key: Key, counters: &Counters) -> Option<Arc<ReadBlock>> {
-        let stamp = self.tick();
-        let e = self.entries.get_mut(&key)?;
-        self.order.remove(&e.stamp);
-        e.stamp = stamp;
-        self.order.insert(stamp, key);
+        let index = *self.entries.get(&key)?;
+        if index != self.head {
+            self.unlink(index);
+            self.link_front(index);
+        }
         counters.hits.fetch_add(1, Ordering::Relaxed);
-        Some(e.block.clone())
+        Some(self.slots[index].as_ref().unwrap().block.clone())
     }
     pub fn insert(&mut self, key: Key, block: Arc<ReadBlock>) {
-        // Include allocated capacities, the block header, and cache bookkeeping.
-        let size = block.allocated_bytes() + 64;
+        let size = block.allocated_bytes() + ENTRY_OVERHEAD;
         if size > self.capacity {
             return;
         }
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes -= old.size;
-            self.order.remove(&old.stamp);
+        if let Some(&index) = self.entries.get(&key) {
+            self.remove(index);
         }
-        while self.bytes + size > self.capacity {
-            let (stamp, old) = self.order.pop_first().unwrap();
-            let e = self.entries.remove(&old).unwrap();
-            debug_assert_eq!(stamp, e.stamp);
-            self.bytes -= e.size;
+        while self.bytes > self.capacity - size {
+            self.remove(self.tail);
         }
-        let stamp = self.tick();
+        let index = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        });
+        self.slots[index] = Some(Entry {
+            key,
+            block,
+            size,
+            prev: NONE,
+            next: NONE,
+        });
+        self.link_front(index);
+        self.entries.insert(key, index);
         self.bytes += size;
-        self.order.insert(stamp, key);
-        self.entries.insert(key, Entry { block, size, stamp });
+    }
+    // Recycle a victim only when even the minimum incoming charge needs space.
+    // Arc::try_unwrap protects concurrent readers; an oversized miss does not
+    // evict useful cached blocks. No spare buffer is retained outside the budget.
+    pub fn take_reusable(&mut self, frame_len: usize) -> Option<ReadBlock> {
+        let minimum = frame_len
+            .saturating_add(std::mem::size_of::<ReadBlock>())
+            .saturating_add(ENTRY_OVERHEAD);
+        if self.tail == NONE || minimum > self.capacity || self.bytes <= self.capacity - minimum {
+            return None;
+        }
+        let old = self.remove(self.tail).block;
+        let block = Arc::try_unwrap(old).ok()?;
+        (block.frame_capacity() <= frame_len.saturating_mul(2)).then_some(block)
     }
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -108,7 +158,7 @@ mod tests {
     #[test]
     fn hits_promote_blocks_and_eviction_preserves_outstanding_readers() {
         let first = block(15);
-        let size = first.allocated_bytes() + 64;
+        let size = first.allocated_bytes() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(size * 2);
         let counters = Counters::default();
         cache.insert((1, 0), first.clone());
@@ -131,14 +181,14 @@ mod tests {
 
     #[test]
     fn replacements_oversized_blocks_and_disabled_cache_respect_capacity() {
-        let size = block(15).allocated_bytes() + 64;
+        let size = block(15).allocated_bytes() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(size * 2);
         let counters = Counters::default();
         cache.insert((1, 0), block(15));
         cache.insert((2, 0), block(15));
         let smaller = block(0);
         cache.insert((1, 0), smaller.clone());
-        let smaller_size = smaller.allocated_bytes() + 64;
+        let smaller_size = smaller.allocated_bytes() + ENTRY_OVERHEAD;
         assert_eq!(cache.bytes(), size + smaller_size);
         assert!(Arc::ptr_eq(
             &cache.get((1, 0), &counters).unwrap(),
@@ -148,7 +198,7 @@ mod tests {
         assert_eq!(cache.bytes(), size + smaller_size);
         assert!(cache.get((3, 0), &counters).is_none());
         let larger = block(100);
-        let larger_size = larger.allocated_bytes() + 64;
+        let larger_size = larger.allocated_bytes() + ENTRY_OVERHEAD;
         assert!(larger_size <= size * 2 && larger_size + smaller_size > size * 2);
         cache.insert((2, 0), larger);
         assert_eq!(cache.bytes(), larger_size);
@@ -158,5 +208,97 @@ mod tests {
         disabled.insert((1, 0), block(0));
         assert_eq!(disabled.bytes(), 0);
         assert!(disabled.get((1, 0), &counters).is_none());
+    }
+
+    #[test]
+    fn recycling_reuses_storage_but_never_overwrites_an_outstanding_reader() {
+        let first = block(15);
+        let size = first.allocated_bytes() + ENTRY_OVERHEAD;
+        let mut cache = Cache::new(size);
+        cache.insert((1, 0), first.clone());
+        assert!(cache.take_reusable(45).is_none());
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(
+            first.get(b"k").unwrap().value.as_deref(),
+            Some(&[42; 15][..])
+        );
+        let addresses = first.buffer_addresses();
+        cache.insert((2, 0), first);
+        assert!(cache.take_reusable(size * 2).is_none());
+        assert_eq!(cache.bytes(), size);
+        let recycled = cache.take_reusable(45).unwrap();
+        assert_eq!(cache.bytes(), 0);
+        // Reclaiming the block transferred its buffers rather than cloning them.
+        let (frame, offsets) = recycled.into_buffers();
+        assert_eq!((frame.as_ptr(), offsets.as_ptr()), addresses);
+        assert_eq!(frame.len(), 45);
+        assert!(!offsets.is_empty());
+        let mut next = Vec::new();
+        crate::codec::encode_record(
+            b"z",
+            &Record {
+                seq: 2,
+                value: None,
+            },
+            &mut next,
+        );
+        let mut new_frame = frame;
+        new_frame.clear();
+        crate::codec::write_frame(&mut new_frame, &next).unwrap();
+        let recycled = ReadBlock::decode_reusing(new_frame, offsets, b"z", None, 2).unwrap();
+        assert_eq!(recycled.get(b"z").unwrap().seq, 2);
+        assert!(recycled.get(b"k").is_none());
+    }
+
+    #[test]
+    fn indexed_lru_matches_a_reference_under_mixed_sizes_and_replacements() {
+        let mut cache = Cache::new(2048);
+        let counters = Counters::default();
+        let mut reference: Vec<(Key, Arc<ReadBlock>, usize)> = Vec::new();
+        let mut rng = 0x12345678u64;
+        for step in 0..10_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let key = (rng % 3, (rng % 31) as usize);
+            if step % 3 == 0 {
+                let position = reference.iter().position(|(k, _, _)| *k == key);
+                let expected = position.map(|i| {
+                    let e = reference.remove(i);
+                    let block = e.1.clone();
+                    reference.insert(0, e);
+                    block
+                });
+                let actual = cache.get(key, &counters);
+                assert_eq!(actual.is_some(), expected.is_some());
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert!(Arc::ptr_eq(&actual, &expected));
+                }
+            } else {
+                let block = block((rng % 4096) as usize);
+                let size = block.allocated_bytes() + ENTRY_OVERHEAD;
+                cache.insert(key, block.clone());
+                if size <= 2048 {
+                    reference.retain(|(k, _, _)| *k != key);
+                    while reference.iter().map(|e| e.2).sum::<usize>() + size > 2048 {
+                        reference.pop().unwrap();
+                    }
+                    reference.insert(0, (key, block, size));
+                }
+            }
+            assert_eq!(cache.bytes(), reference.iter().map(|e| e.2).sum::<usize>());
+            assert_eq!(cache.entries.len(), reference.len());
+            let mut index = cache.head;
+            let mut previous = NONE;
+            for (key, _, _) in &reference {
+                let e = cache.slots[index].as_ref().unwrap();
+                assert_eq!(e.key, *key);
+                assert_eq!(e.prev, previous);
+                previous = index;
+                index = e.next;
+            }
+            assert_eq!(index, NONE);
+            assert_eq!(cache.tail, previous);
+        }
     }
 }

@@ -236,15 +236,27 @@ impl Table {
         }
         let n = p - 1;
         // Drop the cache lock before reading from disk.
-        let cached = { cache.lock().get((self.id, n), counters) };
+        let i = &self.index[n];
+        let (cached, reusable) = {
+            let mut cache = cache.lock();
+            let cached = cache.get((self.id, n), counters);
+            let reusable = if cached.is_none() {
+                cache.take_reusable(i.len as usize)
+            } else {
+                None
+            };
+            (cached, reusable)
+        };
         let block = if let Some(b) = cached {
             b
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
-            let i = &self.index[n];
-            let bytes = at(&self.file, i.offset, i.len as usize)?;
-            let b = Arc::new(ReadBlock::decode(
+            let (mut bytes, offsets) = reusable.map(ReadBlock::into_buffers).unwrap_or_default();
+            bytes.resize(i.len as usize, 0);
+            self.file.read_exact_at(&mut bytes, i.offset)?;
+            let b = Arc::new(ReadBlock::decode_reusing(
                 bytes,
+                offsets,
                 &i.first,
                 self.index.get(n + 1).map(|next| next.first.as_slice()),
                 self.max_seq,

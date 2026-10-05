@@ -1,81 +1,72 @@
-# Paired Linux resource comparison
+# Random-read comparison
 
-This isolated package runs the same Rust workload against this engine and
-RocksDB 11.8.1, through rust-rocksdb 0.25.0. Each backend is built into a separate
-release executable. RocksDB is a benchmark dependency only; it does not change
-the library's dependencies or Rust 1.85 support. The benchmark requires Rust
-1.88 or newer and libclang for the native RocksDB build.
+This isolated package compares the current engine, the fixed pre-change engine
+at `c5fe790d5352bdea9df921419ff855938fd13aa9`, and RocksDB 11.8.1
+(rust-rocksdb 0.25.0). All three run the same Rust random-Get harness as separate
+release processes on one Linux host. RocksDB is only a benchmark dependency.
 
-Both backends use a 4 MiB write buffer, at most three write buffers, an 8 MiB
-block cache, 16 KiB blocks, ten Bloom filter bits per key, and no compression.
-Every individual mutation writes a WAL and calls fsync before returning.
-The engine retains its default size-tiered compaction and RocksDB its default
-leveled compaction. These are comparable configuration budgets, not identical
-algorithms or hard process memory limits. RocksDB's metadata remains outside
-the block cache, as it does in this engine.
+Only random point reads are measured. The previous write, update, delete,
+compaction and sequential verification phases have been removed. Ordinary
+correctness tests for those operations remain in the library's test suite.
 
-## Workload
+## Fixtures and conditions
 
-One client inserts increasing eight-byte keys, flushes, reopens, performs two
-identical random lookup passes, updates half the keys, deletes a quarter,
-flushes and fully compacts. It then reopens and verifies every key and value.
-The random read passes each contain at most 100,000 lookups. Values contain
-the key and an update marker so verification detects incorrect values as well
-as missing keys. No full in-memory expected-value map is kept.
+Fixtures are created once per case, before measured processes start:
 
-The runner performs three paired trials of 100,000 keys with 128-byte values,
-two paired trials of 1,000,000 keys with 128-byte values, and one paired trial
-of 100,000 keys with 1,024-byte values. Each trial uses a fresh process and
-database; backend order alternates. All trials run sequentially on one host.
+- The ignored library test `read_fixture::write_read_benchmark_fixture` uses
+  the production SST writer and manifest, without millions of WAL/fsync calls.
+- RocksDB's `SstFileWriter` and external-file ingestion create the same logical
+  key/value dataset with the same number of disjoint, equally divided files.
+- The old and new engine executables read the exact same engine fixture.
+- Both use 16 KiB blocks, an 8 MiB block-cache budget, ten Bloom bits per key
+  and no compression. Metadata is outside the block cache.
+- The engine compaction trigger is 64; RocksDB opens read-only. File counts are
+  asserted at open and after each pass, so the prepared layout remains fixed.
+- OS file cache is explicitly warmed before each process. This does not preload
+  the engine block cache. Datasets fit the benchmark host's RAM.
 
-## Run
+Cases: 100,000 keys / 128-byte values / one SST; 1,000,000 keys / 128-byte values /
+five SSTs; and 100,000 keys / 1,024-byte values / five SSTs. Keys are eight-byte
+big-endian integers; values encode the key and a known fill pattern.
 
-The `rocksdb-comparison` GitHub Actions workflow builds and runs this benchmark
-on a disposable Ubuntu runner. It uploads raw JSONL records, environment
-metadata, per-process logs, and the dependency lockfile. The small verification
-run is stored separately from full measurements.
+Each case runs six trials. Backend order rotates so each backend occupies every
+position twice. Seeds change between trials and match between backends. Each
+fresh process makes two identical seeded passes of 500,000 random successful
+Get calls, validating the entire returned value every time. No sequential Get
+pass is performed. The first pass starts with a fresh block cache; the second
+repeats the same query sequence.
 
-To reproduce on a disposable Linux host with cgroup v2 and its memory
-controller available:
+## Running
+
+Use the `rocksdb-comparison` workflow for the complete reproducible run. It
+builds the baseline with the current harness, runs a small smoke case and then
+the full comparison. Native RocksDB compilation requires Rust 1.88+ and
+libclang; the library still supports Rust 1.85.
+
+After producing `comparison-bin/baseline`, `comparison-bin/engine`, and
+`comparison-bin/rocksdb` as shown in the workflow:
 
 ```sh
-export CARGO_BUILD_JOBS=3 CXXFLAGS=-g0
-mkdir -p comparison-bin
-cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml
-cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
-cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --features rocks
-cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
-sudo env KV_BENCH_COMMIT="$(git rev-parse HEAD)" KV_BENCH_RUST="$(rustc --version)" \
-  python3 benchmarks/rocksdb-compare/run.py comparison-results
+python3 benchmarks/rocksdb-compare/run.py comparison-results
 ```
 
-The runner creates and removes only its own unique cgroups and temporary DB
-directory. It may enable the root cgroup memory controller; it does not set a
-memory limit or drop the host page cache. `KV_COMPARE_SMOKE=1` runs a 100-key
-verification workload instead. `KV_BENCH_DIR` selects the temporary filesystem.
+Use `KV_COMPARE_SMOKE=1` for a 100-key, 1,000-query-per-pass smoke case.
+`KV_BENCH_DIR` selects the temporary fixture filesystem. Fixture commands and
+each read process have timeouts. Progress is printed for each fixture file,
+process and read pass. The workflow saves raw JSONL, logs and environment data.
 
-## Interpreting the numbers
+## Interpretation
 
-- Process RSS includes the engine, allocator retention and a bounded latency
-  sample buffer. Peak RSS covers all phases, including verification.
-- Cgroup `memory.current` and `memory.peak` include charged anonymous memory,
-  file cache and kernel memory. Each child enters its group before exec and
-  creating DB files. Already shared executable/library pages can be charged
-  elsewhere. Do not add RSS to cgroup file cache because mapped pages overlap.
-- Reopen occurs in the same process; allocator state and OS page cache remain.
-  Neither random read pass measures cold-disk reads.
-- Mutation throughput includes the operation loop and the final synchronous
-  flush/background compaction wait. Per-operation p50/p99 is sampled at most
-  10,000 times and excludes that final maintenance pause. Lookup throughput
-  includes correctness checks.
-- Disk bytes include regular DB files, including WAL and metadata. Allocated
-  bytes use `st_blocks`, excluding directory metadata. Compare both after load
-  and after compaction; allocation can differ from logical file length.
-- Compression is disabled for a controlled comparison. The synthetic values
-  are compressible, and RocksDB can support compression in other builds.
-- Inspect the recorded filesystem mount options. Successful fsync calls on
-  hosted CI storage do not validate power-loss recovery or physical durability.
-- This is a small, single-client comparison. It does not establish concurrent
-  throughput, long-running write amplification, production reliability, or
-  performance with datasets larger than RAM. Two large trials and one larger
-  value trial support only provisional conclusions about those workloads.
+Throughput includes random key generation, correctness checks and value
+destruction. Sampled latency times Get only, at most 10,000 samples per pass.
+RSS and peak RSS describe the fresh read process, excluding fixture creation.
+They are not comparable to the previous full-workload lifetime peaks. Cgroup
+memory is not reported because fixtures/page-cache pages were allocated outside
+the measured child process.
+
+This fixed-layout, OS-cache-warm, single-client hit workload differs from the
+previous organically generated write/compaction workload. Use the included
+same-host baseline to assess the optimization; do not directly subtract old
+benchmark numbers. Results do not establish cold-device, concurrent, missing-key,
+write, range-scan or durability performance. RocksDB uses pinned Get; the engine
+returns independently owned values.
