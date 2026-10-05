@@ -49,8 +49,8 @@ jobs:
         run: |
           mkdir -p comparison-bin
           python3 benchmarks/rocksdb-compare/prepare_baseline.py
-          cargo build --locked --release --manifest-path baseline-source/benchmarks/rocksdb-compare/Cargo.toml --target-dir benchmarks/rocksdb-compare/target
-          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
+          cargo build --locked --release --manifest-path baseline-source/benchmarks/rocksdb-compare/Cargo.toml --target-dir baseline-source/benchmark-target
+          cp baseline-source/benchmark-target/release/kv-compare comparison-bin/baseline
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --features rocks

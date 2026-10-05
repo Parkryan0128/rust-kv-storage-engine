@@ -15,6 +15,17 @@ fn profile_random_read_stages() -> Result<()> {
     let tables = (2..table_count + 2)
         .map(|id| Table::open(&dir.join(format!("sst/{id:020}.sst")), id))
         .collect::<Result<Vec<_>>>()?;
+    let max_frame_bytes = tables
+        .iter()
+        .flat_map(|t| &t.index)
+        .map(|i| i.len as u64)
+        .max()
+        .expect("nonempty fixture");
+    let record_bytes = value_bytes as u64 + 25;
+    assert!(max_frame_bytes <= block_bytes + HEADER as u64);
+    if keys / table_count * record_bytes >= block_bytes {
+        assert!(max_frame_bytes > block_bytes - record_bytes + HEADER as u64);
+    }
     let mut buffers = (Vec::new(), Vec::new());
     let mut rng = 0xace123u64;
     let mut read_ns = 0u128;
@@ -71,6 +82,10 @@ fn profile_random_read_stages() -> Result<()> {
         serde_json::json!({
             "keys":keys,"value_bytes":value_bytes,"tables":table_count,
             "block_bytes":block_bytes,"samples":samples,
+            "max_frame_bytes":max_frame_bytes,
+            "block_count":tables.iter().map(|t| t.index.len()).sum::<usize>(),
+            "source_root":env!("CARGO_MANIFEST_DIR"),
+            "decoder_source_crc32":crc32fast::hash(include_str!("codec.rs").as_bytes()),
             "mean_read_ns":mean(read_ns),"mean_decode_crc_records_ns":mean(decode_ns),
             "mean_lookup_copy_ns":mean(lookup_ns),"mean_crc_only_ns":mean(crc_ns),
             "mean_frame_bytes":bytes_read as f64/samples as f64,

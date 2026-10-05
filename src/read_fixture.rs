@@ -17,6 +17,13 @@ fn write_read_benchmark_fixture() -> Result<()> {
     assert!(keys > 0 && (1..=64).contains(&tables) && tables <= keys);
     assert!((9..=16 * 1024 * 1024).contains(&value_bytes));
     assert!((64..=crate::codec::MAX_RECORD).contains(&block_bytes));
+    println!(
+        "READ_FIXTURE_CONFIG {}",
+        serde_json::json!({
+            "keys":keys,"value_bytes":value_bytes,"tables":tables,
+            "block_bytes":block_bytes,"source_root":env!("CARGO_MANIFEST_DIR")
+        })
+    );
     drop(Engine::open(&dir)?);
     let mut ids = Vec::new();
     for part in 0..tables {

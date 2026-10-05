@@ -46,6 +46,12 @@ builds the baseline with the current harness, runs a small smoke case and then
 the full comparison. Native RocksDB compilation requires Rust 1.88+ and
 libclang; the library still supports Rust 1.85.
 
+Baseline benchmark and unit-test builds use separate target directories from
+the current checkout. Fixture reports verify their compiled source root and
+requested block size. Stage tests also check actual SST frame sizes and report
+the compiled decoder source checksum; the runner verifies that against the
+intended checkout before accepting measurements.
+
 After producing `comparison-bin/baseline`, `comparison-bin/engine`, and
 `comparison-bin/rocksdb` as shown in the workflow:
 

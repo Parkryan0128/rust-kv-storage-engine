@@ -7,6 +7,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import zlib
 
 BASELINE = "7760c0d26ac67bfcb5fe1784f2053674ef9b49e4"
 
@@ -106,12 +107,19 @@ def main():
                                KV_READ_BLOCK_BYTES=str(block_bytes))
                     fixtures[block_bytes] = (engine_dir, rocks_dir, env)
                     print(f"READ_PREPARE {label}", flush=True)
-                    subprocess.run(
+                    text = logged(
                         ["cargo", "test", "--locked", "--release", "--lib",
                          "read_fixture::write_read_benchmark_fixture", "--",
                          "--ignored", "--exact", "--nocapture", "--test-threads=1"],
-                        env=env, check=True, timeout=180,
+                        env, output / f"{label}-fixture.log", 180,
                     )
+                    configs = [json.loads(line.split("READ_FIXTURE_CONFIG ", 1)[1])
+                               for line in text.splitlines() if "READ_FIXTURE_CONFIG " in line]
+                    assert len(configs) == 1
+                    config = configs[0]
+                    assert config["block_bytes"] == block_bytes and config["keys"] == keys
+                    assert Path(config["source_root"]).resolve() == Path.cwd().resolve()
+                    print("READ_FIXTURE_CONFIG " + json.dumps(config), flush=True)
                     subprocess.run(
                         [str(binaries["rocksdb"]), "prepare", str(rocks_dir),
                          str(keys), str(size), str(tables)], env=env, check=True, timeout=180,
@@ -120,9 +128,11 @@ def main():
                         for name, manifest in [("baseline", "baseline-source/Cargo.toml"),
                                                ("engine", "Cargo.toml")]:
                             warm_files(engine_dir)
+                            source = Path(manifest).resolve().parent
+                            target = str(source / "target")
                             text = logged(
                                 ["cargo", "test", "--locked", "--release", "--lib",
-                                 "--manifest-path", manifest, "--target-dir", "target",
+                                 "--manifest-path", manifest, "--target-dir", target,
                                  "sstable::read_profile::profile_random_read_stages", "--",
                                  "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                                 env, output / f"{label}-{name}-profile.log", 180,
@@ -132,6 +142,9 @@ def main():
                             assert len(reports) == 1
                             report = reports[0]
                             assert report["keys"] == keys and report["block_bytes"] == block_bytes
+                            assert Path(report["source_root"]).resolve() == source
+                            assert report["decoder_source_crc32"] == zlib.crc32(
+                                (source / "src/codec.rs").read_bytes())
                             report["engine"] = name
                             profile_file.write(json.dumps(report) + "\n")
                             profile_file.flush()
