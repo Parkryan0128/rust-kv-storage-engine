@@ -12,6 +12,7 @@ impl Backend {
         Ok(Self(Engine::open_with_options(
             path,
             Options {
+                block_size: crate::block_bytes(),
                 compaction_file_threshold: 64,
                 ..Options::default()
             },
@@ -51,7 +52,7 @@ fn options() -> rocksdb::Options {
     options.set_disable_auto_compactions(true);
     let mut table = BlockBasedOptions::default();
     table.set_block_cache(&Cache::new_lru_cache(8 * 1024 * 1024));
-    table.set_block_size(16 * 1024);
+    table.set_block_size(crate::block_bytes());
     table.set_bloom_filter(10.0, false);
     table.set_cache_index_and_filter_blocks(false);
     options.set_block_based_table_factory(&table);

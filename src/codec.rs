@@ -64,11 +64,14 @@ impl RecordRef<'_> {
         }
     }
 }
+#[inline]
 pub(crate) fn decode_record_ref<'a>(c: &mut Cursor<'a>) -> Result<RecordRef<'a>> {
-    let seq = c.u64()?;
-    let tag = c.take(1)?[0];
-    let kl = c.u32()? as usize;
-    let vl = c.u32()? as usize;
+    // Validate each contiguous region once, retaining all header/body checks.
+    let header = c.take(17)?;
+    let seq = u64::from_le_bytes(header[..8].try_into().unwrap());
+    let tag = header[8];
+    let kl = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+    let vl = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
     if seq == 0
         || tag > 1
         || (tag == 0 && vl != 0)
@@ -76,8 +79,7 @@ pub(crate) fn decode_record_ref<'a>(c: &mut Cursor<'a>) -> Result<RecordRef<'a>>
     {
         return Err(corrupt("invalid record header"));
     }
-    let key = c.take(kl)?;
-    let v = c.take(vl)?;
+    let (key, v) = c.take(kl + vl)?.split_at(kl);
     Ok(RecordRef {
         key,
         seq,

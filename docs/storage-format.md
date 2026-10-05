@@ -18,6 +18,12 @@ When the memory or WAL limit is reached, the next write starts a new buffer. A b
 
 Reads check memory first, then SSTables. Bloom filters skip files that cannot contain the key, indexes locate its block, and a cache holds recently read blocks.
 
+Table snapshots are ordered by descending maximum sequence. After finding a
+record (including a tombstone), reads stop when the remaining files cannot
+contain a newer version. A file's maximum sequence is only an upper bound:
+finding a key in the first file does not by itself end the search. Keys below
+a table's first indexed key skip that table before checking its Bloom filter.
+
 Point reads cache validated encoded blocks with a compact record-offset index.
 The frame CRC and every record's bounds, header, key order and sequence are
 checked before caching. Only the requested value is copied out, so retaining a

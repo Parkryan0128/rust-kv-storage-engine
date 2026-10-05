@@ -10,9 +10,13 @@ fn write_read_benchmark_fixture() -> Result<()> {
     let keys = parse("KV_READ_FIXTURE_KEYS");
     let value_bytes = parse("KV_READ_FIXTURE_VALUE_BYTES") as usize;
     let tables = parse("KV_READ_FIXTURE_TABLES");
+    let block_bytes = env::var("KV_READ_FIXTURE_BLOCK_BYTES")
+        .map(|s| s.parse::<usize>().expect("block size"))
+        .unwrap_or(16 * 1024);
     assert!(!dir.exists(), "fixture directory must be new");
     assert!(keys > 0 && (1..=64).contains(&tables) && tables <= keys);
     assert!((9..=16 * 1024 * 1024).contains(&value_bytes));
+    assert!((64..=crate::codec::MAX_RECORD).contains(&block_bytes));
     drop(Engine::open(&dir)?);
     let mut ids = Vec::new();
     for part in 0..tables {
@@ -36,7 +40,7 @@ fn write_read_benchmark_fixture() -> Result<()> {
             id,
             records,
             end - start,
-            16 * 1024,
+            block_bytes,
             10,
         )?;
         ids.push(id);

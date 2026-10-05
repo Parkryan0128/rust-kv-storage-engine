@@ -15,6 +15,7 @@ use crossbeam_channel::{bounded, Sender};
 use fs2::FileExt;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
+    cmp::Reverse,
     collections::{HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -227,6 +228,7 @@ impl Engine {
             }
             tables.push(Arc::new(table));
         }
+        tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
         wal_ids.retain(|id| *id > manifest.wal_floor);
         let mut sequence = manifest.max_seq;
         let mut immutable = VecDeque::new();
@@ -370,6 +372,11 @@ impl Engine {
         drop(s);
         let mut newest: Option<Record> = None;
         for table in tables.iter() {
+            // Tables are published in descending max-sequence order. A hit
+            // (including a tombstone) can make every remaining file obsolete.
+            if newest.as_ref().is_some_and(|r| r.seq >= table.max_seq) {
+                break;
+            }
             if let Some(r) = table.get(key, &c.cache, &c.counters)? {
                 if newest.as_ref().is_none_or(|old| r.seq > old.seq) {
                     newest = Some(r);
@@ -687,7 +694,9 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
-            Arc::make_mut(&mut s.tables).push(table);
+            let tables = Arc::make_mut(&mut s.tables);
+            tables.push(table);
+            tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
             s.immutable.pop_front();
         }
         self.progress();
@@ -742,6 +751,7 @@ impl Core {
             let tables = Arc::make_mut(&mut s.tables);
             tables.retain(|t| !selected.contains(&t.id));
             tables.push(merged);
+            tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
         }
         fault::hit("compaction_before_old_delete")?;
         for old in tables {

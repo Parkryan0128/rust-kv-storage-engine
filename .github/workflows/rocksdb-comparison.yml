@@ -43,13 +43,12 @@ jobs:
       - name: Check out the fixed pre-change baseline
         uses: actions/checkout@v4
         with:
-          ref: c5fe790d5352bdea9df921419ff855938fd13aa9
+          ref: 7760c0d26ac67bfcb5fe1784f2053674ef9b49e4
           path: baseline-source
       - name: Build identical random-read harnesses
         run: |
           mkdir -p comparison-bin
-          cp benchmarks/rocksdb-compare/Cargo.toml benchmarks/rocksdb-compare/Cargo.lock baseline-source/benchmarks/rocksdb-compare/
-          cp benchmarks/rocksdb-compare/src/*.rs baseline-source/benchmarks/rocksdb-compare/src/
+          python3 benchmarks/rocksdb-compare/prepare_baseline.py
           cargo build --locked --release --manifest-path baseline-source/benchmarks/rocksdb-compare/Cargo.toml --target-dir benchmarks/rocksdb-compare/target
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml

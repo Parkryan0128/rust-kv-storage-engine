@@ -22,6 +22,8 @@ mod manifest;
 mod memtable;
 #[cfg(test)]
 mod read_fixture;
+#[cfg(test)]
+mod read_path_tests;
 mod sstable;
 mod wal;
 pub use compaction::CompactionStyle;

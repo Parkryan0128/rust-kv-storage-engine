@@ -4,6 +4,14 @@ use serde_json::{json, Value};
 use std::{fs, path::Path, time::Instant};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+fn block_bytes() -> usize {
+    let bytes = std::env::var("KV_READ_BLOCK_BYTES")
+        .map(|s| s.parse::<usize>().expect("block size"))
+        .unwrap_or(16 * 1024);
+    assert!([4096, 8192, 16384].contains(&bytes));
+    bytes
+}
+
 fn memory() -> Value {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let kb = |name: &str| {
@@ -81,7 +89,7 @@ fn main() -> Result<()> {
             "READ_REPORT {}",
             json!({
                 "stage":stage,"keys":keys,"value_bytes":value_bytes,"tables":tables,
-                "operations":queries,"seed":seed,"seconds":seconds,
+                "block_bytes":block_bytes(),"operations":queries,"seed":seed,"seconds":seconds,
                 "ops_per_second":queries as f64/seconds,
                 "sample_count":samples.len(),"sampled_p50_us":percentile(50),
                 "sampled_p99_us":percentile(99),"memory":memory(),

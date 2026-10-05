@@ -1,7 +1,7 @@
 # Random-read comparison
 
 This isolated package compares the current engine, the fixed pre-change engine
-at `c5fe790d5352bdea9df921419ff855938fd13aa9`, and RocksDB 11.8.1
+at `7760c0d26ac67bfcb5fe1784f2053674ef9b49e4`, and RocksDB 11.8.1
 (rust-rocksdb 0.25.0). All three run the same Rust random-Get harness as separate
 release processes on one Linux host. RocksDB is only a benchmark dependency.
 
@@ -18,8 +18,10 @@ Fixtures are created once per case, before measured processes start:
 - RocksDB's `SstFileWriter` and external-file ingestion create the same logical
   key/value dataset with the same number of disjoint, equally divided files.
 - The old and new engine executables read the exact same engine fixture.
-- Both use 16 KiB blocks, an 8 MiB block-cache budget, ten Bloom bits per key
-  and no compression. Metadata is outside the block cache.
+- Every backend runs at 4, 8 and 16 KiB block sizes, with an 8 MiB block-cache
+  budget, ten Bloom bits per key and no compression. Metadata is outside the
+  block cache. The library's default block size remains 16 KiB; the benchmark
+  sets block size explicitly when building fixtures.
 - The engine compaction trigger is 64; RocksDB opens read-only. File counts are
   asserted at open and after each pass, so the prepared layout remains fixed.
 - OS file cache is explicitly warmed before each process. This does not preload
@@ -29,8 +31,9 @@ Cases: 100,000 keys / 128-byte values / one SST; 1,000,000 keys / 128-byte value
 five SSTs; and 100,000 keys / 1,024-byte values / five SSTs. Keys are eight-byte
 big-endian integers; values encode the key and a known fill pattern.
 
-Each case runs six trials. Backend order rotates so each backend occupies every
-position twice. Seeds change between trials and match between backends. Each
+Each case/block-size combination runs six trials. Both block-size and backend
+order rotate so each occupies every position twice. Seeds change between trials
+and match between backends and block sizes. Each
 fresh process makes two identical seeded passes of 500,000 random successful
 Get calls, validating the entire returned value every time. No sequential Get
 pass is performed. The first pass starts with a fresh block cache; the second
@@ -50,7 +53,10 @@ After producing `comparison-bin/baseline`, `comparison-bin/engine`, and
 python3 benchmarks/rocksdb-compare/run.py comparison-results
 ```
 
-Use `KV_COMPARE_SMOKE=1` for a 100-key, 1,000-query-per-pass smoke case.
+Use `KV_COMPARE_SMOKE=1` for a 100-key, 1,000-query-per-pass smoke case at all
+three block sizes. `KV_READ_BLOCK_BYTES` configures standalone executable runs;
+it must match the fixture. `KV_READ_FIXTURE_BLOCK_BYTES` configures the engine
+fixture writer and stage microbenchmark.
 `KV_BENCH_DIR` selects the temporary fixture filesystem. Fixture commands and
 each read process have timeouts. Progress is printed for each fixture file,
 process and read pass. The workflow saves raw JSONL, logs and environment data.
@@ -70,3 +76,18 @@ same-host baseline to assess the optimization; do not directly subtract old
 benchmark numbers. Results do not establish cold-device, concurrent, missing-key,
 write, range-scan or durability performance. RocksDB uses pinned Get; the engine
 returns independently owned values.
+
+Before measured trials, a separate ignored test samples 10,000 random uncached
+blocks for each engine version and fixture. It times positional file reads,
+full CRC/record validation with offset reconstruction, and lookup/value copying.
+Buffers are reused, files are OS-cache warm, and routing, cache management,
+locking and buffer allocation are excluded. A separate warmed-buffer CRC-only
+measurement overlaps validation and must not be added to it. Timer overhead
+is included. These diagnostic means are not an end-to-end CPU profile or
+percentages of total Get time. The same test harness is copied into the baseline
+behind `cfg(test)`, leaving its production source behavior unchanged.
+
+Use equal-size rows to compare engines and before/after code. A smaller block
+can reduce miss processing but increases the index and may affect writes and
+scans, which this benchmark does not measure. Reports retain every block size,
+RSS and SST bytes rather than reporting only the fastest configuration.

@@ -21,6 +21,9 @@ const MAGIC: &[u8; 8] = b"RKVSST02";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
+#[cfg(test)]
+#[path = "read_profile.rs"]
+mod read_profile;
 struct Index {
     first: Vec<u8>,
     offset: u64,
@@ -226,6 +229,9 @@ impl Table {
         cache: &Mutex<Cache>,
         counters: &Counters,
     ) -> Result<Option<Record>> {
+        if self.index.first().is_none_or(|i| key < i.first.as_slice()) {
+            return Ok(None);
+        }
         if !self.bloom.contains(key) {
             counters.bloom_negatives.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
