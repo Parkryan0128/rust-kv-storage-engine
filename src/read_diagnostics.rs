@@ -137,7 +137,12 @@ fn decode_block(table: &Table, n: usize, payload: &[u8]) -> Result<Block> {
 fn block_queries(table: &Table, keys: &[[u8; 8]], trial: usize) -> Result<()> {
     let positions: Vec<_> = keys
         .iter()
-        .map(|key| table.index.partition_point(|i| i.first.as_slice() <= key.as_slice()) - 1)
+        .map(|key| {
+            table
+                .index
+                .partition_point(|i| i.first.as_slice() <= key.as_slice())
+                - 1
+        })
         .collect();
     let mut totals = [0u128; 5];
     let mut decoded_records = 0;
