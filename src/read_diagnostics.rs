@@ -91,7 +91,10 @@ fn borrowed_lookup(table: &Table, n: usize, payload: &[u8], key: &[u8]) -> Resul
         let v = cursor.take(vl)?;
         if previous.is_some_and(|p| p >= k)
             || seq > table.max_seq
-            || table.index.get(n + 1).is_some_and(|next| k >= next.first.as_slice())
+            || table
+                .index
+                .get(n + 1)
+                .is_some_and(|next| k >= next.first.as_slice())
         {
             return Err(corrupt("SST record order/sequence"));
         }
@@ -116,7 +119,10 @@ fn decode_block(table: &Table, n: usize, payload: &[u8]) -> Result<Block> {
         let item = decode_record(&mut cursor)?;
         if block.last().is_some_and(|p| p.0 >= item.0)
             || item.1.seq > table.max_seq
-            || table.index.get(n + 1).is_some_and(|next| item.0 >= next.first)
+            || table
+                .index
+                .get(n + 1)
+                .is_some_and(|next| item.0 >= next.first)
         {
             return Err(corrupt("SST record order/sequence"));
         }

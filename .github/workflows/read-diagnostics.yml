@@ -23,6 +23,7 @@ jobs:
       - run: cargo test --locked --release --lib --no-run
       - name: Measure read path
         run: |
+          set -o pipefail
           mkdir -p read-diagnostics-results
           rustc --version > read-diagnostics-results/environment.txt
           lscpu >> read-diagnostics-results/environment.txt
