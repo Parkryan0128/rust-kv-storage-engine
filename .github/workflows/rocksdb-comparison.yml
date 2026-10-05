@@ -1,0 +1,50 @@
+name: rocksdb-comparison
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/rocksdb-compare/**'
+      - '.github/workflows/rocksdb-comparison.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: 3
+      CXXFLAGS: '-g0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check memory accounting
+        run: sudo python3 benchmarks/rocksdb-compare/run.py --check-cgroup
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: benchmarks/rocksdb-compare/target
+          key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+      - name: Check formatting
+        run: cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+      - name: Build both engines
+        run: |
+          mkdir -p comparison-bin
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --features rocks
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
+      - name: Verify small workload
+        run: sudo env KV_BENCH_COMMIT="$(git rev-parse HEAD)" KV_BENCH_RUST="$(rustc --version)" KV_COMPARE_SMOKE=1 KV_BENCH_DIR="$RUNNER_TEMP" python3 benchmarks/rocksdb-compare/run.py comparison-smoke
+      - name: Run paired measurements
+        run: sudo env KV_BENCH_COMMIT="$(git rev-parse HEAD)" KV_BENCH_RUST="$(rustc --version)" KV_BENCH_DIR="$RUNNER_TEMP" python3 benchmarks/rocksdb-compare/run.py comparison-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rocksdb-comparison
+          path: |
+            comparison-results/
+            comparison-smoke/
+            benchmarks/rocksdb-compare/Cargo.lock

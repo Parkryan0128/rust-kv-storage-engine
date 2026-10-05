@@ -1,0 +1,22 @@
+[package]
+name = "kv-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.88"
+
+# Keep native benchmark dependencies and their MSRV out of the library workspace.
+[workspace]
+
+[features]
+rocks = ["dep:rocksdb"]
+
+[dependencies]
+rust-kv-storage-engine = { path = "../.." }
+bytes = "1"
+serde_json = "1"
+rocksdb = { version = "=0.25.0", optional = true, default-features = false, features = ["bindgen-runtime"] }
+
+[profile.release]
+debug = 0
+strip = "debuginfo"

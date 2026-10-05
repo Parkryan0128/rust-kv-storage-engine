@@ -1,0 +1,28 @@
+name: resource-baseline
+on:
+  pull_request:
+    paths:
+      - 'examples/resource_report.rs'
+      - 'scripts/run_resource_report.py'
+      - '.github/workflows/resource-baseline.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release --example resource_report
+      - run: python3 scripts/run_resource_report.py resource-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resource-baseline
+          path: resource-results/
