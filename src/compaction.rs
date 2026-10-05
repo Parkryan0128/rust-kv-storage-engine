@@ -130,7 +130,7 @@ mod tests {
             (12, 500),
         ];
         assert_eq!(pick_ids(&files, 3, CompactionStyle::SizeTiered), [2, 4, 6]);
-        assert_eq!(pick_ids(&files, 9, CompactionStyle::SizeTiered), []);
+        assert!(pick_ids(&files, 9, CompactionStyle::SizeTiered).is_empty());
         assert_eq!(
             pick_ids(&files, 3, CompactionStyle::Full).len(),
             files.len()
@@ -149,7 +149,7 @@ mod tests {
         );
         assert_eq!(
             pick_ids(&[(1, 1), (2, 2), (3, 4)], 2, CompactionStyle::SizeTiered),
-            []
+            Vec::<u64>::new()
         );
         assert_eq!(
             pick_ids(
