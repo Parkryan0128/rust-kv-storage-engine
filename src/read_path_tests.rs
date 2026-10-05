@@ -79,6 +79,15 @@ fn open(path: &std::path::Path) -> Engine {
 fn reads_prune_obsolete_files_without_confusing_file_and_record_sequences() {
     let dir = fixture();
     let e = open(dir.path());
+    assert_eq!(
+        e.inspect()
+            .unwrap()
+            .tables
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec![7, 4, 9]
+    );
     assert_eq!(e.get(b"\0").unwrap(), None);
     assert_eq!(e.stats().block_reads, 0);
     assert_eq!(e.stats().bloom_negatives, 0);

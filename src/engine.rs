@@ -16,7 +16,7 @@ use fs2::FileExt;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
     cmp::Reverse,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -441,6 +441,9 @@ impl Engine {
     pub fn inspect(&self) -> Result<Inspection> {
         let s = self.inner.core.state.read();
         check(&s)?;
+        // Preserve publication order in the inspection API independently of
+        // the sequence-ordered snapshot used by point reads.
+        let by_id: HashMap<_, _> = s.tables.iter().map(|t| (t.id, t)).collect();
         let memory = |mem: &MemTable, wal_id| MemtableInfo {
             wal_id,
             bytes: mem.bytes,
@@ -461,13 +464,17 @@ impl Engine {
                 .map(|f| memory(&f.mem, Some(f.id)))
                 .collect(),
             tables: s
+                .manifest
                 .tables
                 .iter()
-                .map(|t| TableInfo {
-                    id: t.id,
-                    bytes: t.file_bytes,
-                    records: t.count,
-                    max_sequence: t.max_seq,
+                .map(|id| {
+                    let t = by_id[id];
+                    TableInfo {
+                        id: t.id,
+                        bytes: t.file_bytes,
+                        records: t.count,
+                        max_sequence: t.max_seq,
+                    }
                 })
                 .collect(),
         })
