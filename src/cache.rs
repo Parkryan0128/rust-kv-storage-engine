@@ -123,7 +123,10 @@ mod tests {
         assert_eq!(cache.bytes(), size * 2);
         cache.insert((3, 0), block(15));
         assert!(cache.get((1, 0), &counters).is_none());
-        assert_eq!(reader.get(b"k").unwrap().value.as_deref(), Some(&[42; 15][..]));
+        assert_eq!(
+            reader.get(b"k").unwrap().value.as_deref(),
+            Some(&[42; 15][..])
+        );
     }
 
     #[test]

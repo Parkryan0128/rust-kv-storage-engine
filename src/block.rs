@@ -8,12 +8,7 @@ pub(crate) struct ReadBlock {
 }
 
 impl ReadBlock {
-    pub fn decode(
-        bytes: Vec<u8>,
-        first: &[u8],
-        next: Option<&[u8]>,
-        max_seq: u64,
-    ) -> Result<Self> {
+    pub fn decode(bytes: Vec<u8>, first: &[u8], next: Option<&[u8]>, max_seq: u64) -> Result<Self> {
         let payload = frame_payload(&bytes)?;
         let mut c = Cursor { b: payload };
         let mut previous: Option<&[u8]> = None;
