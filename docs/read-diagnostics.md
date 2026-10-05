@@ -10,6 +10,11 @@ The `read-diagnostics` workflow runs this command and uploads JSON records
 prefixed with `READ_DIAGNOSTIC`, plus machine metadata. This is an experiment,
 not a performance threshold enforced by ordinary tests.
 
+After the encoded-block cache optimization, the public Get sweep uses the new
+production path. The materialized-block phase and control continue to measure
+`Table::block`, used by iteration/compaction, to preserve the original diagnostic.
+Use the paired RocksDB benchmark for end-to-end performance comparisons.
+
 Fixtures contain one million eight-byte keys and 128-byte values. They are
 created directly with the production SST writer and manifest before timing,
 avoiding the unrelated cost of synchronous WAL insertion. One fixture has

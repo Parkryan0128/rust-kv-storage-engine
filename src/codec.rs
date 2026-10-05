@@ -48,6 +48,23 @@ pub(crate) fn encode_record(key: &[u8], r: &Record, out: &mut Vec<u8>) {
     }
 }
 pub(crate) fn decode_record(c: &mut Cursor<'_>) -> Result<(Vec<u8>, Record)> {
+    let r = decode_record_ref(c)?;
+    Ok((r.key.to_vec(), r.to_owned()))
+}
+pub(crate) struct RecordRef<'a> {
+    pub key: &'a [u8],
+    pub seq: u64,
+    pub value: Option<&'a [u8]>,
+}
+impl RecordRef<'_> {
+    pub fn to_owned(&self) -> Record {
+        Record {
+            seq: self.seq,
+            value: self.value.map(Bytes::copy_from_slice),
+        }
+    }
+}
+pub(crate) fn decode_record_ref<'a>(c: &mut Cursor<'a>) -> Result<RecordRef<'a>> {
     let seq = c.u64()?;
     let tag = c.take(1)?[0];
     let kl = c.u32()? as usize;
@@ -59,19 +76,31 @@ pub(crate) fn decode_record(c: &mut Cursor<'_>) -> Result<(Vec<u8>, Record)> {
     {
         return Err(corrupt("invalid record header"));
     }
-    let key = c.take(kl)?.to_vec();
+    let key = c.take(kl)?;
     let v = c.take(vl)?;
-    Ok((
+    Ok(RecordRef {
         key,
-        Record {
-            seq,
-            value: if tag == 1 {
-                Some(Bytes::copy_from_slice(v))
-            } else {
-                None
-            },
-        },
-    ))
+        seq,
+        value: (tag == 1).then_some(v),
+    })
+}
+// Validate an entire in-memory frame without allocating a second payload buffer.
+pub(crate) fn frame_payload(bytes: &[u8]) -> Result<&[u8]> {
+    if bytes.len() < HEADER {
+        return Err(corrupt("truncated frame header"));
+    }
+    if crc32fast::hash(&bytes[..4]) != u32::from_le_bytes(bytes[4..8].try_into().unwrap()) {
+        return Err(corrupt("frame header checksum"));
+    }
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    if len > MAX_FRAME || bytes.len() - HEADER != len {
+        return Err(corrupt("data frame length"));
+    }
+    let payload = &bytes[HEADER..];
+    if crc32fast::hash(payload) != u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {
+        return Err(corrupt("frame payload checksum"));
+    }
+    Ok(payload)
 }
 pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<u64> {
     if payload.len() > MAX_FRAME {

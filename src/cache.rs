@@ -1,4 +1,4 @@
-use crate::memtable::Record;
+use crate::{block::ReadBlock, memtable::Record};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -9,7 +9,7 @@ use std::{
 pub(crate) type Block = Vec<(Vec<u8>, Record)>;
 type Key = (u64, usize);
 struct Entry {
-    block: Arc<Block>,
+    block: Arc<ReadBlock>,
     size: usize,
     stamp: u64,
 }
@@ -50,7 +50,7 @@ impl Cache {
         self.clock += 1;
         self.clock
     }
-    pub fn get(&mut self, key: Key, counters: &Counters) -> Option<Arc<Block>> {
+    pub fn get(&mut self, key: Key, counters: &Counters) -> Option<Arc<ReadBlock>> {
         let stamp = self.tick();
         let e = self.entries.get_mut(&key)?;
         self.order.remove(&e.stamp);
@@ -59,8 +59,9 @@ impl Cache {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         Some(e.block.clone())
     }
-    pub fn insert(&mut self, key: Key, block: Arc<Block>) {
-        let size = block.iter().map(|(k, r)| r.size(k)).sum::<usize>() + 64;
+    pub fn insert(&mut self, key: Key, block: Arc<ReadBlock>) {
+        // Include allocated capacities, the block header, and cache bookkeeping.
+        let size = block.allocated_bytes() + 64;
         if size > self.capacity {
             return;
         }
@@ -89,21 +90,27 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn block(value_len: usize) -> Arc<Block> {
-        Arc::new(vec![(
-            b"k".to_vec(),
-            Record {
+    fn block(value_len: usize) -> Arc<ReadBlock> {
+        let mut payload = Vec::new();
+        crate::codec::encode_record(
+            b"k",
+            &Record {
                 seq: 1,
                 value: Some(Bytes::from(vec![42; value_len])),
             },
-        )])
+            &mut payload,
+        );
+        let mut frame = Vec::new();
+        crate::codec::write_frame(&mut frame, &payload).unwrap();
+        Arc::new(ReadBlock::decode(frame, b"k", None, 1).unwrap())
     }
 
     #[test]
     fn hits_promote_blocks_and_eviction_preserves_outstanding_readers() {
-        let mut cache = Cache::new(256);
+        let first = block(15);
+        let size = first.allocated_bytes() + 64;
+        let mut cache = Cache::new(size * 2);
         let counters = Counters::default();
-        let first = block(15); // 128 accounted bytes, including cache overhead.
         cache.insert((1, 0), first.clone());
         cache.insert((1, 1), block(15));
         let reader = cache.get((1, 0), &counters).unwrap();
@@ -113,30 +120,35 @@ mod tests {
         assert!(cache.get((1, 0), &counters).is_some());
         assert!(cache.get((2, 0), &counters).is_some());
         assert_eq!(counters.hits.load(Ordering::Relaxed), 3);
-        assert_eq!(cache.bytes(), 256);
+        assert_eq!(cache.bytes(), size * 2);
         cache.insert((3, 0), block(15));
         assert!(cache.get((1, 0), &counters).is_none());
-        assert_eq!(reader[0].1.value.as_deref(), Some(&[42; 15][..]));
+        assert_eq!(reader.get(b"k").unwrap().value.as_deref(), Some(&[42; 15][..]));
     }
 
     #[test]
     fn replacements_oversized_blocks_and_disabled_cache_respect_capacity() {
-        let mut cache = Cache::new(256);
+        let size = block(15).allocated_bytes() + 64;
+        let mut cache = Cache::new(size * 2);
         let counters = Counters::default();
         cache.insert((1, 0), block(15));
         cache.insert((2, 0), block(15));
         let smaller = block(0);
         cache.insert((1, 0), smaller.clone());
-        assert_eq!(cache.bytes(), 241);
+        let smaller_size = smaller.allocated_bytes() + 64;
+        assert_eq!(cache.bytes(), size + smaller_size);
         assert!(Arc::ptr_eq(
             &cache.get((1, 0), &counters).unwrap(),
             &smaller
         ));
         cache.insert((3, 0), block(256));
-        assert_eq!(cache.bytes(), 241);
+        assert_eq!(cache.bytes(), size + smaller_size);
         assert!(cache.get((3, 0), &counters).is_none());
-        cache.insert((2, 0), block(100));
-        assert_eq!(cache.bytes(), 213);
+        let larger = block(100);
+        let larger_size = larger.allocated_bytes() + 64;
+        assert!(larger_size <= size * 2 && larger_size + smaller_size > size * 2);
+        cache.insert((2, 0), larger);
+        assert_eq!(cache.bytes(), larger_size);
         assert!(cache.get((1, 0), &counters).is_none());
         assert!(cache.get((2, 0), &counters).is_some());
         let mut disabled = Cache::new(0);

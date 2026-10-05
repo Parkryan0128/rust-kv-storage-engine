@@ -1,4 +1,5 @@
 use crate::{
+    block::ReadBlock,
     bloom::Bloom,
     cache::{Block, Cache, Counters},
     codec::*,
@@ -240,14 +241,18 @@ impl Table {
             b
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
-            let b = Arc::new(self.block(n)?);
+            let i = &self.index[n];
+            let bytes = at(&self.file, i.offset, i.len as usize)?;
+            let b = Arc::new(ReadBlock::decode(
+                bytes,
+                &i.first,
+                self.index.get(n + 1).map(|next| next.first.as_slice()),
+                self.max_seq,
+            )?);
             cache.lock().insert((self.id, n), b.clone());
             b
         };
-        Ok(block
-            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
-            .ok()
-            .map(|i| block[i].1.clone()))
+        Ok(block.get(key))
     }
     pub fn iter(self: &Arc<Self>) -> TableIter {
         TableIter {

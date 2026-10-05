@@ -9,6 +9,7 @@
 //! engine.delete(b"hello")?;
 //! # Ok::<(), rust_kv_storage_engine::EngineError>(())
 //! ```
+mod block;
 mod bloom;
 mod cache;
 mod codec;

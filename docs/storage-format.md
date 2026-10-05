@@ -18,6 +18,14 @@ When the memory or WAL limit is reached, the next write starts a new buffer. A b
 
 Reads check memory first, then SSTables. Bloom filters skip files that cannot contain the key, indexes locate its block, and a cache holds recently read blocks.
 
+Point reads cache validated encoded blocks with a compact record-offset index.
+The frame CRC and every record's bounds, header, key order and sequence are
+checked before caching. Only the requested value is copied out, so retaining a
+small returned value does not retain the whole block. Cache accounting includes
+the allocated frame/index capacities and an allowance for cache bookkeeping;
+it is not a hard bound on process RSS. Iteration and compaction still decode
+complete blocks. The on-disk format is unchanged, including legacy SST support.
+
 ## Combining files
 
 Compaction merges SSTables and keeps the newest record for each key.

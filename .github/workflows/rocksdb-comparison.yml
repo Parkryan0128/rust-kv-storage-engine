@@ -1,5 +1,11 @@
 name: rocksdb-comparison
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benchmarks/rocksdb-compare/**'
+      - '.github/workflows/rocksdb-comparison.yml'
   pull_request:
     paths:
       - 'benchmarks/rocksdb-compare/**'
@@ -10,7 +16,7 @@ permissions:
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
@@ -29,6 +35,10 @@ jobs:
           key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
       - name: Check formatting
         run: cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+      - name: Validate engine before benchmarking
+        run: |
+          cargo fmt --check
+          cargo test --locked --release --all-features
       - name: Build both engines
         run: |
           mkdir -p comparison-bin
