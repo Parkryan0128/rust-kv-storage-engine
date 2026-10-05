@@ -1,0 +1,35 @@
+name: read-diagnostics
+on:
+  pull_request:
+    paths:
+      - 'src/read_diagnostics.rs'
+      - '.github/workflows/read-diagnostics.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: read-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo test --locked --release --lib --no-run
+      - name: Measure read path
+        run: |
+          mkdir -p read-diagnostics-results
+          rustc --version > read-diagnostics-results/environment.txt
+          lscpu >> read-diagnostics-results/environment.txt
+          findmnt -T . >> read-diagnostics-results/environment.txt
+          cargo test --locked --release --lib read_cost_breakdown -- --ignored --nocapture --test-threads=1 | tee read-diagnostics-results/results.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: read-diagnostics
+          path: read-diagnostics-results/

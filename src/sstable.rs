@@ -501,3 +501,7 @@ mod tests {
         assert_eq!(Table::open(&path, 1).unwrap().count, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "read_diagnostics.rs"]
+mod read_diagnostics;
