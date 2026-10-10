@@ -24,20 +24,28 @@ contain a newer version. A file's maximum sequence is only an upper bound:
 finding a key in the first file does not by itself end the search. Keys below
 a table's first indexed key skip that table before checking its Bloom filter.
 
-Point reads cache validated encoded blocks with a compact record-offset index.
-The frame CRC and every record's bounds, header, key order and sequence are
-checked before caching. Only the requested value is copied out, so retaining a
+Point reads cache encoded blocks. Version 03 stores the compact record-offset
+index inside each checksummed data frame. On the first read of each block after
+open, every record's bounds, header, key order, sequence and persisted offset are
+validated. The table retains an eight-byte validation fingerprint per block.
+After eviction, an identical payload CRC permits reuse of that validation;
+every disk read still verifies the entire frame CRC. A changed CRC triggers full
+validation again. This uses the existing CRC32 corruption model, not authentication
+against deliberate checksum collisions. Search-path record decoding remains checked.
+Versions 01/02 rebuild and validate their offset arrays on each cache miss.
+Only the requested value is copied out, so retaining a
 small returned value does not retain the whole block. Cache accounting includes
 the allocated frame/index capacities and an allowance for cache bookkeeping;
 it is not a hard bound on process RSS. Iteration and compaction still decode
-complete blocks. The on-disk format is unchanged, including legacy SST support.
+complete blocks, without allocating a second full payload buffer.
 
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
 order through indexed links rather than a tree. When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
 block; outstanding readers retain their original immutable block. Frames that
-cannot fit the budget do not evict entries for recycling. Every reused frame and record
-is validated again before being cached. Cache charges include allocated buffer
+cannot fit the budget do not evict entries for recycling: legacy blocks use a
+conservative offset-array bound and version 03 includes its index in the frame.
+Reused frames follow the checksum and validation rules above. Cache charges include allocated buffer
 capacities and a per-entry allowance; no separate spare-buffer pool is retained.
 
 Reused frames grow to the requested length instead of doubling their capacity.
@@ -46,9 +54,9 @@ trimmed when it would prevent cache admission. Compaction evicts obsolete table
 entries and prevents old reader snapshots from putting them back in the cache.
 Outstanding readers still finish safely through their immutable blocks/open files.
 
-Strict key ordering lets point reads check the next-block upper bound once per
-block. Every record header, sequence, order and frame checksum is still checked.
-Block splitting uses encoded record lengths, separately from memtable memory charges.
+Strict key ordering lets validation check the next-block upper bound once per
+block. Block splitting includes encoded record lengths and the persisted directory,
+separately from memtable memory charges.
 
 ## Combining files
 
@@ -60,6 +68,15 @@ Compaction merges SSTables and keeps the newest record for each key.
 Partial merges keep tombstones so old values in other files stay deleted. A full merge can remove both the old value and its tombstone.
 
 `flush()` saves earlier writes and waits for eligible compactions. `compact()` also requests a full merge.
+
+Each merge opens at most four input iterators. Larger requests proceed through
+manifest-published partial merges, retaining tombstones until it is safe to remove
+them. Recovery can resume from any published round. This bounds input block/value
+residency by four inputs rather than the total SST count; it does not cap RSS,
+which also includes indexes, filters, output buffers and concurrent operations.
+The tradeoff is additional intermediate write I/O for merges with more than four
+inputs. `stats().max_compaction_inputs` reports the observed maximum since open.
+Obsolete-cache cleanup runs after releasing the engine state write lock.
 
 The background worker releases the maintenance lock fairly between jobs so a
 manual flush does not wait for a continuously replenished background queue.
@@ -92,11 +109,11 @@ After a write or maintenance I/O error, drop all engine handles and reopen the d
 
 Records store a sequence number, a value/deletion tag, and key/value lengths and bytes. Empty values and deleted keys have different tags. Numbers use little-endian encoding; CRC32 checksums detect damaged frames.
 
-Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST02`: a metadata summary frame followed by checksummed index pages targeting 1 MiB each. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit. This allows the total index to grow past one frame without stopping compaction.
+Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST03`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
 
 The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
 
-Existing `RKVSST01` SSTables remain readable, including in the same database as version `02` files. Flush and compaction write version `02`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read the new SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
+Existing `RKVSST01` and `RKVSST02` SSTables remain readable alongside version `03` files. Flush and compaction write version `03`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read version `03` SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
 
 Exact layouts: [records](../src/codec.rs), [WAL](../src/wal.rs), [SSTables](../src/sstable.rs), [manifest](../src/manifest.rs).
 

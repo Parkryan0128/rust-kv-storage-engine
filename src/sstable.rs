@@ -1,5 +1,5 @@
 use crate::{
-    block::ReadBlock,
+    block::{indexed_records, ReadBlock},
     bloom::Bloom,
     cache::{Block, Cache, Counters},
     codec::*,
@@ -15,12 +15,13 @@ use std::{
     os::unix::fs::FileExt,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
-const MAGIC: &[u8; 8] = b"RKVSST02";
+const PAGED_MAGIC: &[u8; 8] = b"RKVSST02";
+const MAGIC: &[u8; 8] = b"RKVSST03";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
@@ -31,6 +32,7 @@ struct Index {
     first: Vec<u8>,
     offset: u64,
     len: u32,
+    validated: AtomicU64,
 }
 pub(crate) struct Table {
     pub id: u64,
@@ -41,6 +43,7 @@ pub(crate) struct Table {
     pub file_bytes: u64,
     pub max_seq: u64,
     cacheable: AtomicBool,
+    indexed: bool,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; len];
@@ -66,6 +69,7 @@ impl Table {
         let mut index = vec![];
         let mut bloom = Bloom::new(estimate, bloom_bits);
         let mut block = vec![];
+        let mut offsets = vec![];
         let mut first = vec![];
         let mut previous: Option<Vec<u8>> = None;
         let mut count = 0;
@@ -75,20 +79,23 @@ impl Table {
             if previous.as_ref().is_some_and(|p| p >= &key) {
                 return Err(corrupt("unsorted SST input"));
             }
-            if !block.is_empty() && block.len() + r.encoded_len(&key) > block_size {
-                write_block(&mut f, &mut block, &first, &mut index)?;
+            if !block.is_empty()
+                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * 4 + 4 > block_size
+            {
+                write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
             }
             if block.is_empty() {
                 first = key.clone();
             }
             bloom.insert(&key);
+            offsets.push(block.len() as u32);
             encode_record(&key, &r, &mut block);
             max_seq = max_seq.max(r.seq);
             count += 1;
             previous = Some(key);
         }
         if !block.is_empty() {
-            write_block(&mut f, &mut block, &first, &mut index)?;
+            write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
         }
         if bloom.needs_rebuild(count, bloom_bits) {
             // Compaction can discard nearly all inputs. Rebuild from the
@@ -96,9 +103,10 @@ impl Table {
             bloom = Bloom::new(count, bloom_bits);
             for i in &index {
                 resize_frame(&mut block, i.len as usize);
+                fault::hit("bloom_rebuild_read")?;
                 f.read_exact_at(&mut block, i.offset)?;
                 let mut c = Cursor {
-                    b: frame_payload(&block)?,
+                    b: indexed_records(frame_payload(&block)?)?,
                 };
                 while !c.b.is_empty() {
                     bloom.insert(decode_record_ref(&mut c)?.key);
@@ -135,7 +143,7 @@ impl Table {
         let legacy = magic == LEGACY_MAGIC;
         let footer_size = if legacy {
             LEGACY_FOOTER
-        } else if magic == MAGIC {
+        } else if magic == MAGIC || magic == PAGED_MAGIC {
             FOOTER
         } else {
             return Err(corrupt("SST version"));
@@ -217,35 +225,37 @@ impl Table {
             file_bytes: len,
             max_seq,
             cacheable: AtomicBool::new(true),
+            indexed: magic == MAGIC,
         })
     }
     pub fn block(&self, n: usize) -> Result<Block> {
         let i = &self.index[n];
         let bytes = at(&self.file, i.offset, i.len as usize)?;
-        let mut raw = &bytes[..];
-        let payload = read_frame(&mut raw, false)?.ok_or_else(|| corrupt("empty data frame"))?;
-        if !raw.is_empty() {
-            return Err(corrupt("data frame length"));
+        let block = self.decode(n, bytes, Vec::new())?;
+        (0..block.record_count())
+            .map(|n| {
+                let record = block.record_at(n)?;
+                Ok((record.key.to_vec(), record.to_owned()))
+            })
+            .collect()
+    }
+
+    fn decode(&self, n: usize, bytes: Vec<u8>, offsets: Vec<u32>) -> Result<ReadBlock> {
+        let i = &self.index[n];
+        let next = self.index.get(n + 1).map(|next| next.first.as_slice());
+        if self.indexed {
+            let (block, fingerprint) = ReadBlock::decode_indexed(
+                bytes,
+                &i.first,
+                next,
+                self.max_seq,
+                i.validated.load(Ordering::Relaxed),
+            )?;
+            i.validated.store(fingerprint, Ordering::Relaxed);
+            Ok(block)
+        } else {
+            ReadBlock::decode_reusing(bytes, offsets, &i.first, next, self.max_seq)
         }
-        let mut c = Cursor { b: &payload };
-        let mut block: Block = vec![];
-        while !c.b.is_empty() {
-            let item = decode_record(&mut c)?;
-            if block.last().is_some_and(|p| p.0 >= item.0)
-                || item.1.seq > self.max_seq
-                || self
-                    .index
-                    .get(n + 1)
-                    .is_some_and(|next| item.0 >= next.first)
-            {
-                return Err(corrupt("SST record order/sequence"));
-            }
-            block.push(item);
-        }
-        if block.first().is_none_or(|x| x.0 != i.first) {
-            return Err(corrupt("SST first key mismatch"));
-        }
-        Ok(block)
     }
     pub fn get(
         &self,
@@ -271,7 +281,7 @@ impl Table {
             let mut cache = cache.lock();
             let cached = cache.get((self.id, n), counters);
             let reusable = if cached.is_none() && self.cacheable.load(Ordering::Relaxed) {
-                cache.take_reusable(i.len as usize)
+                cache.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
             };
@@ -284,22 +294,18 @@ impl Table {
             let (mut bytes, offsets) = reusable.map(ReadBlock::into_buffers).unwrap_or_default();
             resize_frame(&mut bytes, i.len as usize);
             self.file.read_exact_at(&mut bytes, i.offset)?;
-            let mut block = ReadBlock::decode_reusing(
-                bytes,
-                offsets,
-                &i.first,
-                self.index.get(n + 1).map(|next| next.first.as_slice()),
-                self.max_seq,
-            )?;
+            let mut block = self.decode(n, bytes, offsets)?;
             block.trim_to_budget(budget);
             let b = Arc::new(block);
+            #[cfg(test)]
+            crate::test_hooks::pause("cache_before_admission");
             let mut cache = cache.lock();
             if self.cacheable.load(Ordering::Relaxed) {
                 cache.insert((self.id, n), b.clone());
             }
             b
         };
-        Ok(block.get(key))
+        block.lookup(key)
     }
     pub fn iter(self: &Arc<Self>) -> TableIter {
         TableIter {
@@ -378,6 +384,7 @@ fn read_index(
         first,
         offset: off,
         len: bl,
+        validated: AtomicU64::new(0),
     });
     Ok(())
 }
@@ -388,8 +395,24 @@ fn write_block(f: &mut File, b: &mut Vec<u8>, first: &[u8], index: &mut Vec<Inde
         first: first.to_vec(),
         offset,
         len,
+        validated: AtomicU64::new(0),
     });
     b.clear();
+    Ok(())
+}
+fn write_indexed_block(
+    f: &mut File,
+    b: &mut Vec<u8>,
+    offsets: &mut Vec<u32>,
+    first: &[u8],
+    index: &mut Vec<Index>,
+) -> Result<()> {
+    for &offset in offsets.iter() {
+        put_u32(b, offset);
+    }
+    put_u32(b, offsets.len() as u32);
+    write_block(f, b, first, index)?;
+    offsets.clear();
     Ok(())
 }
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
@@ -457,8 +480,8 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index[0].len, 950);
-        assert_eq!(table.index[1].len, 1000);
+        assert_eq!(table.index[0].len, 958);
+        assert_eq!(table.index[1].len, 1008);
         let cache = Mutex::new(Cache::new(1200));
         let counters = Counters::default();
         assert_eq!(table.get(b"a", &cache, &counters).unwrap().unwrap().seq, 1);
@@ -490,10 +513,10 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index.len(), 2);
-        for n in 0..2 {
-            assert_eq!(table.index[n].len as usize, 3 * 18 + HEADER);
-            assert_eq!(table.block(n).unwrap().len(), 3);
+        assert_eq!(table.index.len(), 3);
+        for n in 0..3 {
+            assert_eq!(table.index[n].len as usize, 2 * 18 + 2 * 4 + 4 + HEADER);
+            assert_eq!(table.block(n).unwrap().len(), 2);
         }
         let large = Table::write(
             &dir.path().join("large.sst"),
@@ -511,7 +534,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(large.index.len(), 1);
-        assert_eq!(large.block(0).unwrap()[0].1.value.as_ref().unwrap().len(), 1024);
+        assert_eq!(
+            large.block(0).unwrap()[0].1.value.as_ref().unwrap().len(),
+            1024
+        );
     }
 
     #[test]
@@ -600,11 +626,109 @@ mod tests {
         let live_bytes = cache.lock().bytes();
         // A retired file stays usable through its open handle after unlink.
         fs::remove_file(dir.path().join("retired.sst")).unwrap();
-        assert_eq!(table.get(b"key", &cache, &counters).unwrap().unwrap().seq, 1);
+        assert_eq!(
+            table.get(b"key", &cache, &counters).unwrap().unwrap().seq,
+            1
+        );
         assert_eq!(cache.lock().bytes(), live_bytes);
         assert!(cache.lock().get((1, 0), &counters).is_none());
         assert!(cache.lock().get((2, 0), &counters).is_some());
         assert_eq!(held.get(b"key").unwrap().value.unwrap(), "value");
+    }
+
+    #[test]
+    fn retirement_between_disk_read_and_admission_cannot_refill_cache() {
+        use std::{sync::mpsc::sync_channel, thread, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sst");
+        let table = Arc::new(
+            Table::write(
+                &path,
+                1,
+                std::iter::once(Ok((
+                    b"key".to_vec(),
+                    Record {
+                        seq: 1,
+                        value: Some(Bytes::from_static(b"value")),
+                    },
+                ))),
+                1,
+                64,
+                10,
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(Mutex::new(Cache::new(512)));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        let reader_table = table.clone();
+        let reader_cache = cache.clone();
+        let reader = thread::spawn(move || {
+            crate::test_hooks::arm("cache_before_admission", entered_tx, resume_rx);
+            reader_table.get(b"key", &reader_cache, &Counters::default())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        {
+            let mut cache = cache.lock();
+            table.retire();
+            cache.remove_tables(&std::collections::HashSet::from([1]));
+        }
+        fs::remove_file(path).unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap().unwrap().value.unwrap(),
+            "value"
+        );
+        assert_eq!(cache.lock().bytes(), 0);
+    }
+
+    #[test]
+    fn version_two_and_three_tables_remain_readable_together() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Engine::open(dir.path()).unwrap());
+        let path = dir.path().join("sst/00000000000000000002.sst");
+        let mut file = File::create(path).unwrap();
+        file.write_all(PAGED_MAGIC).unwrap();
+        let mut bytes = Vec::new();
+        encode_record(
+            b"old",
+            &Record {
+                seq: 1,
+                value: Some(Bytes::from_static(b"v2")),
+            },
+            &mut bytes,
+        );
+        let mut index = Vec::new();
+        write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
+        let mut bloom = Bloom::new(1, 10);
+        bloom.insert(b"old");
+        let offset = file.stream_position().unwrap();
+        let size = write_metadata(&mut file, 1, 1, &bloom, &index).unwrap();
+        let mut footer = PAGED_MAGIC.to_vec();
+        put_u64(&mut footer, offset);
+        put_u64(&mut footer, size);
+        let checksum = crc32fast::hash(&footer);
+        put_u32(&mut footer, checksum);
+        file.write_all(&footer).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        Manifest {
+            wal_floor: 0,
+            max_seq: 1,
+            tables: vec![2],
+        }
+        .save(dir.path())
+        .unwrap();
+        let db = Engine::open(dir.path()).unwrap();
+        db.put(b"new", b"v3").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
+        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
+        db.compact().unwrap();
+        drop(db);
+        let db = Engine::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
+        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
     }
 
     #[test]

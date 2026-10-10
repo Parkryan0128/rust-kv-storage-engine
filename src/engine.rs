@@ -101,6 +101,8 @@ pub struct Stats {
     pub compaction_input_bytes: u64,
     pub compaction_output_bytes: u64,
     pub compactions: u64,
+    /// Largest number of input SSTs in a single merge since open (at most four).
+    pub max_compaction_inputs: u64,
 }
 struct Frozen {
     id: u64,
@@ -515,6 +517,7 @@ impl Engine {
             compaction_input_bytes: c.counters.compaction_input_bytes.load(Ordering::Relaxed),
             compaction_output_bytes: c.counters.compaction_output_bytes.load(Ordering::Relaxed),
             compactions: c.counters.compactions.load(Ordering::Relaxed),
+            max_compaction_inputs: c.counters.max_compaction_inputs.load(Ordering::Relaxed),
         }
     }
 }
@@ -737,6 +740,21 @@ impl Core {
         if tables.is_empty() {
             return Ok(());
         }
+        // Publish bounded partial merges. A crash between rounds leaves a valid
+        // manifest, and tombstones survive until all remaining SSTs are selected.
+        let mut pending: VecDeque<_> = tables.into();
+        while pending.len() > compaction::MAX_INPUTS {
+            let inputs = pending.drain(..compaction::MAX_INPUTS).collect();
+            pending.push_back(self.compact_group(inputs)?);
+        }
+        self.compact_group(pending.into())?;
+        Ok(())
+    }
+    fn compact_group(&self, tables: Vec<Arc<Table>>) -> Result<Arc<Table>> {
+        debug_assert!((1..=compaction::MAX_INPUTS).contains(&tables.len()));
+        self.counters
+            .max_compaction_inputs
+            .fetch_max(tables.len() as u64, Ordering::Relaxed);
         let dir = &self.disk.as_ref().unwrap().dir;
         let id = self.allocate()?;
         let estimate = tables.iter().map(|t| t.count).sum();
@@ -767,8 +785,14 @@ impl Core {
             s.manifest = manifest;
             let live = Arc::make_mut(&mut s.tables);
             live.retain(|t| !selected.contains(&t.id));
-            live.push(merged);
+            live.push(merged.clone());
             live.sort_unstable_by_key(|table| Reverse(table.max_seq));
+        }
+        // Retiring/admitting blocks share the cache mutex, but an O(cache size)
+        // purge must not hold the state lock needed by unrelated memtable reads.
+        #[cfg(test)]
+        crate::test_hooks::pause("before_cache_purge");
+        {
             let mut cache = self.cache.lock();
             for table in &tables {
                 table.retire();
@@ -782,6 +806,41 @@ impl Core {
         }
         sync_dir(&dir.join("sst"))?;
         fault::hit("compaction_after_dir_sync")?;
-        Ok(())
+        Ok(merged)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use std::{sync::mpsc::sync_channel, time::Duration};
+
+    #[test]
+    fn cache_purge_does_not_hold_the_state_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open_with_options(
+            dir.path(),
+            Options {
+                compaction_file_threshold: 1000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        db.put(b"disk", b"old").unwrap();
+        db.flush().unwrap();
+        let worker_db = db.clone();
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            crate::test_hooks::arm("before_cache_purge", entered_tx, resume_rx);
+            worker_db.compact()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // try_read fails immediately if publication still holds the write lock.
+        assert!(db.inner.core.state.try_read().is_some());
+        db.put(b"memory", b"unblocked").unwrap();
+        assert_eq!(db.get(b"memory").unwrap().unwrap(), "unblocked");
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
     }
 }

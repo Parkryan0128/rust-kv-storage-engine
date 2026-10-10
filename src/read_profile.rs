@@ -58,13 +58,7 @@ fn profile_random_read_stages() -> Result<()> {
         read_ns += start.elapsed().as_nanos();
         bytes_read += i.len as u64;
         let start = Instant::now();
-        let block = ReadBlock::decode_reusing(
-            bytes,
-            offsets,
-            &i.first,
-            t.index.get(n + 1).map(|i| i.first.as_slice()),
-            t.max_seq,
-        )?;
+        let block = t.decode(n, bytes, offsets)?;
         decode_ns += start.elapsed().as_nanos();
         let start = Instant::now();
         let record = block.get(&key).expect("fixture key");
@@ -91,7 +85,7 @@ fn profile_random_read_stages() -> Result<()> {
             "mean_read_ns":mean(read_ns),"mean_decode_crc_records_ns":mean(decode_ns),
             "mean_lookup_copy_ns":mean(lookup_ns),"mean_crc_only_ns":mean(crc_ns),
             "mean_frame_bytes":bytes_read as f64/samples as f64,
-            "notes":"OS-warm uncached-block microbenchmark with reused buffers; excludes routing, cache, locks and allocation. CRC-only overlaps decode. Timer overhead is included."
+            "notes":"OS-warm uncached-block microbenchmark with reused buffers and per-table validation certificates; first touches fully validate, repeat touches reuse validation after checking CRC. Excludes routing/cache/locks. CRC-only overlaps decode. Timer overhead is included."
         })
     );
     Ok(())

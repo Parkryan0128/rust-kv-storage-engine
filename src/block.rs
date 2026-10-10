@@ -5,6 +5,8 @@ use crate::{codec::*, error::corrupt, memtable::Record, Result};
 pub(crate) struct ReadBlock {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
+    // Zero for legacy blocks; otherwise the persisted offset directory starts here.
+    index_start: usize,
 }
 
 impl ReadBlock {
@@ -53,7 +55,57 @@ impl ReadBlock {
         if offsets.capacity() > offsets.len().max(4).saturating_mul(2) {
             offsets.shrink_to_fit();
         }
-        Ok(Self { bytes, offsets })
+        Ok(Self {
+            bytes,
+            offsets,
+            index_start: 0,
+        })
+    }
+
+    pub fn decode_indexed(
+        bytes: Vec<u8>,
+        first: &[u8],
+        next: Option<&[u8]>,
+        max_seq: u64,
+        validated: u64,
+    ) -> Result<(Self, u64)> {
+        let payload = frame_payload(&bytes)?;
+        let records = indexed_records(payload)?;
+        let index_start = HEADER + records.len();
+        // The extra bit distinguishes an unvalidated block from a valid zero CRC.
+        let fingerprint =
+            (1u64 << 32) | u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64;
+        if fingerprint != validated {
+            let mut cursor = Cursor { b: records };
+            let mut previous: Option<&[u8]> = None;
+            for offset in payload[records.len()..payload.len() - 4].chunks_exact(4) {
+                let offset = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+                if offset != records.len() - cursor.b.len() {
+                    return Err(corrupt("SST record offset"));
+                }
+                let record = decode_record_ref(&mut cursor)?;
+                if record.seq > max_seq || previous.is_some_and(|p| p >= record.key) {
+                    return Err(corrupt("SST record order/sequence"));
+                }
+                if previous.is_none() && record.key != first {
+                    return Err(corrupt("SST first key mismatch"));
+                }
+                previous = Some(record.key);
+            }
+            cursor.done()?;
+            let last = previous.ok_or_else(|| corrupt("empty SST block"))?;
+            if next.is_some_and(|key| last >= key) {
+                return Err(corrupt("SST record order/sequence"));
+            }
+        }
+        Ok((
+            Self {
+                bytes,
+                offsets: Vec::new(),
+                index_start,
+            },
+            fingerprint,
+        ))
     }
 
     pub fn into_buffers(self) -> (Vec<u8>, Vec<u32>) {
@@ -86,19 +138,70 @@ impl ReadBlock {
         &self.bytes[offset + 17..offset + 17 + len as usize]
     }
 
+    #[cfg(test)]
     pub fn get(&self, key: &[u8]) -> Option<Record> {
+        self.lookup(key).expect("validated block")
+    }
+
+    pub fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
+        if self.index_start != 0 {
+            let (mut left, mut right) = (0, self.record_count());
+            while left < right {
+                let middle = left + (right - left) / 2;
+                let record = self.record_at(middle)?;
+                match record.key.cmp(key) {
+                    std::cmp::Ordering::Less => left = middle + 1,
+                    std::cmp::Ordering::Greater => right = middle,
+                    std::cmp::Ordering::Equal => return Ok(Some(record.to_owned())),
+                }
+            }
+            return Ok(None);
+        }
         let index = self
             .offsets
             .binary_search_by(|&offset| self.key(offset).cmp(key))
-            .ok()?;
+            .ok();
+        let Some(index) = index else { return Ok(None) };
         let mut c = Cursor {
             b: &self.bytes[self.offsets[index] as usize..],
         };
-        Some(
+        Ok(Some(
             decode_record_ref(&mut c)
                 .expect("immutable validated record")
                 .to_owned(),
-        )
+        ))
+    }
+
+    pub fn record_count(&self) -> usize {
+        if self.index_start == 0 {
+            self.offsets.len()
+        } else {
+            (self.bytes.len() - self.index_start - 4) / 4
+        }
+    }
+
+    pub fn record_at(&self, index: usize) -> Result<RecordRef<'_>> {
+        if index >= self.record_count() {
+            return Err(corrupt("SST record index"));
+        }
+        let offset = if self.index_start == 0 {
+            self.offsets[index] as usize
+        } else {
+            let start = self.index_start + index * 4;
+            HEADER + u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
+        };
+        let end = if self.index_start == 0 {
+            self.bytes.len()
+        } else {
+            self.index_start
+        };
+        let mut cursor = Cursor {
+            b: self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| corrupt("SST record offset"))?,
+        };
+        decode_record_ref(&mut cursor)
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -108,10 +211,91 @@ impl ReadBlock {
     }
 }
 
+pub(crate) fn indexed_records(payload: &[u8]) -> Result<&[u8]> {
+    let footer = payload
+        .get(payload.len().saturating_sub(4)..)
+        .filter(|footer| footer.len() == 4)
+        .ok_or_else(|| corrupt("SST offset footer"))?;
+    let count = u32::from_le_bytes(footer.try_into().unwrap()) as usize;
+    if count == 0 || count > (payload.len() - 4) / 21 {
+        return Err(corrupt("SST offset count"));
+    }
+    Ok(&payload[..payload.len() - 4 - count * 4])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    fn indexed_frame(records: &[TestRecord<'_>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut offsets = Vec::new();
+        for &(key, seq, value) in records {
+            offsets.push(payload.len() as u32);
+            encode_record(
+                key,
+                &Record {
+                    seq,
+                    value: value.map(Bytes::copy_from_slice),
+                },
+                &mut payload,
+            );
+        }
+        for &offset in &offsets {
+            put_u32(&mut payload, offset);
+        }
+        put_u32(&mut payload, offsets.len() as u32);
+        framed(&payload)
+    }
+
+    #[test]
+    fn persisted_offsets_validate_once_and_revalidate_changed_frames() {
+        let bytes = indexed_frame(&[
+            (b"", 1, Some(b"")),
+            (b"b", 2, None),
+            (b"z", 3, Some(b"last")),
+        ]);
+        let (block, fingerprint) =
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, 0).unwrap();
+        assert_eq!(block.record_count(), 3);
+        assert_eq!(block.lookup(b"z").unwrap().unwrap().value.unwrap(), "last");
+        assert_eq!(block.lookup(b"b").unwrap().unwrap().value, None);
+        assert_eq!(block.lookup(b"a").unwrap(), None);
+        assert!(block.offsets.is_empty());
+        let (again, cached) =
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, fingerprint).unwrap();
+        assert_eq!(cached, fingerprint);
+        assert_eq!(again.lookup(b"").unwrap().unwrap().value.unwrap().len(), 0);
+        // A fresh, valid CRC is not enough to bypass structural checks after a change.
+        let mut payload = frame_payload(&bytes).unwrap().to_vec();
+        payload[17..25].fill(0); // second record's sequence
+        assert!(ReadBlock::decode_indexed(framed(&payload), b"", None, 3, fingerprint).is_err());
+        for at in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            assert!(ReadBlock::decode_indexed(changed, b"", None, 3, fingerprint).is_err());
+        }
+    }
+
+    #[test]
+    fn persisted_directory_rejects_checksum_valid_bad_offsets_counts_and_order() {
+        let original = indexed_frame(&[(b"a", 1, None), (b"b", 2, None)]);
+        let payload = frame_payload(&original).unwrap();
+        for case in 0..6 {
+            let mut changed = payload.to_vec();
+            match case {
+                0 => changed[36..40].copy_from_slice(&1u32.to_le_bytes()),
+                1 => changed[40..44].copy_from_slice(&u32::MAX.to_le_bytes()),
+                2 => changed[44..48].copy_from_slice(&0u32.to_le_bytes()),
+                3 => changed[44..48].copy_from_slice(&u32::MAX.to_le_bytes()),
+                4 => changed[35] = b'a',
+                _ => changed[18..26].copy_from_slice(&3u64.to_le_bytes()),
+            }
+            assert!(ReadBlock::decode_indexed(framed(&changed), b"a", None, 2, 0).is_err());
+        }
+        assert!(ReadBlock::decode_indexed(original, b"a", Some(b"b"), 2, 0).is_err());
+    }
 
     type TestRecord<'a> = (&'a [u8], u64, Option<&'a [u8]>);
 

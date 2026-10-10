@@ -24,6 +24,7 @@ pub(crate) struct Counters {
     pub compaction_input_bytes: AtomicU64,
     pub compaction_output_bytes: AtomicU64,
     pub compactions: AtomicU64,
+    pub max_compaction_inputs: AtomicU64,
     pub hits: AtomicU64,
     pub bloom_negatives: AtomicU64,
 }
@@ -119,10 +120,18 @@ impl Cache {
     // Recycle a victim only when even the minimum incoming charge needs space.
     // Arc::try_unwrap protects concurrent readers. Frames that cannot fit do
     // not evict useful blocks. No spare buffer is retained outside the budget.
-    pub fn take_reusable(&mut self, frame_len: usize) -> Option<ReadBlock> {
+    pub fn take_reusable(&mut self, frame_len: usize, indexed: bool) -> Option<ReadBlock> {
+        // Before decoding legacy records, use an upper bound for their index.
+        // An optimistic one-offset charge could evict a victim even though the
+        // incoming dense block can never fit. Indexed frames carry no extra index.
+        let index_bytes = if indexed {
+            0
+        } else {
+            frame_len.saturating_sub(crate::codec::HEADER) / 17 * std::mem::size_of::<u32>()
+        };
         let minimum = frame_len
             .saturating_add(std::mem::size_of::<ReadBlock>())
-            .saturating_add(std::mem::size_of::<u32>())
+            .saturating_add(index_bytes)
             .saturating_add(ENTRY_OVERHEAD);
         if self.tail == NONE || minimum > self.capacity || self.bytes <= self.capacity - minimum {
             return None;
@@ -231,12 +240,28 @@ mod tests {
     }
 
     #[test]
+    fn dense_legacy_blocks_that_cannot_fit_do_not_evict_for_recycling() {
+        let mut cache = Cache::new(1200);
+        let counters = Counters::default();
+        cache.insert((1, 0), block(920));
+        let before = cache.bytes();
+        assert!(before > 0);
+        // 55 empty values with one-byte keys: frame 1002, required offsets 220.
+        assert!(cache.take_reusable(1002, false).is_none());
+        assert_eq!(cache.bytes(), before);
+        assert!(cache.get((1, 0), &counters).is_some());
+        // V3 carries its directory within the frame, so this bound is exact.
+        assert!(cache.take_reusable(1226, true).is_none());
+        assert_eq!(cache.bytes(), before);
+    }
+
+    #[test]
     fn recycling_reuses_storage_but_never_overwrites_an_outstanding_reader() {
         let first = block(15);
         let size = first.allocated_bytes() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(size);
         cache.insert((1, 0), first.clone());
-        assert!(cache.take_reusable(45).is_none());
+        assert!(cache.take_reusable(45, false).is_none());
         assert_eq!(cache.bytes(), 0);
         assert_eq!(
             first.get(b"k").unwrap().value.as_deref(),
@@ -244,9 +269,9 @@ mod tests {
         );
         let addresses = first.buffer_addresses();
         cache.insert((2, 0), first);
-        assert!(cache.take_reusable(size * 2).is_none());
+        assert!(cache.take_reusable(size * 2, false).is_none());
         assert_eq!(cache.bytes(), size);
-        let recycled = cache.take_reusable(45).unwrap();
+        let recycled = cache.take_reusable(45, false).unwrap();
         assert_eq!(cache.bytes(), 0);
         // Reclaiming the block transferred its buffers rather than cloning them.
         let (frame, offsets) = recycled.into_buffers();

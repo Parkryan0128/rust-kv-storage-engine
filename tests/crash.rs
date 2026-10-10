@@ -192,6 +192,7 @@ fn partial_compaction_crashes_and_io_errors_preserve_unselected_files() {
     use rust_kv_storage_engine::Options;
     for mode in ["tiered", "tiered-error"] {
         for point in [
+            "bloom_rebuild_read",
             "sst_before_sync",
             "sst_after_sync",
             "sst_after_rename",
@@ -251,5 +252,56 @@ fn partial_compaction_crashes_and_io_errors_preserve_unselected_files() {
             e.compact().unwrap();
             assert_eq!(e.stats().sst_records, 511);
         }
+    }
+}
+
+#[test]
+fn interrupted_multi_round_compaction_recovers_published_prefix() {
+    use rust_kv_storage_engine::Options;
+    for point in [
+        "compaction_before_old_delete",
+        "compaction_after_old_delete",
+        "compaction_after_dir_sync",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            compaction_file_threshold: 1000,
+            ..Options::default()
+        };
+        let db = Engine::open_with_options(dir.path(), opts.clone()).unwrap();
+        for generation in 0..11u8 {
+            db.put(&[generation], &[generation]).unwrap();
+            db.put(b"hot", &[generation]).unwrap();
+            if generation == 0 {
+                db.put(b"deleted", b"old").unwrap();
+            }
+            if generation == 5 {
+                db.delete(b"deleted").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        drop(db);
+        assert_eq!(
+            worker()
+                .arg(dir.path())
+                .arg("compact")
+                .arg(point)
+                .status()
+                .unwrap()
+                .code(),
+            Some(86)
+        );
+        let db = Engine::open_with_options(dir.path(), opts).unwrap();
+        for generation in 0..11u8 {
+            assert_eq!(
+                db.get(&[generation]).unwrap().unwrap().as_ref(),
+                &[generation]
+            );
+        }
+        assert_eq!(db.get(b"hot").unwrap().unwrap().as_ref(), &[10]);
+        assert_eq!(db.get(b"deleted").unwrap(), None);
+        db.compact().unwrap();
+        assert_eq!(db.stats().sst_files, 1);
+        assert_eq!(db.get(b"deleted").unwrap(), None);
     }
 }

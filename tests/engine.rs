@@ -360,6 +360,20 @@ fn concurrent_manual_flush_and_compact_do_not_deadlock_or_lose_data() {
 
 #[test]
 fn flush_completes_while_a_producer_keeps_writing() {
+    if std::env::var_os("KV_FLUSH_CHILD").is_none() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "flush_completes_while_a_producer_keeps_writing",
+                "--nocapture",
+            ])
+            .env("KV_FLUSH_CHILD", "1");
+        assert!(run_with_deadline(&mut command, Duration::from_secs(30))
+            .expect("flush subprocess exceeded deadline and was killed")
+            .success());
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = Engine::open_with_options(dir.path(), options()).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -398,6 +412,58 @@ fn flush_completes_while_a_producer_keeps_writing() {
     for key in 0..16u64 {
         assert_eq!(db.get(&key.to_be_bytes()).unwrap().unwrap().len(), 2048);
     }
+}
+
+#[test]
+fn liveness_harness_terminates_a_stalled_child() {
+    if std::env::var_os("KV_STALLED_CHILD").is_some() {
+        loop {
+            thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "liveness_harness_terminates_a_stalled_child"])
+        .env("KV_STALLED_CHILD", "1");
+    assert!(run_with_deadline(&mut command, Duration::from_millis(200)).is_none());
+}
+
+#[test]
+fn full_compaction_bounds_fan_in_and_preserves_deletions_across_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        compaction_file_threshold: 1000,
+        ..Options::default()
+    };
+    let db = Engine::open_with_options(dir.path(), options.clone()).unwrap();
+    for generation in 0..11u8 {
+        db.put(&[generation], &vec![generation; 128 * 1024])
+            .unwrap();
+        db.put(b"hot", &[generation]).unwrap();
+        if generation == 0 {
+            db.put(b"deleted", b"old").unwrap();
+        }
+        if generation == 5 {
+            db.delete(b"deleted").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(db.stats().sst_files, 11);
+    db.compact().unwrap();
+    assert_eq!(db.stats().sst_files, 1);
+    assert_eq!(db.stats().max_compaction_inputs, 4);
+    assert!(db.stats().compactions > 1);
+    assert_eq!(db.get(b"deleted").unwrap(), None);
+    drop(db);
+    let db = Engine::open_with_options(dir.path(), options).unwrap();
+    for generation in 0..11u8 {
+        assert_eq!(
+            db.get(&[generation]).unwrap().unwrap().as_ref(),
+            vec![generation; 128 * 1024]
+        );
+    }
+    assert_eq!(db.get(b"hot").unwrap().unwrap().as_ref(), &[10]);
+    assert_eq!(db.get(b"deleted").unwrap(), None);
 }
 
 #[test]

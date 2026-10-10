@@ -72,6 +72,16 @@ impl Bloom {
 mod tests {
     use super::*;
     #[test]
+    fn rebuilding_respects_half_size_boundary_minimum_and_cap() {
+        let bloom = Bloom::new(160, 10); // 200 bytes
+        assert!(!bloom.needs_rebuild(80, 10)); // exactly half
+        assert!(bloom.needs_rebuild(79, 10)); // rounded up to 99, below half
+        assert!(bloom.needs_rebuild(0, 10));
+        assert!(!Bloom::new(0, 10).needs_rebuild(0, 10));
+        assert_eq!(Bloom::byte_len(0, 10), 8);
+        assert_eq!(Bloom::byte_len(u64::MAX, 30), 8 * 1024 * 1024);
+    }
+    #[test]
     fn no_false_negatives_and_bounded_false_positives() {
         let mut b = Bloom::new(10000, 10);
         for i in 0u64..10000 {

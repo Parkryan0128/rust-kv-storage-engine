@@ -35,6 +35,29 @@ pub fn verify(e: &Engine, model: &BTreeMap<Vec<u8>, Vec<u8>>, keys: usize) {
     }
 }
 pub struct Rng(pub u64);
+pub fn run_with_deadline(
+    command: &mut std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(command.spawn().unwrap());
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return Some(status);
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 impl Rng {
     pub fn next(&mut self) -> u64 {
         let mut x = self.0;

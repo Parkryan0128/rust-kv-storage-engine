@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap},
     sync::Arc,
 };
+pub(crate) const MAX_INPUTS: usize = 4;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompactionStyle {
     #[default]

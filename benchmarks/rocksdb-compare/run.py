@@ -9,8 +9,6 @@ import sys
 import tempfile
 import zlib
 
-BASELINE = "7760c0d26ac67bfcb5fe1784f2053674ef9b49e4"
-
 
 def capture(*args):
     return subprocess.check_output(args, text=True).strip()
@@ -36,7 +34,7 @@ def logged(command, env, path, timeout):
 def main():
     output = Path(sys.argv[1] if len(sys.argv) > 1 else "comparison-results")
     output.mkdir(parents=True, exist_ok=True)
-    names = ("baseline", "engine", "rocksdb")
+    names = ("engine", "rocksdb")
     binaries = {name: Path("comparison-bin", name).resolve() for name in names}
     smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
     queries = 1000 if smoke else 500_000
@@ -47,7 +45,6 @@ def main():
     ]
     metadata = {
         "commit": capture("git", "rev-parse", "HEAD"),
-        "baseline_commit": BASELINE,
         "platform": platform.platform(),
         "rust": capture("rustc", "--version"),
         "cpu": capture("lscpu"),
@@ -76,9 +73,10 @@ def main():
             "Fixture creation and OS-cache warming are outside measured processes.",
             "Fresh process/block cache per trial; two identical seeded random passes.",
             "Read-only fixed layouts: engine compaction trigger 64; RocksDB read-only open.",
-            "Block-size order and backend order rotate; each occupies each position twice.",
+            "Block-size order rotates twice; backend order alternates across six trials.",
             "RSS excludes fixture creation and OS page cache.",
-            "Baseline and current engine read the same fixture bytes with the same harness.",
+            "Engine uses its production V3 SST writer; RocksDB uses its production SST writer.",
+            "V3 full record validation is cached per block within each fresh engine process; every disk read still checks the full frame CRC.",
             "Latency samples time Get only; throughput includes RNG, validation and value release.",
             "Single-client OS-cache-warm hit workload, not physical-disk or write performance.",
             "READ_PROFILE is a separate forced-miss microbenchmark, not an end-to-end CPU profile.",
@@ -125,8 +123,7 @@ def main():
                          str(keys), str(size), str(tables)], env=env, check=True, timeout=180,
                     )
                     if not smoke:
-                        for name, manifest in [("baseline", "baseline-source/Cargo.toml"),
-                                               ("engine", "Cargo.toml")]:
+                        for name, manifest in [("engine", "Cargo.toml")]:
                             warm_files(engine_dir)
                             source = Path(manifest).resolve().parent
                             target = str(source / "target")
@@ -152,7 +149,7 @@ def main():
                 for trial in range(1, trials + 1):
                     block_rotation = (trial - 1) % len(block_sizes)
                     blocks = block_sizes[block_rotation:] + block_sizes[:block_rotation]
-                    rotation = ((trial - 1) % 3 + (trial - 1) // 3 * 2) % len(names)
+                    rotation = (trial - 1) % len(names)
                     order = names[rotation:] + names[:rotation]
                     seed = 0xACE123 + trial * 104729
                     for block_bytes in blocks:

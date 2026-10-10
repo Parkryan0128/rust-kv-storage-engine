@@ -25,6 +25,8 @@ mod read_fixture;
 #[cfg(test)]
 mod read_path_tests;
 mod sstable;
+#[cfg(test)]
+mod test_hooks;
 mod wal;
 pub use compaction::CompactionStyle;
 pub use engine::{Engine, KvEngine, Options, Result, Stats};
