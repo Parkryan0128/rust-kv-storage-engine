@@ -75,7 +75,7 @@ impl Wal {
         ))
     }
     pub fn append(&mut self, key: &[u8], r: &Record) -> Result<()> {
-        let mut b = Vec::with_capacity(r.size(key));
+        let mut b = Vec::with_capacity(r.encoded_len(key));
         encode_record(key, r, &mut b);
         fault::hit("wal_before_append")?;
         self.bytes += write_frame(&mut self.file, &b)?;

@@ -35,10 +35,20 @@ complete blocks. The on-disk format is unchanged, including legacy SST support.
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
 order through indexed links rather than a tree. When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
-block; outstanding readers retain their original immutable block. Oversized
-misses do not evict useful entries for recycling. Every reused frame and record
+block; outstanding readers retain their original immutable block. Frames that
+cannot fit the budget do not evict entries for recycling. Every reused frame and record
 is validated again before being cached. Cache charges include allocated buffer
 capacities and a per-entry allowance; no separate spare-buffer pool is retained.
+
+Reused frames grow to the requested length instead of doubling their capacity.
+Sparse blocks shed oversized recycled offset arrays; retained spare capacity is
+trimmed when it would prevent cache admission. Compaction evicts obsolete table
+entries and prevents old reader snapshots from putting them back in the cache.
+Outstanding readers still finish safely through their immutable blocks/open files.
+
+Strict key ordering lets point reads check the next-block upper bound once per
+block. Every record header, sequence, order and frame checksum is still checked.
+Block splitting uses encoded record lengths, separately from memtable memory charges.
 
 ## Combining files
 
@@ -51,6 +61,13 @@ Partial merges keep tombstones so old values in other files stay deleted. A full
 
 `flush()` saves earlier writes and waits for eligible compactions. `compact()` also requests a full merge.
 
+The background worker releases the maintenance lock fairly between jobs so a
+manual flush does not wait for a continuously replenished background queue.
+When compaction discards enough records to overallocate the Bloom filter by more
+than roughly two times, the writer rebuilds it from output blocks with bounded
+scratch space. Empty output always uses the minimum filter size. This adds an
+output read pass only for such shrinking merges and does not change the file format.
+
 ## Saving files and recovering
 
 New files become active in this order:
@@ -60,6 +77,12 @@ New files become active in this order:
 3. Update the in-memory state, then remove obsolete files.
 
 On open, the engine reads the MANIFEST, replays newer WAL records, and removes temporary or unused files.
+
+New or interrupted database initialization syncs the directory's ancestor chain
+before publishing its first manifest, including entries created by an earlier
+interrupted initialization. Reopening a database with a published manifest does
+not repeat those ancestor reads; normal path traversal permission is sufficient
+for ancestors of an initialized database.
 
 Recovery accepts an incomplete tail only in the newest WAL. Corrupt records return an error; a missing manifest is not reconstructed.
 

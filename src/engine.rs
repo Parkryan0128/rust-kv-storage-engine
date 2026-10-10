@@ -175,13 +175,7 @@ impl Engine {
     }
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         options.validate()?;
-        let dir = path.as_ref();
-        fs::create_dir_all(dir)?;
-        let dir = fs::canonicalize(dir)?;
-        // Sync parents too, since create_dir_all may have created them.
-        for ancestor in dir.ancestors() {
-            sync_dir(ancestor)?;
-        }
+        let dir = create_db_dir(path.as_ref())?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -314,8 +308,8 @@ impl Engine {
                             if c.stop.load(Ordering::Acquire) {
                                 break;
                             }
-                            let _guard = c.maintenance.lock();
                             loop {
+                                let guard = c.maintenance.lock();
                                 if c.stop.load(Ordering::Acquire) {
                                     break;
                                 }
@@ -334,6 +328,9 @@ impl Engine {
                                     c.poison(&e);
                                     break;
                                 }
+                                // Hand off between jobs so a flush with a finite
+                                // WAL goal cannot wait for all future writes.
+                                parking_lot::MutexGuard::unlock_fair(guard);
                             }
                         }
                     })?,
@@ -547,6 +544,19 @@ fn check(s: &State) -> Result<()> {
         None => Ok(()),
     }
 }
+fn create_db_dir(path: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(path)?;
+    let dir = fs::canonicalize(path)?;
+    // A published manifest means initialization already synced the ancestors.
+    // Without one, include ancestors left by an interrupted create_dir_all:
+    // merely syncing directories created by this call would miss those entries.
+    if !dir.join("MANIFEST").try_exists()? {
+        for ancestor in dir.ancestors() {
+            sync_dir(ancestor)?;
+        }
+    }
+    Ok(dir)
+}
 fn wal_path(dir: &Path, id: u64) -> PathBuf {
     dir.join("wal").join(format!("{id:020}.wal"))
 }
@@ -755,10 +765,15 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
-            let tables = Arc::make_mut(&mut s.tables);
-            tables.retain(|t| !selected.contains(&t.id));
-            tables.push(merged);
-            tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
+            let live = Arc::make_mut(&mut s.tables);
+            live.retain(|t| !selected.contains(&t.id));
+            live.push(merged);
+            live.sort_unstable_by_key(|table| Reverse(table.max_seq));
+            let mut cache = self.cache.lock();
+            for table in &tables {
+                table.retire();
+            }
+            cache.remove_tables(&selected);
         }
         fault::hit("compaction_before_old_delete")?;
         for old in tables {

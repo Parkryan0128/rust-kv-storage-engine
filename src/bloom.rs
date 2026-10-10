@@ -18,12 +18,17 @@ fn hash(key: &[u8]) -> (u64, u64) {
 }
 impl Bloom {
     pub fn new(count: u64, bits_per_key: usize) -> Self {
-        let bytes = (count.saturating_mul(bits_per_key as u64).div_ceil(8))
-            .clamp(8, 8 * 1024 * 1024) as usize;
         Self {
-            bits: vec![0; bytes],
+            bits: vec![0; Self::byte_len(count, bits_per_key)],
             probes: ((bits_per_key as f64 * 0.69) as u32).clamp(1, 20),
         }
+    }
+    fn byte_len(count: u64, bits_per_key: usize) -> usize {
+        (count.saturating_mul(bits_per_key as u64).div_ceil(8)).clamp(8, 8 * 1024 * 1024) as usize
+    }
+    pub fn needs_rebuild(&self, count: u64, bits_per_key: usize) -> bool {
+        let needed = Self::byte_len(count, bits_per_key);
+        (count == 0 && needed < self.bits.len()) || needed < self.bits.len() / 2
     }
     pub fn insert(&mut self, key: &[u8]) {
         let (mut h, delta) = hash(key);

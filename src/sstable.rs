@@ -14,7 +14,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
 const MAGIC: &[u8; 8] = b"RKVSST02";
@@ -37,6 +40,7 @@ pub(crate) struct Table {
     pub count: u64,
     pub file_bytes: u64,
     pub max_seq: u64,
+    cacheable: AtomicBool,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; len];
@@ -53,7 +57,11 @@ impl Table {
         bloom_bits: usize,
     ) -> Result<Self> {
         let tmp = path.with_extension("tmp");
-        let mut f = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&tmp)?;
         f.write_all(MAGIC)?;
         let mut index = vec![];
         let mut bloom = Bloom::new(estimate, bloom_bits);
@@ -67,7 +75,7 @@ impl Table {
             if previous.as_ref().is_some_and(|p| p >= &key) {
                 return Err(corrupt("unsorted SST input"));
             }
-            if !block.is_empty() && block.len() + r.size(&key) > block_size {
+            if !block.is_empty() && block.len() + r.encoded_len(&key) > block_size {
                 write_block(&mut f, &mut block, &first, &mut index)?;
             }
             if block.is_empty() {
@@ -81,6 +89,21 @@ impl Table {
         }
         if !block.is_empty() {
             write_block(&mut f, &mut block, &first, &mut index)?;
+        }
+        if bloom.needs_rebuild(count, bloom_bits) {
+            // Compaction can discard nearly all inputs. Rebuild from the
+            // written output without retaining all keys or merging twice.
+            bloom = Bloom::new(count, bloom_bits);
+            for i in &index {
+                resize_frame(&mut block, i.len as usize);
+                f.read_exact_at(&mut block, i.offset)?;
+                let mut c = Cursor {
+                    b: frame_payload(&block)?,
+                };
+                while !c.b.is_empty() {
+                    bloom.insert(decode_record_ref(&mut c)?.key);
+                }
+            }
         }
         let meta_offset = f.stream_position()?;
         let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index)?;
@@ -193,6 +216,7 @@ impl Table {
             count,
             file_bytes: len,
             max_seq,
+            cacheable: AtomicBool::new(true),
         })
     }
     pub fn block(&self, n: usize) -> Result<Block> {
@@ -243,31 +267,36 @@ impl Table {
         let n = p - 1;
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
-        let (cached, reusable) = {
+        let (cached, reusable, budget) = {
             let mut cache = cache.lock();
             let cached = cache.get((self.id, n), counters);
-            let reusable = if cached.is_none() {
+            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Relaxed) {
                 cache.take_reusable(i.len as usize)
             } else {
                 None
             };
-            (cached, reusable)
+            (cached, reusable, cache.block_budget())
         };
         let block = if let Some(b) = cached {
             b
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
             let (mut bytes, offsets) = reusable.map(ReadBlock::into_buffers).unwrap_or_default();
-            bytes.resize(i.len as usize, 0);
+            resize_frame(&mut bytes, i.len as usize);
             self.file.read_exact_at(&mut bytes, i.offset)?;
-            let b = Arc::new(ReadBlock::decode_reusing(
+            let mut block = ReadBlock::decode_reusing(
                 bytes,
                 offsets,
                 &i.first,
                 self.index.get(n + 1).map(|next| next.first.as_slice()),
                 self.max_seq,
-            )?);
-            cache.lock().insert((self.id, n), b.clone());
+            )?;
+            block.trim_to_budget(budget);
+            let b = Arc::new(block);
+            let mut cache = cache.lock();
+            if self.cacheable.load(Ordering::Relaxed) {
+                cache.insert((self.id, n), b.clone());
+            }
             b
         };
         Ok(block.get(key))
@@ -280,6 +309,19 @@ impl Table {
             failed: false,
         }
     }
+    // Call while holding the same cache mutex used by get's admission check.
+    // An old snapshot can still read the file, but cannot refill the cache.
+    pub fn retire(&self) {
+        self.cacheable.store(false, Ordering::Relaxed);
+    }
+}
+fn resize_frame(bytes: &mut Vec<u8>, len: usize) {
+    if bytes.capacity() < len {
+        // Vec::resize alone grows geometrically; recycled frames close to the
+        // cache budget could otherwise become too large to admit.
+        bytes.reserve_exact(len - bytes.len());
+    }
+    bytes.resize(len, 0);
 }
 fn write_metadata(
     f: &mut impl Write,
@@ -391,6 +433,179 @@ mod tests {
     use super::*;
     use crate::{manifest::Manifest, Engine};
     use bytes::Bytes;
+
+    #[test]
+    fn larger_recycled_frame_remains_cacheable_near_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::write(
+            &dir.path().join("table.sst"),
+            1,
+            [(b'a', 920), (b'b', 970)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, len))| {
+                    Ok((
+                        vec![key],
+                        Record {
+                            seq: i as u64 + 1,
+                            value: Some(Bytes::from(vec![key; len])),
+                        },
+                    ))
+                }),
+            2,
+            64,
+            10,
+        )
+        .unwrap();
+        assert_eq!(table.index[0].len, 950);
+        assert_eq!(table.index[1].len, 1000);
+        let cache = Mutex::new(Cache::new(1200));
+        let counters = Counters::default();
+        assert_eq!(table.get(b"a", &cache, &counters).unwrap().unwrap().seq, 1);
+        assert_eq!(table.get(b"b", &cache, &counters).unwrap().unwrap().seq, 2);
+        assert_eq!(counters.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(table.get(b"b", &cache, &counters).unwrap().unwrap().seq, 2);
+        assert_eq!(counters.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.hits.load(Ordering::Relaxed), 1);
+        assert!(cache.lock().bytes() <= 1200);
+    }
+
+    #[test]
+    fn packing_uses_encoded_lengths_and_allows_one_oversized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::write(
+            &dir.path().join("packed.sst"),
+            1,
+            (b'a'..=b'f').enumerate().map(|(i, key)| {
+                Ok((
+                    vec![key],
+                    Record {
+                        seq: i as u64 + 1,
+                        value: Some(Bytes::new()),
+                    },
+                ))
+            }),
+            6,
+            64,
+            10,
+        )
+        .unwrap();
+        assert_eq!(table.index.len(), 2);
+        for n in 0..2 {
+            assert_eq!(table.index[n].len as usize, 3 * 18 + HEADER);
+            assert_eq!(table.block(n).unwrap().len(), 3);
+        }
+        let large = Table::write(
+            &dir.path().join("large.sst"),
+            2,
+            std::iter::once(Ok((
+                b"key".to_vec(),
+                Record {
+                    seq: 7,
+                    value: Some(Bytes::from(vec![42; 1024])),
+                },
+            ))),
+            1,
+            64,
+            10,
+        )
+        .unwrap();
+        assert_eq!(large.index.len(), 1);
+        assert_eq!(large.block(0).unwrap()[0].1.value.as_ref().unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn output_count_controls_bloom_size_after_heavy_deduplication() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [0u64, 17] {
+            let records = || {
+                (0..count).map(|key| {
+                    Ok((
+                        key.to_be_bytes().to_vec(),
+                        Record {
+                            seq: key + 1,
+                            value: Some(Bytes::from_static(b"value")),
+                        },
+                    ))
+                })
+            };
+            let actual = Table::write(
+                &dir.path().join(format!("actual-{count}.sst")),
+                1,
+                records(),
+                1_000_000,
+                64,
+                10,
+            )
+            .unwrap();
+            let expected = Table::write(
+                &dir.path().join(format!("expected-{count}.sst")),
+                2,
+                records(),
+                count,
+                64,
+                10,
+            )
+            .unwrap();
+            assert_eq!(actual.file_bytes, expected.file_bytes);
+            if count == 0 {
+                assert_eq!(actual.file_bytes, 88);
+            }
+            let cache = Mutex::new(Cache::new(0));
+            let counters = Counters::default();
+            for key in 0..count {
+                assert_eq!(
+                    actual
+                        .get(&key.to_be_bytes(), &cache, &counters)
+                        .unwrap()
+                        .unwrap()
+                        .seq,
+                    key + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_snapshot_reads_do_not_repopulate_or_evict_live_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::write(
+            &dir.path().join("retired.sst"),
+            1,
+            std::iter::once(Ok((
+                b"key".to_vec(),
+                Record {
+                    seq: 1,
+                    value: Some(Bytes::from_static(b"value")),
+                },
+            ))),
+            1,
+            64,
+            10,
+        )
+        .unwrap();
+        let cache = Mutex::new(Cache::new(512));
+        let counters = Counters::default();
+        table.get(b"key", &cache, &counters).unwrap();
+        let capacity = cache.lock().bytes();
+        let held = cache.lock().get((1, 0), &counters).unwrap();
+        {
+            let mut cache = cache.lock();
+            table.retire();
+            cache.remove_tables(&std::collections::HashSet::from([1]));
+            assert_eq!(cache.bytes(), 0);
+            *cache = Cache::new(capacity);
+            cache.insert((2, 0), held.clone());
+        }
+        let live_bytes = cache.lock().bytes();
+        // A retired file stays usable through its open handle after unlink.
+        fs::remove_file(dir.path().join("retired.sst")).unwrap();
+        assert_eq!(table.get(b"key", &cache, &counters).unwrap().unwrap().seq, 1);
+        assert_eq!(cache.lock().bytes(), live_bytes);
+        assert!(cache.lock().get((1, 0), &counters).is_none());
+        assert!(cache.lock().get((2, 0), &counters).is_some());
+        assert_eq!(held.get(b"key").unwrap().value.unwrap(), "value");
+    }
 
     #[test]
     fn legacy_sst_can_be_read_and_compacted_with_new_tables() {

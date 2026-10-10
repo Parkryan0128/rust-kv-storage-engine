@@ -27,10 +27,7 @@ impl ReadBlock {
         while !c.b.is_empty() {
             let offset = bytes.len() - c.b.len();
             let r = decode_record_ref(&mut c)?;
-            if previous.is_some_and(|p| p >= r.key)
-                || r.seq > max_seq
-                || next.is_some_and(|key| r.key >= key)
-            {
+            if previous.is_some_and(|p| p >= r.key) || r.seq > max_seq {
                 return Err(corrupt("SST record order/sequence"));
             }
             if previous.is_none() && r.key != first {
@@ -46,8 +43,15 @@ impl ReadBlock {
             offsets.push(offset as u32);
             previous = Some(r.key);
         }
-        if offsets.is_empty() {
-            return Err(corrupt("SST first key mismatch"));
+        let last = previous.ok_or_else(|| corrupt("SST first key mismatch"))?;
+        // Strict ordering above makes the last key an upper bound for every
+        // record. Check the next block boundary once, not once per record.
+        if next.is_some_and(|key| last >= key) {
+            return Err(corrupt("SST record order/sequence"));
+        }
+        // A recycled dense block must not carry a large index into a sparse one.
+        if offsets.capacity() > offsets.len().max(4).saturating_mul(2) {
+            offsets.shrink_to_fit();
         }
         Ok(Self { bytes, offsets })
     }
@@ -58,6 +62,16 @@ impl ReadBlock {
 
     pub fn frame_capacity(&self) -> usize {
         self.bytes.capacity()
+    }
+
+    pub fn trim_to_budget(&mut self, budget: usize) {
+        let minimum = self.bytes.len()
+            + self.offsets.len() * std::mem::size_of::<u32>()
+            + std::mem::size_of::<Self>();
+        if minimum <= budget && self.allocated_bytes() > budget {
+            self.bytes.shrink_to_fit();
+            self.offsets.shrink_to_fit();
+        }
     }
 
     #[cfg(test)]
@@ -194,5 +208,23 @@ mod tests {
                 assert!(ReadBlock::decode(framed(&payload[..cut]), b"a", None, 2).is_err());
             }
         }
+    }
+
+    #[test]
+    fn sparse_reused_blocks_release_large_offset_buffers() {
+        let bytes = frame(&[(b"a", 1, Some(b"value"))]);
+        let offsets = Vec::with_capacity(4096);
+        let block = ReadBlock::decode_reusing(bytes, offsets, b"a", None, 1).unwrap();
+        assert!(block.offsets.capacity() <= 8);
+        assert_eq!(block.get(b"a").unwrap().value.unwrap(), "value");
+    }
+
+    #[test]
+    fn checking_only_the_last_upper_bound_still_rejects_cross_block_keys() {
+        let bytes = frame(&[(b"a", 1, None), (b"m", 2, None), (b"z", 3, None)]);
+        for next in [b"b", b"m", b"z"] {
+            assert!(ReadBlock::decode(bytes.clone(), b"a", Some(next), 3).is_err());
+        }
+        assert!(ReadBlock::decode(bytes, b"a", Some(b"zz"), 3).is_ok());
     }
 }

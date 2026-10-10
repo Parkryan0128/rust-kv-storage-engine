@@ -7,8 +7,11 @@ pub(crate) struct Record {
     pub value: Option<Bytes>,
 }
 impl Record {
-    pub fn size(&self, key: &[u8]) -> usize {
+    pub fn memory_size(&self, key: &[u8]) -> usize {
         48 + key.len() + self.value.as_ref().map_or(0, Bytes::len)
+    }
+    pub fn encoded_len(&self, key: &[u8]) -> usize {
+        17 + key.len() + self.value.as_ref().map_or(0, Bytes::len)
     }
 }
 #[derive(Default)]
@@ -18,10 +21,10 @@ pub(crate) struct MemTable {
 }
 impl MemTable {
     pub fn insert(&mut self, key: Vec<u8>, record: Record) {
-        self.bytes += record.size(&key);
+        self.bytes += record.memory_size(&key);
         match self.data.entry(key) {
             Entry::Occupied(mut entry) => {
-                self.bytes -= entry.get().size(entry.key());
+                self.bytes -= entry.get().memory_size(entry.key());
                 entry.insert(record);
             }
             Entry::Vacant(entry) => {
@@ -31,7 +34,7 @@ impl MemTable {
     }
     pub fn remove(&mut self, key: &[u8]) {
         if let Some(old) = self.data.remove(key) {
-            self.bytes -= old.size(key);
+            self.bytes -= old.memory_size(key);
         }
     }
     pub fn get(&self, key: &[u8]) -> Option<Record> {

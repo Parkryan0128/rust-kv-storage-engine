@@ -357,6 +357,80 @@ fn concurrent_manual_flush_and_compact_do_not_deadlock_or_lose_data() {
         assert_eq!(e.get(&i.to_be_bytes()).unwrap().unwrap(), "ok");
     }
 }
+
+#[test]
+fn flush_completes_while_a_producer_keeps_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open_with_options(dir.path(), options()).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let writer_db = db.clone();
+    let writer_stop = stop.clone();
+    let writer = thread::spawn(move || {
+        let mut generation = 0u64;
+        while !writer_stop.load(Ordering::Acquire) {
+            writer_db
+                .put(&(generation % 16).to_be_bytes(), &[42; 2048])
+                .unwrap();
+            generation += 1;
+            if generation == 16 {
+                ready_tx.send(()).unwrap();
+            }
+        }
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(10));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let flush_db = db.clone();
+    let flush = thread::spawn(move || {
+        done_tx.send(flush_db.flush()).unwrap();
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(10));
+    // Stop and join even on timeout, so a failed assertion leaves no writer.
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    flush.join().unwrap();
+    ready.unwrap();
+    completed
+        .expect("flush waited for the producer to stop")
+        .unwrap();
+    drop(db);
+    let db = Engine::open(dir.path()).unwrap();
+    for key in 0..16u64 {
+        assert_eq!(db.get(&key.to_be_bytes()).unwrap().unwrap().len(), 2048);
+    }
+}
+
+#[test]
+fn deleting_all_keys_reclaims_cached_blocks_and_empty_table_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open_with_options(
+        dir.path(),
+        Options {
+            compaction_file_threshold: 1000,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for key in 0..256u64 {
+        db.put(&key.to_be_bytes(), b"value").unwrap();
+    }
+    db.flush().unwrap();
+    let held = db.get(&0u64.to_be_bytes()).unwrap().unwrap();
+    assert!(db.stats().cache_bytes > 0);
+    for key in 0..256u64 {
+        db.delete(&key.to_be_bytes()).unwrap();
+    }
+    db.compact().unwrap();
+    assert_eq!(db.stats().sst_records, 0);
+    assert_eq!(db.stats().cache_bytes, 0);
+    assert_eq!(db.stats().sst_bytes, 88);
+    assert_eq!(held, "value");
+    drop(db);
+    let db = Engine::open(dir.path()).unwrap();
+    assert_eq!(db.stats().sst_bytes, 88);
+    assert_eq!(db.get(&0u64.to_be_bytes()).unwrap(), None);
+}
+
 #[test]
 fn background_flush_bounds_memory_and_reclaims_wals() {
     let d = tempfile::tempdir().unwrap();

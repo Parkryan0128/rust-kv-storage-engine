@@ -1,6 +1,6 @@
 use crate::{block::ReadBlock, memtable::Record};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -117,11 +117,12 @@ impl Cache {
         self.bytes += size;
     }
     // Recycle a victim only when even the minimum incoming charge needs space.
-    // Arc::try_unwrap protects concurrent readers; an oversized miss does not
-    // evict useful cached blocks. No spare buffer is retained outside the budget.
+    // Arc::try_unwrap protects concurrent readers. Frames that cannot fit do
+    // not evict useful blocks. No spare buffer is retained outside the budget.
     pub fn take_reusable(&mut self, frame_len: usize) -> Option<ReadBlock> {
         let minimum = frame_len
             .saturating_add(std::mem::size_of::<ReadBlock>())
+            .saturating_add(std::mem::size_of::<u32>())
             .saturating_add(ENTRY_OVERHEAD);
         if self.tail == NONE || minimum > self.capacity || self.bytes <= self.capacity - minimum {
             return None;
@@ -132,6 +133,25 @@ impl Cache {
     }
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub fn block_budget(&self) -> usize {
+        self.capacity.saturating_sub(ENTRY_OVERHEAD)
+    }
+    pub fn remove_tables(&mut self, retired: &HashSet<u64>) {
+        let mut index = self.head;
+        while index != NONE {
+            let e = self.slots[index].as_ref().unwrap();
+            let (next, table) = (e.next, e.key.0);
+            if retired.contains(&table) {
+                self.remove(index);
+            }
+            index = next;
+        }
+        if self.entries.is_empty() {
+            self.entries.shrink_to_fit();
+            self.slots = Vec::new();
+            self.free = Vec::new();
+        }
     }
 }
 
@@ -300,5 +320,29 @@ mod tests {
             assert_eq!(index, NONE);
             assert_eq!(cache.tail, previous);
         }
+    }
+
+    #[test]
+    fn retiring_tables_preserves_live_lru_entries_and_outstanding_values() {
+        let mut cache = Cache::new(4096);
+        let counters = Counters::default();
+        let old = block(15);
+        cache.insert((1, 0), old.clone());
+        cache.insert((2, 0), block(15));
+        cache.insert((1, 1), block(15));
+        cache.insert((3, 0), block(15));
+        cache.remove_tables(&HashSet::from([1, 3]));
+        assert!(cache.get((1, 0), &counters).is_none());
+        assert!(cache.get((1, 1), &counters).is_none());
+        assert!(cache.get((3, 0), &counters).is_none());
+        assert!(cache.get((2, 0), &counters).is_some());
+        assert_eq!(cache.head, cache.tail);
+        assert_eq!(old.get(b"k").unwrap().value.unwrap().len(), 15);
+        cache.remove_tables(&HashSet::from([2]));
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!((cache.head, cache.tail), (NONE, NONE));
+        assert!(cache.slots.is_empty());
+        cache.insert((4, 0), block(0));
+        assert!(cache.get((4, 0), &counters).is_some());
     }
 }
