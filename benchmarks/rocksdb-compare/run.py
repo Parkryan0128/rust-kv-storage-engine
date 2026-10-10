@@ -23,8 +23,9 @@ def warm_files(path):
                     pass
 
 
-def logged(command, env, path, timeout):
-    completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout)
+def logged(command, env, path, timeout, cpu=None):
+    completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout,
+                               preexec_fn=None if cpu is None else lambda: os.sched_setaffinity(0, {cpu}))
     path.write_text(completed.stdout + completed.stderr)
     if completed.returncode:
         print(completed.stdout + completed.stderr, flush=True)
@@ -37,6 +38,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     names = ("engine", "baseline", "rocksdb")
     orders = list(permutations(names))
+    cpu = min(os.sched_getaffinity(0))
     sources = {"engine": Path.cwd(), "baseline": Path("baseline-source").resolve()}
     binaries = {name: Path("comparison-bin", name).resolve() for name in names}
     smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
@@ -50,6 +52,7 @@ def main():
         "commit": capture("git", "rev-parse", "HEAD"),
         "baseline_commit": capture("git", "-C", str(sources["baseline"]), "rev-parse", "HEAD"),
         "platform": platform.platform(),
+        "benchmark_cpu": cpu,
         "rust": capture("rustc", "--version"),
         "cpu": capture("lscpu"),
         "host_memory": Path("/proc/meminfo").read_text(),
@@ -79,10 +82,11 @@ def main():
             "Read-only fixed layouts: engine compaction trigger 64; RocksDB read-only open.",
             "Block-size order rotates twice; all six backend-order permutations run once.",
             "RSS excludes fixture creation and OS page cache.",
-            "Current and baseline use their own production V4/V3 SST writers and separate fixtures; RocksDB uses its production SST writer.",
-            "V3/V4 full record validation is cached per block within each fresh engine process; every disk read still checks the full frame CRC.",
+            "Current and baseline use their own production V5/V3 SST writers and separate fixtures; RocksDB uses its production SST writer.",
+            "V3/V5 full record validation is cached per block within each fresh engine process; every disk read still checks the full frame CRC.",
             "Latency samples time Get only; throughput includes RNG, validation and value release.",
             "Single-client OS-cache-warm hit workload, not physical-disk or write performance.",
+            "All measured read processes and diagnostic profiles are pinned to the same allowed CPU core.",
             "READ_PROFILE is a separate forced-miss microbenchmark, not an end-to-end CPU profile.",
             "Profile CRC-only time overlaps decode; routing/cache/locks/allocation are excluded.",
         ],
@@ -142,7 +146,7 @@ def main():
                                  "--manifest-path", manifest, "--target-dir", target,
                                  "sstable::read_profile::profile_random_read_stages", "--",
                                  "--ignored", "--exact", "--nocapture", "--test-threads=1"],
-                                profile_env, output / f"{label}-{name}-profile.log", 180,
+                                profile_env, output / f"{label}-{name}-profile.log", 180, cpu=cpu,
                             )
                             reports = [json.loads(line.split("READ_PROFILE ", 1)[1])
                                        for line in text.splitlines() if "READ_PROFILE " in line]
@@ -171,7 +175,7 @@ def main():
                             text = logged(
                                 [str(binaries[name]), "read", str(directory), str(keys),
                                  str(size), str(tables), str(queries), str(seed)],
-                                env, output / f"{label}.log", 120,
+                                env, output / f"{label}.log", 120, cpu=cpu,
                             )
                             seen = []
                             for line in text.splitlines():

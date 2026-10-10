@@ -1,5 +1,5 @@
 use crate::{
-    block::{indexed_records, ReadBlock},
+    block::{expand_compact_frame, indexed_records, ReadBlock},
     bloom::Bloom,
     cache::{Block, Cache, Counters},
     codec::*,
@@ -22,7 +22,8 @@ use std::{
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
 const PAGED_MAGIC: &[u8; 8] = b"RKVSST02";
 const INDEXED_MAGIC: &[u8; 8] = b"RKVSST03";
-const MAGIC: &[u8; 8] = b"RKVSST04";
+const COMPACT_MAGIC: &[u8; 8] = b"RKVSST04";
+const MAGIC: &[u8; 8] = b"RKVSST05";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
@@ -81,15 +82,8 @@ impl Table {
             if previous.as_ref().is_some_and(|p| p >= &key) {
                 return Err(corrupt("unsorted SST input"));
             }
-            // The new record starts at block.len(); retain u32 offsets when
-            // a large block needs them. Single oversized records start at zero.
-            let width = if block.len() <= u16::MAX as usize {
-                2
-            } else {
-                4
-            };
             if !block.is_empty()
-                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * width + 4 > block_size
+                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * 4 + 4 > block_size
             {
                 write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
             }
@@ -115,7 +109,7 @@ impl Table {
                 fault::hit("bloom_rebuild_read")?;
                 f.read_exact_at(&mut block, i.offset)?;
                 let mut c = Cursor {
-                    b: indexed_records(frame_payload(&block)?, true)?,
+                    b: indexed_records(frame_payload(&block)?)?,
                 };
                 while !c.b.is_empty() {
                     bloom.insert(decode_record_ref(&mut c)?.key);
@@ -123,7 +117,7 @@ impl Table {
             }
         }
         let meta_offset = f.stream_position()?;
-        let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index)?;
+        let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index, false)?;
         let mut footer = vec![];
         footer.extend(MAGIC);
         put_u64(&mut footer, meta_offset);
@@ -152,7 +146,11 @@ impl Table {
         let legacy = magic == LEGACY_MAGIC;
         let footer_size = if legacy {
             LEGACY_FOOTER
-        } else if magic == MAGIC || magic == INDEXED_MAGIC || magic == PAGED_MAGIC {
+        } else if magic == MAGIC
+            || magic == INDEXED_MAGIC
+            || magic == COMPACT_MAGIC
+            || magic == PAGED_MAGIC
+        {
             FOOTER
         } else {
             return Err(corrupt("SST version"));
@@ -189,7 +187,8 @@ impl Table {
         let max_seq = c.u64()?;
         let bloom = Bloom::decode(&mut c)?;
         let n = if legacy { c.u32()? as u64 } else { c.u64()? };
-        if n > count || n > size / 16 {
+        let explicit_offsets = magic != MAGIC;
+        if n > count || n > size / if explicit_offsets { 16 } else { 8 } {
             return Err(corrupt("SST index length"));
         }
         // Grow only as verified entries are decoded, not from an untrusted count.
@@ -200,7 +199,7 @@ impl Table {
                 return Err(corrupt("SST metadata frame length"));
             }
             for _ in 0..n {
-                read_index(&mut c, &mut index, &mut end, offset)?;
+                read_index(&mut c, &mut index, &mut end, offset, true)?;
             }
             c.done()?;
         } else {
@@ -214,7 +213,7 @@ impl Table {
                     if index.len() as u64 >= n {
                         return Err(corrupt("extra SST index entries"));
                     }
-                    read_index(&mut c, &mut index, &mut end, offset)?;
+                    read_index(&mut c, &mut index, &mut end, offset, explicit_offsets)?;
                 }
             }
         }
@@ -234,8 +233,8 @@ impl Table {
             file_bytes: len,
             max_seq,
             cacheable: AtomicBool::new(true),
-            indexed: magic == MAGIC || magic == INDEXED_MAGIC,
-            compact_offsets: magic == MAGIC,
+            indexed: magic == MAGIC || magic == INDEXED_MAGIC || magic == COMPACT_MAGIC,
+            compact_offsets: magic == COMPACT_MAGIC,
         })
     }
     pub fn block(&self, n: usize) -> Result<Block> {
@@ -254,13 +253,19 @@ impl Table {
         let i = &self.index[n];
         let next = self.index.get(n + 1).map(|next| next.first.as_slice());
         if self.indexed {
+            // Compatibility for the short-lived compact-directory format.
+            // Current V5 blocks retain the original V3 byte layout and decoder.
+            let bytes = if self.compact_offsets {
+                expand_compact_frame(bytes)?
+            } else {
+                bytes
+            };
             let (block, fingerprint) = ReadBlock::decode_indexed(
                 bytes,
                 &i.first,
                 next,
                 self.max_seq,
                 i.validated.load(Ordering::Relaxed),
-                self.compact_offsets,
             )?;
             i.validated.store(fingerprint, Ordering::Relaxed);
             Ok(block)
@@ -291,7 +296,10 @@ impl Table {
         let (cached, reusable, budget) = {
             let mut cache = cache.lock();
             let cached = cache.get((self.id, n), counters);
-            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Relaxed) {
+            let reusable = if cached.is_none()
+                && self.cacheable.load(Ordering::Relaxed)
+                && !self.compact_offsets
+            {
                 cache.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
@@ -346,6 +354,7 @@ fn write_metadata(
     max_seq: u64,
     bloom: &Bloom,
     index: &[Index],
+    explicit_offsets: bool,
 ) -> Result<u64> {
     let mut page = vec![];
     put_u64(&mut page, count);
@@ -356,13 +365,16 @@ fn write_metadata(
     page.clear();
     for i in index {
         // A single large key can exceed the target, but fits within MAX_FRAME.
-        if !page.is_empty() && page.len() + 16 + i.first.len() > INDEX_PAGE_TARGET {
+        let entry_bytes = if explicit_offsets { 16 } else { 8 };
+        if !page.is_empty() && page.len() + entry_bytes + i.first.len() > INDEX_PAGE_TARGET {
             bytes += write_frame(f, &page)?;
             page.clear();
         }
         put_u32(&mut page, i.first.len() as u32);
         page.extend(&i.first);
-        put_u64(&mut page, i.offset);
+        if explicit_offsets {
+            put_u64(&mut page, i.offset);
+        }
         put_u32(&mut page, i.len);
     }
     if !page.is_empty() {
@@ -375,10 +387,13 @@ fn read_index(
     index: &mut Vec<Index>,
     end: &mut u64,
     metadata_offset: u64,
+    explicit_offsets: bool,
 ) -> Result<()> {
     let kl = c.u32()? as usize;
     let first = c.take(kl)?.to_vec();
-    let off = c.u64()?;
+    // Blocks are contiguous: their offsets are already determined by the
+    // preceding framed lengths. V5 omits this redundant on-disk u64.
+    let off = if explicit_offsets { c.u64()? } else { *end };
     let bl = c.u32()?;
     if off != *end
         || bl as usize > MAX_FRAME + HEADER
@@ -418,18 +433,10 @@ fn write_indexed_block(
     first: &[u8],
     index: &mut Vec<Index>,
 ) -> Result<()> {
-    let narrow = offsets
-        .last()
-        .is_none_or(|&offset| offset <= u16::MAX as u32);
     for &offset in offsets.iter() {
-        if narrow {
-            b.extend((offset as u16).to_le_bytes());
-        } else {
-            put_u32(b, offset);
-        }
+        put_u32(b, offset);
     }
-    let wide_flag = if narrow { 0 } else { 1 << 31 };
-    put_u32(b, offsets.len() as u32 | wide_flag);
+    put_u32(b, offsets.len() as u32);
     write_block(f, b, first, index)?;
     offsets.clear();
     Ok(())
@@ -499,8 +506,8 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index[0].len, 956);
-        assert_eq!(table.index[1].len, 1006);
+        assert_eq!(table.index[0].len, 958);
+        assert_eq!(table.index[1].len, 1008);
         let cache = Mutex::new(Cache::new(1200));
         let counters = Counters::default();
         assert_eq!(table.get(b"a", &cache, &counters).unwrap().unwrap().seq, 1);
@@ -532,10 +539,10 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index.len(), 2);
-        for n in 0..2 {
-            assert_eq!(table.index[n].len as usize, 3 * 18 + 3 * 2 + 4 + HEADER);
-            assert_eq!(table.block(n).unwrap().len(), 3);
+        assert_eq!(table.index.len(), 3);
+        for n in 0..3 {
+            assert_eq!(table.index[n].len as usize, 2 * 18 + 2 * 4 + 4 + HEADER);
+            assert_eq!(table.block(n).unwrap().len(), 2);
         }
         let large = Table::write(
             &dir.path().join("large.sst"),
@@ -702,8 +709,8 @@ mod tests {
     }
 
     #[test]
-    fn version_two_and_three_tables_remain_readable_with_version_four() {
-        for magic in [PAGED_MAGIC, INDEXED_MAGIC] {
+    fn versions_two_through_four_remain_readable_with_version_five() {
+        for magic in [PAGED_MAGIC, INDEXED_MAGIC, COMPACT_MAGIC] {
             let dir = tempfile::tempdir().unwrap();
             drop(Engine::open(dir.path()).unwrap());
             let path = dir.path().join("sst/00000000000000000002.sst");
@@ -722,12 +729,15 @@ mod tests {
             if magic == INDEXED_MAGIC {
                 put_u32(&mut bytes, 0);
                 put_u32(&mut bytes, 1);
+            } else if magic == COMPACT_MAGIC {
+                bytes.extend(0u16.to_le_bytes());
+                put_u32(&mut bytes, 1);
             }
             write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
             let mut bloom = Bloom::new(1, 10);
             bloom.insert(b"old");
             let offset = file.stream_position().unwrap();
-            let size = write_metadata(&mut file, 1, 1, &bloom, &index).unwrap();
+            let size = write_metadata(&mut file, 1, 1, &bloom, &index, true).unwrap();
             let mut footer = magic.to_vec();
             put_u64(&mut footer, offset);
             put_u64(&mut footer, size);
@@ -744,82 +754,83 @@ mod tests {
             .save(dir.path())
             .unwrap();
             let db = Engine::open(dir.path()).unwrap();
-            db.put(b"new", b"v4").unwrap();
+            db.put(b"new", b"v5").unwrap();
             db.flush().unwrap();
             assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
-            assert_eq!(db.get(b"new").unwrap().unwrap(), "v4");
+            assert_eq!(db.get(b"new").unwrap().unwrap(), "v5");
             db.compact().unwrap();
             drop(db);
             let db = Engine::open(dir.path()).unwrap();
             assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
-            assert_eq!(db.get(b"new").unwrap().unwrap(), "v4");
+            assert_eq!(db.get(b"new").unwrap().unwrap(), "v5");
         }
     }
 
     #[test]
-    fn writer_preserves_u16_boundary_wide_blocks_and_oversized_records() {
+    fn version_five_changes_only_metadata_not_data_frames_or_block_boundaries() {
         let dir = tempfile::tempdir().unwrap();
-        for (second_offset, width) in [(65535usize, 2), (65536, 4), (100_000, 4)] {
-            let path = dir.path().join(format!("boundary-{second_offset}.sst"));
-            let records = vec![
-                (
-                    b"a".to_vec(),
+        let path = dir.path().join("v5.sst");
+        let table = Table::write(
+            &path,
+            1,
+            (0u64..200).map(|key| {
+                Ok((
+                    key.to_be_bytes().to_vec(),
                     Record {
-                        seq: 1,
-                        value: Some(Bytes::from(vec![42; second_offset - 18])),
+                        seq: key + 1,
+                        value: Some(Bytes::from(vec![42; 32])),
                     },
-                ),
-                (
-                    b"b".to_vec(),
-                    Record {
-                        seq: 2,
-                        value: None,
-                    },
-                ),
-            ];
-            // Overestimation also exercises the compact/wide Bloom rebuild parser.
-            let table = Table::write(
-                &path,
-                1,
-                records.clone().into_iter().map(Ok),
-                1000,
-                200_000,
-                10,
-            )
-            .unwrap();
-            assert_eq!(table.index.len(), 1);
-            assert_eq!(
-                table.index[0].len as usize,
-                HEADER + second_offset + 18 + 2 * width + 4
-            );
-            drop(table);
-            let table = Table::open(&path, 1).unwrap();
-            assert!(table.compact_offsets);
-            assert_eq!(table.block(0).unwrap(), records);
-            let cache = Mutex::new(Cache::new(0));
-            for (key, record) in &records {
-                assert_eq!(
-                    table
-                        .get(key, &cache, &Counters::default())
-                        .unwrap()
-                        .as_ref(),
-                    Some(record)
-                );
-            }
-            let split = Table::write(
-                &dir.path().join(format!("split-{second_offset}.sst")),
-                2,
-                records.clone().into_iter().map(Ok),
-                2,
-                second_offset + 6,
-                10,
-            )
-            .unwrap();
-            assert_eq!(split.index.len(), 2);
-            assert_eq!(split.index[0].len as usize, HEADER + second_offset + 6);
-            let all: Vec<_> = Arc::new(split).iter().collect::<Result<_>>().unwrap();
-            assert_eq!(all, records);
+                ))
+            }),
+            200,
+            128,
+            10,
+        )
+        .unwrap();
+        let raw = fs::read(&path).unwrap();
+        let end = table.index.last().map(|i| i.offset + i.len as u64).unwrap();
+        let old_path = dir.path().join("v3.sst");
+        let mut file = File::create(&old_path).unwrap();
+        file.write_all(INDEXED_MAGIC).unwrap();
+        file.write_all(&raw[8..end as usize]).unwrap();
+        let size = write_metadata(
+            &mut file,
+            table.count,
+            table.max_seq,
+            &table.bloom,
+            &table.index,
+            true,
+        )
+        .unwrap();
+        let mut footer = INDEXED_MAGIC.to_vec();
+        put_u64(&mut footer, end);
+        put_u64(&mut footer, size);
+        let checksum = crc32fast::hash(&footer);
+        put_u32(&mut footer, checksum);
+        file.write_all(&footer).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let old = Table::open(&old_path, 2).unwrap();
+        assert_eq!(
+            old.file_bytes - table.file_bytes,
+            table.index.len() as u64 * 8
+        );
+        assert_eq!(table.index.len(), old.index.len());
+        for (a, b) in table.index.iter().zip(&old.index) {
+            assert_eq!((a.offset, a.len, &a.first), (b.offset, b.len, &b.first));
         }
+        let cache = Mutex::new(Cache::new(0));
+        let counters = Counters::default();
+        for key in 0u64..200 {
+            assert_eq!(
+                table.get(&key.to_be_bytes(), &cache, &counters).unwrap(),
+                old.get(&key.to_be_bytes(), &cache, &counters).unwrap()
+            );
+        }
+        assert_eq!(
+            &raw[8..end as usize],
+            &fs::read(old_path).unwrap()[8..end as usize]
+        );
     }
 
     #[test]
