@@ -6,7 +6,9 @@ pub(crate) struct ReadBlock {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
     // Zero for legacy blocks; otherwise the persisted offset directory starts here.
-    index_start: usize,
+    index_start: u32,
+    // Zero for reconstructed legacy offsets, two or four for persisted offsets.
+    offset_width: u32,
 }
 
 impl ReadBlock {
@@ -59,6 +61,7 @@ impl ReadBlock {
             bytes,
             offsets,
             index_start: 0,
+            offset_width: 0,
         })
     }
 
@@ -68,18 +71,23 @@ impl ReadBlock {
         next: Option<&[u8]>,
         max_seq: u64,
         validated: u64,
+        compact: bool,
     ) -> Result<(Self, u64)> {
         let payload = frame_payload(&bytes)?;
-        let records = indexed_records(payload)?;
-        let index_start = HEADER + records.len();
+        let (records, width) = indexed_layout(payload, compact)?;
+        let index_start = (HEADER + records.len()) as u32;
         // The extra bit distinguishes an unvalidated block from a valid zero CRC.
         let fingerprint =
             (1u64 << 32) | u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64;
         if fingerprint != validated {
             let mut cursor = Cursor { b: records };
             let mut previous: Option<&[u8]> = None;
-            for offset in payload[records.len()..payload.len() - 4].chunks_exact(4) {
-                let offset = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+            for offset in payload[records.len()..payload.len() - 4].chunks_exact(width) {
+                let offset = if width == 2 {
+                    u16::from_le_bytes(offset.try_into().unwrap()) as usize
+                } else {
+                    u32::from_le_bytes(offset.try_into().unwrap()) as usize
+                };
                 if offset != records.len() - cursor.b.len() {
                     return Err(corrupt("SST record offset"));
                 }
@@ -103,6 +111,7 @@ impl ReadBlock {
                 bytes,
                 offsets: Vec::new(),
                 index_start,
+                offset_width: width as u32,
             },
             fingerprint,
         ))
@@ -144,18 +153,11 @@ impl ReadBlock {
     }
 
     pub fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
-        if self.index_start != 0 {
-            let (mut left, mut right) = (0, self.record_count());
-            while left < right {
-                let middle = left + (right - left) / 2;
-                let record = self.record_at(middle)?;
-                match record.key.cmp(key) {
-                    std::cmp::Ordering::Less => left = middle + 1,
-                    std::cmp::Ordering::Greater => right = middle,
-                    std::cmp::Ordering::Equal => return Ok(Some(record.to_owned())),
-                }
-            }
-            return Ok(None);
+        // Specialize once per lookup, avoiding width dispatch at each probe.
+        match self.offset_width {
+            2 => return self.lookup_indexed::<2>(key),
+            4 => return self.lookup_indexed::<4>(key),
+            _ => {}
         }
         let index = self
             .offsets
@@ -172,11 +174,28 @@ impl ReadBlock {
         ))
     }
 
+    fn lookup_indexed<const WIDTH: usize>(&self, key: &[u8]) -> Result<Option<Record>> {
+        let (mut left, mut right) = (
+            0,
+            (self.bytes.len() - self.index_start as usize - 4) / WIDTH,
+        );
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let record = self.record_indexed::<WIDTH>(middle)?;
+            match record.key.cmp(key) {
+                std::cmp::Ordering::Less => left = middle + 1,
+                std::cmp::Ordering::Greater => right = middle,
+                std::cmp::Ordering::Equal => return Ok(Some(record.to_owned())),
+            }
+        }
+        Ok(None)
+    }
+
     pub fn record_count(&self) -> usize {
-        if self.index_start == 0 {
-            self.offsets.len()
-        } else {
-            (self.bytes.len() - self.index_start - 4) / 4
+        match self.offset_width {
+            2 => (self.bytes.len() - self.index_start as usize - 4) / 2,
+            4 => (self.bytes.len() - self.index_start as usize - 4) / 4,
+            _ => self.offsets.len(),
         }
     }
 
@@ -184,17 +203,25 @@ impl ReadBlock {
         if index >= self.record_count() {
             return Err(corrupt("SST record index"));
         }
-        let offset = if self.index_start == 0 {
-            self.offsets[index] as usize
-        } else {
-            let start = self.index_start + index * 4;
-            HEADER + u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
-        };
-        let end = if self.index_start == 0 {
-            self.bytes.len()
-        } else {
-            self.index_start
-        };
+        match self.offset_width {
+            2 => self.record_indexed::<2>(index),
+            4 => self.record_indexed::<4>(index),
+            _ => decode_record_ref(&mut Cursor {
+                b: &self.bytes[self.offsets[index] as usize..],
+            }),
+        }
+    }
+
+    #[inline]
+    fn record_indexed<const WIDTH: usize>(&self, index: usize) -> Result<RecordRef<'_>> {
+        let end = self.index_start as usize;
+        let start = end + index * WIDTH;
+        let offset = HEADER
+            + if WIDTH == 2 {
+                u16::from_le_bytes(self.bytes[start..start + 2].try_into().unwrap()) as usize
+            } else {
+                u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
+            };
         let mut cursor = Cursor {
             b: self
                 .bytes
@@ -211,16 +238,30 @@ impl ReadBlock {
     }
 }
 
-pub(crate) fn indexed_records(payload: &[u8]) -> Result<&[u8]> {
+pub(crate) fn indexed_records(payload: &[u8], compact: bool) -> Result<&[u8]> {
+    Ok(indexed_layout(payload, compact)?.0)
+}
+
+fn indexed_layout(payload: &[u8], compact: bool) -> Result<(&[u8], usize)> {
     let footer = payload
         .get(payload.len().saturating_sub(4)..)
         .filter(|footer| footer.len() == 4)
         .ok_or_else(|| corrupt("SST offset footer"))?;
-    let count = u32::from_le_bytes(footer.try_into().unwrap()) as usize;
-    if count == 0 || count > (payload.len() - 4) / 21 {
+    let trailer = u32::from_le_bytes(footer.try_into().unwrap());
+    let width = if compact && trailer & (1 << 31) == 0 {
+        2
+    } else {
+        4
+    };
+    let count = if compact {
+        trailer & !(1 << 31)
+    } else {
+        trailer
+    } as usize;
+    if count == 0 || count > (payload.len() - 4) / (17 + width) {
         return Err(corrupt("SST offset count"));
     }
-    Ok(&payload[..payload.len() - 4 - count * 4])
+    Ok((&payload[..payload.len() - 4 - count * width], width))
 }
 
 #[cfg(test)]
@@ -229,6 +270,10 @@ mod tests {
     use bytes::Bytes;
 
     fn indexed_frame(records: &[TestRecord<'_>]) -> Vec<u8> {
+        indexed_frame_with_width(records, false)
+    }
+
+    fn indexed_frame_with_width(records: &[TestRecord<'_>], compact: bool) -> Vec<u8> {
         let mut payload = Vec::new();
         let mut offsets = Vec::new();
         for &(key, seq, value) in records {
@@ -242,11 +287,111 @@ mod tests {
                 &mut payload,
             );
         }
+        let narrow = compact
+            && offsets
+                .last()
+                .is_none_or(|&offset| offset <= u16::MAX as u32);
         for &offset in &offsets {
-            put_u32(&mut payload, offset);
+            if narrow {
+                payload.extend((offset as u16).to_le_bytes());
+            } else {
+                put_u32(&mut payload, offset);
+            }
         }
-        put_u32(&mut payload, offsets.len() as u32);
+        let wide_flag = if compact && !narrow { 1 << 31 } else { 0 };
+        put_u32(&mut payload, offsets.len() as u32 | wide_flag);
         framed(&payload)
+    }
+
+    #[test]
+    fn compact_offsets_preserve_lookup_validation_and_resident_metadata_size() {
+        // Packing the start and width into two u32s keeps ReadBlock's old size.
+        assert_eq!(
+            std::mem::size_of::<ReadBlock>(),
+            2 * std::mem::size_of::<Vec<u8>>() + 8
+        );
+        let records: &[TestRecord<'_>] = &[
+            (b"", 1, Some(b"")),
+            (b"\0", 2, None),
+            (b"z", 3, Some(b"last")),
+        ];
+        let bytes = indexed_frame_with_width(records, true);
+        assert_eq!(
+            indexed_frame(records).len() - bytes.len(),
+            records.len() * 2
+        );
+        let (block, fingerprint) =
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, 0, true).unwrap();
+        assert_eq!(block.offset_width, 2);
+        assert!(block.record_at(3).is_err());
+        let (again, cached) =
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, fingerprint, true).unwrap();
+        assert_eq!(cached, fingerprint);
+        for &(key, seq, value) in records {
+            let actual = again.lookup(key).unwrap().unwrap();
+            assert_eq!(actual.seq, seq);
+            assert_eq!(actual.value.as_deref(), value);
+        }
+        assert!(again.lookup(b"a").unwrap().is_none());
+        for cut in 0..bytes.len() {
+            assert!(
+                ReadBlock::decode_indexed(bytes[..cut].to_vec(), b"", None, 3, 0, true).is_err()
+            );
+        }
+        for at in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            assert!(ReadBlock::decode_indexed(changed, b"", None, 3, fingerprint, true).is_err());
+        }
+        let payload = frame_payload(&bytes).unwrap();
+        let directory = indexed_records(payload, true).unwrap().len();
+        for case in 0..7 {
+            let mut changed = payload.to_vec();
+            let tail = changed.len() - 4;
+            match case {
+                0 => changed[directory..directory + 2].copy_from_slice(&1u16.to_le_bytes()),
+                1 => changed[directory + 2..directory + 4].copy_from_slice(&u16::MAX.to_le_bytes()),
+                2 => changed[tail..].copy_from_slice(&0u32.to_le_bytes()),
+                3 => changed[tail..].copy_from_slice(&u32::MAX.to_le_bytes()),
+                4 => changed[tail + 3] |= 0x80, // wrong directory width with a valid CRC
+                5 => changed[17..25].fill(0),   // second sequence
+                _ => changed[52] = 0,           // last key now duplicates the second
+            }
+            assert!(
+                ReadBlock::decode_indexed(framed(&changed), b"", None, 3, fingerprint, true)
+                    .is_err(),
+                "case {case}"
+            );
+        }
+        assert!(ReadBlock::decode_indexed(bytes, b"", Some(b"z"), 3, 0, true).is_err());
+    }
+
+    #[test]
+    fn compact_offsets_switch_at_the_last_record_start_not_frame_length() {
+        for (second_offset, width) in [(65535usize, 2), (65536, 4)] {
+            let large = vec![42; second_offset - 18];
+            let records: &[TestRecord<'_>] = &[(b"a", 1, Some(&large)), (b"b", 2, Some(b"last"))];
+            let bytes = indexed_frame_with_width(records, true);
+            let (block, fingerprint) =
+                ReadBlock::decode_indexed(bytes.clone(), b"a", None, 2, 0, true).unwrap();
+            assert_eq!(block.offset_width, width);
+            assert_eq!(block.record_at(1).unwrap().key, b"b");
+            assert_eq!(
+                block.lookup(b"a").unwrap().unwrap().value.unwrap().as_ref(),
+                large
+            );
+            let (again, _) =
+                ReadBlock::decode_indexed(bytes, b"a", None, 2, fingerprint, true).unwrap();
+            assert_eq!(again.lookup(b"b").unwrap().unwrap().value.unwrap(), "last");
+        }
+        let large = vec![42; 100_000];
+        let bytes = indexed_frame_with_width(&[(b"a", 1, Some(&large))], true);
+        let (block, _) = ReadBlock::decode_indexed(bytes, b"a", None, 1, 0, true).unwrap();
+        assert_eq!(block.offset_width, 2);
+        assert_eq!(
+            block.lookup(b"a").unwrap().unwrap().value.unwrap().as_ref(),
+            large
+        );
     }
 
     #[test]
@@ -257,24 +402,26 @@ mod tests {
             (b"z", 3, Some(b"last")),
         ]);
         let (block, fingerprint) =
-            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, 0).unwrap();
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, 0, false).unwrap();
         assert_eq!(block.record_count(), 3);
         assert_eq!(block.lookup(b"z").unwrap().unwrap().value.unwrap(), "last");
         assert_eq!(block.lookup(b"b").unwrap().unwrap().value, None);
         assert_eq!(block.lookup(b"a").unwrap(), None);
         assert!(block.offsets.is_empty());
         let (again, cached) =
-            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, fingerprint).unwrap();
+            ReadBlock::decode_indexed(bytes.clone(), b"", None, 3, fingerprint, false).unwrap();
         assert_eq!(cached, fingerprint);
         assert_eq!(again.lookup(b"").unwrap().unwrap().value.unwrap().len(), 0);
         // A fresh, valid CRC is not enough to bypass structural checks after a change.
         let mut payload = frame_payload(&bytes).unwrap().to_vec();
         payload[17..25].fill(0); // second record's sequence
-        assert!(ReadBlock::decode_indexed(framed(&payload), b"", None, 3, fingerprint).is_err());
+        assert!(
+            ReadBlock::decode_indexed(framed(&payload), b"", None, 3, fingerprint, false).is_err()
+        );
         for at in 0..bytes.len() {
             let mut changed = bytes.clone();
             changed[at] ^= 1;
-            assert!(ReadBlock::decode_indexed(changed, b"", None, 3, fingerprint).is_err());
+            assert!(ReadBlock::decode_indexed(changed, b"", None, 3, fingerprint, false).is_err());
         }
     }
 
@@ -292,9 +439,9 @@ mod tests {
                 4 => changed[35] = b'a',
                 _ => changed[18..26].copy_from_slice(&3u64.to_le_bytes()),
             }
-            assert!(ReadBlock::decode_indexed(framed(&changed), b"a", None, 2, 0).is_err());
+            assert!(ReadBlock::decode_indexed(framed(&changed), b"a", None, 2, 0, false).is_err());
         }
-        assert!(ReadBlock::decode_indexed(original, b"a", Some(b"b"), 2, 0).is_err());
+        assert!(ReadBlock::decode_indexed(original, b"a", Some(b"b"), 2, 0, false).is_err());
     }
 
     type TestRecord<'a> = (&'a [u8], u64, Option<&'a [u8]>);

@@ -21,7 +21,8 @@ use std::{
 };
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
 const PAGED_MAGIC: &[u8; 8] = b"RKVSST02";
-const MAGIC: &[u8; 8] = b"RKVSST03";
+const INDEXED_MAGIC: &[u8; 8] = b"RKVSST03";
+const MAGIC: &[u8; 8] = b"RKVSST04";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
@@ -44,6 +45,7 @@ pub(crate) struct Table {
     pub max_seq: u64,
     cacheable: AtomicBool,
     indexed: bool,
+    compact_offsets: bool,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; len];
@@ -79,8 +81,15 @@ impl Table {
             if previous.as_ref().is_some_and(|p| p >= &key) {
                 return Err(corrupt("unsorted SST input"));
             }
+            // The new record starts at block.len(); retain u32 offsets when
+            // a large block needs them. Single oversized records start at zero.
+            let width = if block.len() <= u16::MAX as usize {
+                2
+            } else {
+                4
+            };
             if !block.is_empty()
-                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * 4 + 4 > block_size
+                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * width + 4 > block_size
             {
                 write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
             }
@@ -106,7 +115,7 @@ impl Table {
                 fault::hit("bloom_rebuild_read")?;
                 f.read_exact_at(&mut block, i.offset)?;
                 let mut c = Cursor {
-                    b: indexed_records(frame_payload(&block)?)?,
+                    b: indexed_records(frame_payload(&block)?, true)?,
                 };
                 while !c.b.is_empty() {
                     bloom.insert(decode_record_ref(&mut c)?.key);
@@ -143,7 +152,7 @@ impl Table {
         let legacy = magic == LEGACY_MAGIC;
         let footer_size = if legacy {
             LEGACY_FOOTER
-        } else if magic == MAGIC || magic == PAGED_MAGIC {
+        } else if magic == MAGIC || magic == INDEXED_MAGIC || magic == PAGED_MAGIC {
             FOOTER
         } else {
             return Err(corrupt("SST version"));
@@ -225,7 +234,8 @@ impl Table {
             file_bytes: len,
             max_seq,
             cacheable: AtomicBool::new(true),
-            indexed: magic == MAGIC,
+            indexed: magic == MAGIC || magic == INDEXED_MAGIC,
+            compact_offsets: magic == MAGIC,
         })
     }
     pub fn block(&self, n: usize) -> Result<Block> {
@@ -250,6 +260,7 @@ impl Table {
                 next,
                 self.max_seq,
                 i.validated.load(Ordering::Relaxed),
+                self.compact_offsets,
             )?;
             i.validated.store(fingerprint, Ordering::Relaxed);
             Ok(block)
@@ -407,10 +418,18 @@ fn write_indexed_block(
     first: &[u8],
     index: &mut Vec<Index>,
 ) -> Result<()> {
+    let narrow = offsets
+        .last()
+        .is_none_or(|&offset| offset <= u16::MAX as u32);
     for &offset in offsets.iter() {
-        put_u32(b, offset);
+        if narrow {
+            b.extend((offset as u16).to_le_bytes());
+        } else {
+            put_u32(b, offset);
+        }
     }
-    put_u32(b, offsets.len() as u32);
+    let wide_flag = if narrow { 0 } else { 1 << 31 };
+    put_u32(b, offsets.len() as u32 | wide_flag);
     write_block(f, b, first, index)?;
     offsets.clear();
     Ok(())
@@ -480,8 +499,8 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index[0].len, 958);
-        assert_eq!(table.index[1].len, 1008);
+        assert_eq!(table.index[0].len, 956);
+        assert_eq!(table.index[1].len, 1006);
         let cache = Mutex::new(Cache::new(1200));
         let counters = Counters::default();
         assert_eq!(table.get(b"a", &cache, &counters).unwrap().unwrap().seq, 1);
@@ -513,10 +532,10 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(table.index.len(), 3);
-        for n in 0..3 {
-            assert_eq!(table.index[n].len as usize, 2 * 18 + 2 * 4 + 4 + HEADER);
-            assert_eq!(table.block(n).unwrap().len(), 2);
+        assert_eq!(table.index.len(), 2);
+        for n in 0..2 {
+            assert_eq!(table.index[n].len as usize, 3 * 18 + 3 * 2 + 4 + HEADER);
+            assert_eq!(table.block(n).unwrap().len(), 3);
         }
         let large = Table::write(
             &dir.path().join("large.sst"),
@@ -683,52 +702,124 @@ mod tests {
     }
 
     #[test]
-    fn version_two_and_three_tables_remain_readable_together() {
-        let dir = tempfile::tempdir().unwrap();
-        drop(Engine::open(dir.path()).unwrap());
-        let path = dir.path().join("sst/00000000000000000002.sst");
-        let mut file = File::create(path).unwrap();
-        file.write_all(PAGED_MAGIC).unwrap();
-        let mut bytes = Vec::new();
-        encode_record(
-            b"old",
-            &Record {
-                seq: 1,
-                value: Some(Bytes::from_static(b"v2")),
-            },
-            &mut bytes,
-        );
-        let mut index = Vec::new();
-        write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
-        let mut bloom = Bloom::new(1, 10);
-        bloom.insert(b"old");
-        let offset = file.stream_position().unwrap();
-        let size = write_metadata(&mut file, 1, 1, &bloom, &index).unwrap();
-        let mut footer = PAGED_MAGIC.to_vec();
-        put_u64(&mut footer, offset);
-        put_u64(&mut footer, size);
-        let checksum = crc32fast::hash(&footer);
-        put_u32(&mut footer, checksum);
-        file.write_all(&footer).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        Manifest {
-            wal_floor: 0,
-            max_seq: 1,
-            tables: vec![2],
+    fn version_two_and_three_tables_remain_readable_with_version_four() {
+        for magic in [PAGED_MAGIC, INDEXED_MAGIC] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(Engine::open(dir.path()).unwrap());
+            let path = dir.path().join("sst/00000000000000000002.sst");
+            let mut file = File::create(path).unwrap();
+            file.write_all(magic).unwrap();
+            let mut bytes = Vec::new();
+            encode_record(
+                b"old",
+                &Record {
+                    seq: 1,
+                    value: Some(Bytes::from_static(b"previous")),
+                },
+                &mut bytes,
+            );
+            let mut index = Vec::new();
+            if magic == INDEXED_MAGIC {
+                put_u32(&mut bytes, 0);
+                put_u32(&mut bytes, 1);
+            }
+            write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
+            let mut bloom = Bloom::new(1, 10);
+            bloom.insert(b"old");
+            let offset = file.stream_position().unwrap();
+            let size = write_metadata(&mut file, 1, 1, &bloom, &index).unwrap();
+            let mut footer = magic.to_vec();
+            put_u64(&mut footer, offset);
+            put_u64(&mut footer, size);
+            let checksum = crc32fast::hash(&footer);
+            put_u32(&mut footer, checksum);
+            file.write_all(&footer).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            Manifest {
+                wal_floor: 0,
+                max_seq: 1,
+                tables: vec![2],
+            }
+            .save(dir.path())
+            .unwrap();
+            let db = Engine::open(dir.path()).unwrap();
+            db.put(b"new", b"v4").unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
+            assert_eq!(db.get(b"new").unwrap().unwrap(), "v4");
+            db.compact().unwrap();
+            drop(db);
+            let db = Engine::open(dir.path()).unwrap();
+            assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
+            assert_eq!(db.get(b"new").unwrap().unwrap(), "v4");
         }
-        .save(dir.path())
-        .unwrap();
-        let db = Engine::open(dir.path()).unwrap();
-        db.put(b"new", b"v3").unwrap();
-        db.flush().unwrap();
-        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
-        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
-        db.compact().unwrap();
-        drop(db);
-        let db = Engine::open(dir.path()).unwrap();
-        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
-        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
+    }
+
+    #[test]
+    fn writer_preserves_u16_boundary_wide_blocks_and_oversized_records() {
+        let dir = tempfile::tempdir().unwrap();
+        for (second_offset, width) in [(65535usize, 2), (65536, 4), (100_000, 4)] {
+            let path = dir.path().join(format!("boundary-{second_offset}.sst"));
+            let records = vec![
+                (
+                    b"a".to_vec(),
+                    Record {
+                        seq: 1,
+                        value: Some(Bytes::from(vec![42; second_offset - 18])),
+                    },
+                ),
+                (
+                    b"b".to_vec(),
+                    Record {
+                        seq: 2,
+                        value: None,
+                    },
+                ),
+            ];
+            // Overestimation also exercises the compact/wide Bloom rebuild parser.
+            let table = Table::write(
+                &path,
+                1,
+                records.clone().into_iter().map(Ok),
+                1000,
+                200_000,
+                10,
+            )
+            .unwrap();
+            assert_eq!(table.index.len(), 1);
+            assert_eq!(
+                table.index[0].len as usize,
+                HEADER + second_offset + 18 + 2 * width + 4
+            );
+            drop(table);
+            let table = Table::open(&path, 1).unwrap();
+            assert!(table.compact_offsets);
+            assert_eq!(table.block(0).unwrap(), records);
+            let cache = Mutex::new(Cache::new(0));
+            for (key, record) in &records {
+                assert_eq!(
+                    table
+                        .get(key, &cache, &Counters::default())
+                        .unwrap()
+                        .as_ref(),
+                    Some(record)
+                );
+            }
+            let split = Table::write(
+                &dir.path().join(format!("split-{second_offset}.sst")),
+                2,
+                records.clone().into_iter().map(Ok),
+                2,
+                second_offset + 6,
+                10,
+            )
+            .unwrap();
+            assert_eq!(split.index.len(), 2);
+            assert_eq!(split.index[0].len as usize, HEADER + second_offset + 6);
+            let all: Vec<_> = Arc::new(split).iter().collect::<Result<_>>().unwrap();
+            assert_eq!(all, records);
+        }
     }
 
     #[test]
