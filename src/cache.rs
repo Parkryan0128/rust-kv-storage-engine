@@ -127,13 +127,17 @@ impl Cache {
         let index_bytes = if indexed {
             0
         } else {
-            frame_len.saturating_sub(crate::codec::HEADER) / 17 * std::mem::size_of::<u32>()
+            (frame_len.saturating_sub(crate::codec::HEADER) / 17).max(1)
+                * std::mem::size_of::<u32>()
         };
-        let minimum = frame_len
+        let frame_charge = frame_len
             .saturating_add(std::mem::size_of::<ReadBlock>())
-            .saturating_add(index_bytes)
             .saturating_add(ENTRY_OVERHEAD);
-        if self.tail == NONE || minimum > self.capacity || self.bytes <= self.capacity - minimum {
+        let maximum = frame_charge.saturating_add(index_bytes);
+        let minimum = frame_charge.saturating_add(if indexed { 0 } else { 4 });
+        // The upper bound proves admission; the lower bound proves eviction is
+        // necessary. Do not evict just because the pessimistic charge needs space.
+        if self.tail == NONE || maximum > self.capacity || self.bytes <= self.capacity - minimum {
             return None;
         }
         let old = self.remove(self.tail).block;
@@ -253,6 +257,18 @@ mod tests {
         // V3 carries its directory within the frame, so this bound is exact.
         assert!(cache.take_reusable(1226, true).is_none());
         assert_eq!(cache.bytes(), before);
+    }
+
+    #[test]
+    fn uncertain_legacy_index_charge_does_not_force_early_eviction() {
+        let mut cache = Cache::new(600);
+        cache.insert((1, 0), block(15));
+        let before = cache.bytes();
+        // A single-record 200-byte frame fits in the remaining space, even
+        // though the conservative dense-record upper bound would not.
+        assert!(cache.take_reusable(200, false).is_none());
+        assert_eq!(cache.bytes(), before);
+        assert!(cache.get((1, 0), &Counters::default()).is_some());
     }
 
     #[test]
