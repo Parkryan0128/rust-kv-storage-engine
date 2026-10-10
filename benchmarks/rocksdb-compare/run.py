@@ -132,16 +132,17 @@ def main():
                          str(keys), str(size), str(tables)], env=env, check=True, timeout=180,
                     )
                     if not smoke:
-                        for name, manifest in [("engine", "Cargo.toml")]:
-                            warm_files(engine_dir)
-                            source = Path(manifest).resolve().parent
+                        for name, source in sources.items():
+                            warm_files(directories[name])
+                            manifest = str(source / "Cargo.toml")
+                            profile_env = dict(env, KV_READ_FIXTURE_DIR=str(directories[name]))
                             target = str(source / "target")
                             text = logged(
                                 ["cargo", "test", "--locked", "--release", "--lib",
                                  "--manifest-path", manifest, "--target-dir", target,
                                  "sstable::read_profile::profile_random_read_stages", "--",
                                  "--ignored", "--exact", "--nocapture", "--test-threads=1"],
-                                env, output / f"{label}-{name}-profile.log", 180,
+                                profile_env, output / f"{label}-{name}-profile.log", 180,
                             )
                             reports = [json.loads(line.split("READ_PROFILE ", 1)[1])
                                        for line in text.splitlines() if "READ_PROFILE " in line]

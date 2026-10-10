@@ -74,7 +74,38 @@ impl ReadBlock {
         compact: bool,
     ) -> Result<(Self, u64)> {
         let payload = frame_payload(&bytes)?;
-        let (records, width) = indexed_layout(payload, compact)?;
+        let trailer = offset_trailer(payload)?;
+        if compact && trailer & (1 << 31) == 0 {
+            Self::decode_indexed_width::<2>(
+                bytes,
+                first,
+                next,
+                max_seq,
+                validated,
+                trailer as usize,
+            )
+        } else {
+            let count = if compact {
+                trailer & !(1 << 31)
+            } else {
+                trailer
+            };
+            Self::decode_indexed_width::<4>(bytes, first, next, max_seq, validated, count as usize)
+        }
+    }
+
+    fn decode_indexed_width<const WIDTH: usize>(
+        bytes: Vec<u8>,
+        first: &[u8],
+        next: Option<&[u8]>,
+        max_seq: u64,
+        validated: u64,
+        count: usize,
+    ) -> Result<(Self, u64)> {
+        // The caller already verified the frame CRC. Specializing the complete
+        // directory parser avoids dynamic division and per-offset width tests.
+        let payload = &bytes[HEADER..];
+        let records = &payload[..record_bytes::<WIDTH>(payload.len(), count)?];
         let index_start = (HEADER + records.len()) as u32;
         // The extra bit distinguishes an unvalidated block from a valid zero CRC.
         let fingerprint =
@@ -82,8 +113,8 @@ impl ReadBlock {
         if fingerprint != validated {
             let mut cursor = Cursor { b: records };
             let mut previous: Option<&[u8]> = None;
-            for offset in payload[records.len()..payload.len() - 4].chunks_exact(width) {
-                let offset = if width == 2 {
+            for offset in payload[records.len()..payload.len() - 4].chunks_exact(WIDTH) {
+                let offset = if WIDTH == 2 {
                     u16::from_le_bytes(offset.try_into().unwrap()) as usize
                 } else {
                     u32::from_le_bytes(offset.try_into().unwrap()) as usize
@@ -111,7 +142,7 @@ impl ReadBlock {
                 bytes,
                 offsets: Vec::new(),
                 index_start,
-                offset_width: width as u32,
+                offset_width: WIDTH as u32,
             },
             fingerprint,
         ))
@@ -174,6 +205,7 @@ impl ReadBlock {
         ))
     }
 
+    #[inline]
     fn lookup_indexed<const WIDTH: usize>(&self, key: &[u8]) -> Result<Option<Record>> {
         let (mut left, mut right) = (
             0,
@@ -239,29 +271,36 @@ impl ReadBlock {
 }
 
 pub(crate) fn indexed_records(payload: &[u8], compact: bool) -> Result<&[u8]> {
-    Ok(indexed_layout(payload, compact)?.0)
+    let trailer = offset_trailer(payload)?;
+    let len = if compact && trailer & (1 << 31) == 0 {
+        record_bytes::<2>(payload.len(), trailer as usize)?
+    } else {
+        let count = if compact {
+            trailer & !(1 << 31)
+        } else {
+            trailer
+        };
+        record_bytes::<4>(payload.len(), count as usize)?
+    };
+    Ok(&payload[..len])
 }
 
-fn indexed_layout(payload: &[u8], compact: bool) -> Result<(&[u8], usize)> {
+#[inline]
+fn offset_trailer(payload: &[u8]) -> Result<u32> {
     let footer = payload
         .get(payload.len().saturating_sub(4)..)
         .filter(|footer| footer.len() == 4)
         .ok_or_else(|| corrupt("SST offset footer"))?;
-    let trailer = u32::from_le_bytes(footer.try_into().unwrap());
-    let width = if compact && trailer & (1 << 31) == 0 {
-        2
-    } else {
-        4
-    };
-    let count = if compact {
-        trailer & !(1 << 31)
-    } else {
-        trailer
-    } as usize;
-    if count == 0 || count > (payload.len() - 4) / (17 + width) {
+    Ok(u32::from_le_bytes(footer.try_into().unwrap()))
+}
+
+#[inline]
+fn record_bytes<const WIDTH: usize>(payload_len: usize, count: usize) -> Result<usize> {
+    // Called only after offset_trailer validated the four-byte footer.
+    if count == 0 || count > (payload_len - 4) / (17 + WIDTH) {
         return Err(corrupt("SST offset count"));
     }
-    Ok((&payload[..payload.len() - 4 - count * width], width))
+    Ok(payload_len - 4 - count * WIDTH)
 }
 
 #[cfg(test)]
