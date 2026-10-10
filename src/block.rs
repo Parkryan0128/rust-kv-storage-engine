@@ -223,52 +223,6 @@ pub(crate) fn indexed_records(payload: &[u8]) -> Result<&[u8]> {
     Ok(&payload[..payload.len() - 4 - count * 4])
 }
 
-// V4 is retained only for files written by the earlier compact-offset build.
-// New V5 files use V3 data frames and never take this conversion path.
-pub(crate) fn expand_compact_frame(mut bytes: Vec<u8>) -> Result<Vec<u8>> {
-    let (records_len, count, narrow) = compact_layout(frame_payload(&bytes)?)?;
-    let new_len = bytes.len() + if narrow { count * 2 } else { 0 };
-    if new_len - HEADER > MAX_FRAME {
-        return Err(corrupt("expanded SST frame exceeds limit"));
-    }
-    if narrow {
-        let start = HEADER + records_len;
-        bytes.resize(new_len, 0);
-        for n in (0..count).rev() {
-            let at = start + n * 2;
-            let offset = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as u32;
-            bytes[start + n * 4..start + n * 4 + 4].copy_from_slice(&offset.to_le_bytes());
-        }
-    }
-    bytes[new_len - 4..].copy_from_slice(&(count as u32).to_le_bytes());
-    bytes[..4].copy_from_slice(&((new_len - HEADER) as u32).to_le_bytes());
-    let header_crc = crc32fast::hash(&bytes[..4]);
-    let payload_crc = crc32fast::hash(&bytes[HEADER..]);
-    bytes[4..8].copy_from_slice(&header_crc.to_le_bytes());
-    bytes[8..12].copy_from_slice(&payload_crc.to_le_bytes());
-    Ok(bytes)
-}
-
-#[cfg(test)]
-pub(crate) fn compact_records(payload: &[u8]) -> Result<&[u8]> {
-    Ok(&payload[..compact_layout(payload)?.0])
-}
-
-fn compact_layout(payload: &[u8]) -> Result<(usize, usize, bool)> {
-    let footer = payload
-        .get(payload.len().saturating_sub(4)..)
-        .filter(|footer| footer.len() == 4)
-        .ok_or_else(|| corrupt("SST offset footer"))?;
-    let trailer = u32::from_le_bytes(footer.try_into().unwrap());
-    let count = (trailer & !(1 << 31)) as usize;
-    let narrow = trailer & (1 << 31) == 0;
-    let width = if narrow { 2 } else { 4 };
-    if count == 0 || count > (payload.len() - 4) / (17 + width) {
-        return Err(corrupt("SST offset count"));
-    }
-    Ok((payload.len() - 4 - count * width, count, narrow))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,47 +247,6 @@ mod tests {
         }
         put_u32(&mut payload, offsets.len() as u32);
         framed(&payload)
-    }
-
-    #[test]
-    fn version_four_conversion_preserves_values_and_corruption_detection() {
-        for (first_len, narrow) in [(18usize, true), (65535, true), (65536, false)] {
-            let value = vec![42; first_len - 18];
-            let records: &[TestRecord<'_>] = &[(b"a", 1, Some(&value)), (b"b", 2, None)];
-            let v3 = indexed_frame(records);
-            let data = indexed_records(frame_payload(&v3).unwrap()).unwrap();
-            let mut payload = data.to_vec();
-            if narrow {
-                payload.extend(0u16.to_le_bytes());
-                payload.extend((first_len as u16).to_le_bytes());
-                put_u32(&mut payload, 2);
-            } else {
-                put_u32(&mut payload, 0);
-                put_u32(&mut payload, first_len as u32);
-                put_u32(&mut payload, (1 << 31) | 2);
-            }
-            let v4 = framed(&payload);
-            assert_eq!(expand_compact_frame(v4.clone()).unwrap(), v3);
-            let normalized = expand_compact_frame(v4.clone()).unwrap();
-            let (block, _) = ReadBlock::decode_indexed(normalized, b"a", None, 2, 0).unwrap();
-            assert_eq!(
-                block.lookup(b"a").unwrap().unwrap().value.unwrap().as_ref(),
-                value
-            );
-            assert_eq!(block.lookup(b"b").unwrap().unwrap().value, None);
-            for cut in [0, 1, HEADER - 1, v4.len() - 1] {
-                assert!(expand_compact_frame(v4[..cut].to_vec()).is_err());
-            }
-            let mut bad_crc = v4;
-            bad_crc[HEADER] ^= 1;
-            assert!(expand_compact_frame(bad_crc).is_err());
-            payload[data.len()] = 1; // invalid first offset, with a fresh CRC
-            let normalized = expand_compact_frame(framed(&payload)).unwrap();
-            assert!(ReadBlock::decode_indexed(normalized, b"a", None, 2, 0).is_err());
-        }
-        for footer in [0u32, 1 << 31, u32::MAX] {
-            assert!(expand_compact_frame(framed(&footer.to_le_bytes())).is_err());
-        }
     }
 
     #[test]

@@ -27,13 +27,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Check out the pre-compaction-format baseline
-        uses: actions/checkout@v4
-        with:
-          ref: ef358614095922dccbcf36fdaddc1aa174b1cb9d
-          path: baseline-source
-      - name: Share only the benchmark harness with the baseline
-        run: python3 benchmarks/rocksdb-compare/prepare_baseline.py
       - uses: dtolnay/rust-toolchain@stable
       - name: Check formatting
         run: |
@@ -54,9 +47,6 @@ jobs:
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --features rocks
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
-          cargo build --locked --release --manifest-path baseline-source/benchmarks/rocksdb-compare/Cargo.toml
-          cp baseline-source/benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
-          cargo test --locked --release --lib --manifest-path baseline-source/Cargo.toml --no-run
       - name: Verify small random workload
         run: python3 benchmarks/rocksdb-compare/run.py comparison-smoke
         env:

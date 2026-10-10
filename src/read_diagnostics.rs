@@ -72,9 +72,7 @@ fn fixture(tables: u64) -> Result<(tempfile::TempDir, Vec<Table>)> {
 // Equivalent record/order/boundary validation to Table::block, materializing
 // only the selected value. This is a diagnostic control, not a new read API.
 fn borrowed_lookup(table: &Table, n: usize, payload: &[u8], key: &[u8]) -> Result<Option<Bytes>> {
-    let payload = if table.compact_offsets {
-        crate::block::compact_records(payload)?
-    } else if table.indexed {
+    let payload = if table.indexed {
         indexed_records(payload)?
     } else {
         payload
@@ -120,9 +118,7 @@ fn borrowed_lookup(table: &Table, n: usize, payload: &[u8], key: &[u8]) -> Resul
 }
 
 fn decode_block(table: &Table, n: usize, payload: &[u8]) -> Result<Block> {
-    let payload = if table.compact_offsets {
-        crate::block::compact_records(payload)?
-    } else if table.indexed {
+    let payload = if table.indexed {
         indexed_records(payload)?
     } else {
         payload

@@ -1,5 +1,5 @@
 use crate::{
-    block::{expand_compact_frame, indexed_records, ReadBlock},
+    block::{indexed_records, ReadBlock},
     bloom::Bloom,
     cache::{Block, Cache, Counters},
     codec::*,
@@ -21,9 +21,7 @@ use std::{
 };
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
 const PAGED_MAGIC: &[u8; 8] = b"RKVSST02";
-const INDEXED_MAGIC: &[u8; 8] = b"RKVSST03";
-const COMPACT_MAGIC: &[u8; 8] = b"RKVSST04";
-const MAGIC: &[u8; 8] = b"RKVSST05";
+const MAGIC: &[u8; 8] = b"RKVSST03";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
@@ -46,7 +44,6 @@ pub(crate) struct Table {
     pub max_seq: u64,
     cacheable: AtomicBool,
     indexed: bool,
-    compact_offsets: bool,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; len];
@@ -117,7 +114,7 @@ impl Table {
             }
         }
         let meta_offset = f.stream_position()?;
-        let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index, false)?;
+        let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index)?;
         let mut footer = vec![];
         footer.extend(MAGIC);
         put_u64(&mut footer, meta_offset);
@@ -146,11 +143,7 @@ impl Table {
         let legacy = magic == LEGACY_MAGIC;
         let footer_size = if legacy {
             LEGACY_FOOTER
-        } else if magic == MAGIC
-            || magic == INDEXED_MAGIC
-            || magic == COMPACT_MAGIC
-            || magic == PAGED_MAGIC
-        {
+        } else if magic == MAGIC || magic == PAGED_MAGIC {
             FOOTER
         } else {
             return Err(corrupt("SST version"));
@@ -187,8 +180,7 @@ impl Table {
         let max_seq = c.u64()?;
         let bloom = Bloom::decode(&mut c)?;
         let n = if legacy { c.u32()? as u64 } else { c.u64()? };
-        let explicit_offsets = magic != MAGIC;
-        if n > count || n > size / if explicit_offsets { 16 } else { 8 } {
+        if n > count || n > size / 16 {
             return Err(corrupt("SST index length"));
         }
         // Grow only as verified entries are decoded, not from an untrusted count.
@@ -199,7 +191,7 @@ impl Table {
                 return Err(corrupt("SST metadata frame length"));
             }
             for _ in 0..n {
-                read_index(&mut c, &mut index, &mut end, offset, true)?;
+                read_index(&mut c, &mut index, &mut end, offset)?;
             }
             c.done()?;
         } else {
@@ -213,7 +205,7 @@ impl Table {
                     if index.len() as u64 >= n {
                         return Err(corrupt("extra SST index entries"));
                     }
-                    read_index(&mut c, &mut index, &mut end, offset, explicit_offsets)?;
+                    read_index(&mut c, &mut index, &mut end, offset)?;
                 }
             }
         }
@@ -233,8 +225,7 @@ impl Table {
             file_bytes: len,
             max_seq,
             cacheable: AtomicBool::new(true),
-            indexed: magic == MAGIC || magic == INDEXED_MAGIC || magic == COMPACT_MAGIC,
-            compact_offsets: magic == COMPACT_MAGIC,
+            indexed: magic == MAGIC,
         })
     }
     pub fn block(&self, n: usize) -> Result<Block> {
@@ -253,13 +244,6 @@ impl Table {
         let i = &self.index[n];
         let next = self.index.get(n + 1).map(|next| next.first.as_slice());
         if self.indexed {
-            // Compatibility for the short-lived compact-directory format.
-            // Current V5 blocks retain the original V3 byte layout and decoder.
-            let bytes = if self.compact_offsets {
-                expand_compact_frame(bytes)?
-            } else {
-                bytes
-            };
             let (block, fingerprint) = ReadBlock::decode_indexed(
                 bytes,
                 &i.first,
@@ -296,10 +280,7 @@ impl Table {
         let (cached, reusable, budget) = {
             let mut cache = cache.lock();
             let cached = cache.get((self.id, n), counters);
-            let reusable = if cached.is_none()
-                && self.cacheable.load(Ordering::Relaxed)
-                && !self.compact_offsets
-            {
+            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Relaxed) {
                 cache.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
@@ -354,7 +335,6 @@ fn write_metadata(
     max_seq: u64,
     bloom: &Bloom,
     index: &[Index],
-    explicit_offsets: bool,
 ) -> Result<u64> {
     let mut page = vec![];
     put_u64(&mut page, count);
@@ -365,16 +345,13 @@ fn write_metadata(
     page.clear();
     for i in index {
         // A single large key can exceed the target, but fits within MAX_FRAME.
-        let entry_bytes = if explicit_offsets { 16 } else { 8 };
-        if !page.is_empty() && page.len() + entry_bytes + i.first.len() > INDEX_PAGE_TARGET {
+        if !page.is_empty() && page.len() + 16 + i.first.len() > INDEX_PAGE_TARGET {
             bytes += write_frame(f, &page)?;
             page.clear();
         }
         put_u32(&mut page, i.first.len() as u32);
         page.extend(&i.first);
-        if explicit_offsets {
-            put_u64(&mut page, i.offset);
-        }
+        put_u64(&mut page, i.offset);
         put_u32(&mut page, i.len);
     }
     if !page.is_empty() {
@@ -387,13 +364,10 @@ fn read_index(
     index: &mut Vec<Index>,
     end: &mut u64,
     metadata_offset: u64,
-    explicit_offsets: bool,
 ) -> Result<()> {
     let kl = c.u32()? as usize;
     let first = c.take(kl)?.to_vec();
-    // Blocks are contiguous: their offsets are already determined by the
-    // preceding framed lengths. V5 omits this redundant on-disk u64.
-    let off = if explicit_offsets { c.u64()? } else { *end };
+    let off = c.u64()?;
     let bl = c.u32()?;
     if off != *end
         || bl as usize > MAX_FRAME + HEADER
@@ -709,128 +683,52 @@ mod tests {
     }
 
     #[test]
-    fn versions_two_through_four_remain_readable_with_version_five() {
-        for magic in [PAGED_MAGIC, INDEXED_MAGIC, COMPACT_MAGIC] {
-            let dir = tempfile::tempdir().unwrap();
-            drop(Engine::open(dir.path()).unwrap());
-            let path = dir.path().join("sst/00000000000000000002.sst");
-            let mut file = File::create(path).unwrap();
-            file.write_all(magic).unwrap();
-            let mut bytes = Vec::new();
-            encode_record(
-                b"old",
-                &Record {
-                    seq: 1,
-                    value: Some(Bytes::from_static(b"previous")),
-                },
-                &mut bytes,
-            );
-            let mut index = Vec::new();
-            if magic == INDEXED_MAGIC {
-                put_u32(&mut bytes, 0);
-                put_u32(&mut bytes, 1);
-            } else if magic == COMPACT_MAGIC {
-                bytes.extend(0u16.to_le_bytes());
-                put_u32(&mut bytes, 1);
-            }
-            write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
-            let mut bloom = Bloom::new(1, 10);
-            bloom.insert(b"old");
-            let offset = file.stream_position().unwrap();
-            let size = write_metadata(&mut file, 1, 1, &bloom, &index, true).unwrap();
-            let mut footer = magic.to_vec();
-            put_u64(&mut footer, offset);
-            put_u64(&mut footer, size);
-            let checksum = crc32fast::hash(&footer);
-            put_u32(&mut footer, checksum);
-            file.write_all(&footer).unwrap();
-            file.sync_all().unwrap();
-            drop(file);
-            Manifest {
-                wal_floor: 0,
-                max_seq: 1,
-                tables: vec![2],
-            }
-            .save(dir.path())
-            .unwrap();
-            let db = Engine::open(dir.path()).unwrap();
-            db.put(b"new", b"v5").unwrap();
-            db.flush().unwrap();
-            assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
-            assert_eq!(db.get(b"new").unwrap().unwrap(), "v5");
-            db.compact().unwrap();
-            drop(db);
-            let db = Engine::open(dir.path()).unwrap();
-            assert_eq!(db.get(b"old").unwrap().unwrap(), "previous");
-            assert_eq!(db.get(b"new").unwrap().unwrap(), "v5");
-        }
-    }
-
-    #[test]
-    fn version_five_changes_only_metadata_not_data_frames_or_block_boundaries() {
+    fn version_two_and_three_tables_remain_readable_together() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v5.sst");
-        let table = Table::write(
-            &path,
-            1,
-            (0u64..200).map(|key| {
-                Ok((
-                    key.to_be_bytes().to_vec(),
-                    Record {
-                        seq: key + 1,
-                        value: Some(Bytes::from(vec![42; 32])),
-                    },
-                ))
-            }),
-            200,
-            128,
-            10,
-        )
-        .unwrap();
-        let raw = fs::read(&path).unwrap();
-        let end = table.index.last().map(|i| i.offset + i.len as u64).unwrap();
-        let old_path = dir.path().join("v3.sst");
-        let mut file = File::create(&old_path).unwrap();
-        file.write_all(INDEXED_MAGIC).unwrap();
-        file.write_all(&raw[8..end as usize]).unwrap();
-        let size = write_metadata(
-            &mut file,
-            table.count,
-            table.max_seq,
-            &table.bloom,
-            &table.index,
-            true,
-        )
-        .unwrap();
-        let mut footer = INDEXED_MAGIC.to_vec();
-        put_u64(&mut footer, end);
+        drop(Engine::open(dir.path()).unwrap());
+        let path = dir.path().join("sst/00000000000000000002.sst");
+        let mut file = File::create(path).unwrap();
+        file.write_all(PAGED_MAGIC).unwrap();
+        let mut bytes = Vec::new();
+        encode_record(
+            b"old",
+            &Record {
+                seq: 1,
+                value: Some(Bytes::from_static(b"v2")),
+            },
+            &mut bytes,
+        );
+        let mut index = Vec::new();
+        write_block(&mut file, &mut bytes, b"old", &mut index).unwrap();
+        let mut bloom = Bloom::new(1, 10);
+        bloom.insert(b"old");
+        let offset = file.stream_position().unwrap();
+        let size = write_metadata(&mut file, 1, 1, &bloom, &index).unwrap();
+        let mut footer = PAGED_MAGIC.to_vec();
+        put_u64(&mut footer, offset);
         put_u64(&mut footer, size);
         let checksum = crc32fast::hash(&footer);
         put_u32(&mut footer, checksum);
         file.write_all(&footer).unwrap();
         file.sync_all().unwrap();
         drop(file);
-        let old = Table::open(&old_path, 2).unwrap();
-        assert_eq!(
-            old.file_bytes - table.file_bytes,
-            table.index.len() as u64 * 8
-        );
-        assert_eq!(table.index.len(), old.index.len());
-        for (a, b) in table.index.iter().zip(&old.index) {
-            assert_eq!((a.offset, a.len, &a.first), (b.offset, b.len, &b.first));
+        Manifest {
+            wal_floor: 0,
+            max_seq: 1,
+            tables: vec![2],
         }
-        let cache = Mutex::new(Cache::new(0));
-        let counters = Counters::default();
-        for key in 0u64..200 {
-            assert_eq!(
-                table.get(&key.to_be_bytes(), &cache, &counters).unwrap(),
-                old.get(&key.to_be_bytes(), &cache, &counters).unwrap()
-            );
-        }
-        assert_eq!(
-            &raw[8..end as usize],
-            &fs::read(old_path).unwrap()[8..end as usize]
-        );
+        .save(dir.path())
+        .unwrap();
+        let db = Engine::open(dir.path()).unwrap();
+        db.put(b"new", b"v3").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
+        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
+        db.compact().unwrap();
+        drop(db);
+        let db = Engine::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
+        assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
     }
 
     #[test]

@@ -24,7 +24,7 @@ contain a newer version. A file's maximum sequence is only an upper bound:
 finding a key in the first file does not by itself end the search. Keys below
 a table's first indexed key skip that table before checking its Bloom filter.
 
-Point reads cache encoded blocks. Versions 03/05 store the record-offset
+Point reads cache encoded blocks. Version 03 stores the compact record-offset
 index inside each checksummed data frame. On the first read of each block after
 open, every record's bounds, header, key order, sequence and persisted offset are
 validated. The table retains an eight-byte validation fingerprint per block.
@@ -44,7 +44,7 @@ order through indexed links rather than a tree. When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
 block; outstanding readers retain their original immutable block. Frames that
 cannot fit the budget do not evict entries for recycling: legacy blocks use a
-conservative offset-array bound and versions 03/05 include their indexes in the frame.
+conservative offset-array bound and version 03 includes its index in the frame.
 Reused frames follow the checksum and validation rules above. Cache charges include allocated buffer
 capacities and a per-entry allowance; no separate spare-buffer pool is retained.
 
@@ -109,15 +109,11 @@ After a write or maintenance I/O error, drop all engine handles and reopen the d
 
 Records store a sequence number, a value/deletion tag, and key/value lengths and bytes. Empty values and deleted keys have different tags. Numbers use little-endian encoding; CRC32 checksums detect damaged frames.
 
-Frames are capped at 64 MiB and records at 32 MiB. New SSTables use RKVSST05. Data frames retain the exact version 03 representation: encoded records, one little-endian u32 byte offset per record, and a final u32 record count. Data packing, CRCs, binary search, cache charges and value decoding are unchanged. No compression or decompression is introduced.
+Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST03`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
 
-Only the table metadata index changes. Blocks have always been contiguous, starting at file offset eight. Version 05 derives each block offset from the preceding framed lengths, instead of storing a redundant u64 offset for every block. This saves eight bytes per block, and sometimes an index-page header. Reconstructed in-memory index entries are identical to version 03. There is no new per-Get reconstruction.
+The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
 
-The metadata summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64. Each version 05 index entry stores first-key length u32, first-key bytes, and framed block length u32. Older versions also store a u64 block offset before the length. Index pages target 1 MiB, never split entries, and remain checksummed. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
-
-Existing versions 01 through 04 remain readable. Version 04, briefly used by the compact-offset implementation, contains u16/u32 record directories. Its frames are checksum-verified and expanded to the version 03 layout in memory before normal validation; this compatibility path does not run for new version 05 files. The narrower directory approach was withdrawn because repeated measurements did not establish no slowdown across workloads.
-
-Flush and compaction write version 05; opening a database does not rewrite existing SSTs. WAL and MANIFEST stay at version 01. Older binaries cannot read new version 05 SSTs. Retain a backup made with all handles closed if rollback to an older binary is needed.
+Existing `RKVSST01` and `RKVSST02` SSTables remain readable alongside version `03` files. Flush and compaction write version `03`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read version `03` SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
 
 Exact layouts: [records](../src/codec.rs), [WAL](../src/wal.rs), [SSTables](../src/sstable.rs), [manifest](../src/manifest.rs).
 
