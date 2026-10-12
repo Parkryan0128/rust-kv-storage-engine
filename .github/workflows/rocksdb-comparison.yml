@@ -1,15 +1,6 @@
 name: rocksdb-comparison
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'benchmarks/rocksdb-compare/**'
-      - '.github/workflows/rocksdb-comparison.yml'
-  pull_request:
-    paths:
-      - 'benchmarks/rocksdb-compare/**'
-      - '.github/workflows/rocksdb-comparison.yml'
+  # Full performance comparisons are opt-in, not part of ordinary validation.
   workflow_dispatch:
 permissions:
   contents: read

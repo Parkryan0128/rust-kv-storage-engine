@@ -9,6 +9,7 @@
 //! engine.delete(b"hello")?;
 //! # Ok::<(), rust_kv_storage_engine::EngineError>(())
 //! ```
+mod batch;
 mod block;
 mod bloom;
 mod cache;
@@ -28,6 +29,7 @@ mod sstable;
 #[cfg(test)]
 mod test_hooks;
 mod wal;
+pub use batch::WriteBatch;
 pub use compaction::CompactionStyle;
 pub use engine::{Engine, KvEngine, Options, Result, Stats};
 pub use error::EngineError;

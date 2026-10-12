@@ -1,4 +1,4 @@
-use rust_kv_storage_engine::{Engine, EngineError, Options};
+use rust_kv_storage_engine::{Engine, EngineError, Options, WriteBatch};
 use std::io::{self, Write};
 fn main() {
     let a: Vec<_> = std::env::args().collect();
@@ -35,6 +35,39 @@ fn main() {
     }
     if a.len() > 3 {
         std::env::set_var("KV_FAILPOINT", &a[3]);
+    }
+    if mode == "batch" || mode == "batch-error" {
+        if mode == "batch-error" {
+            std::env::set_var("KV_FAIL_ACTION", "error");
+        }
+        let mut batch = WriteBatch::new();
+        batch
+            .put("batch-a", "new")
+            .delete("batch-old")
+            .put("batch-b", "new");
+        let result = e.write_batch(batch);
+        if mode == "batch-error" {
+            assert!(result.is_err(), "injection did not fail");
+            assert!(matches!(e.get(b"batch-a"), Err(EngineError::Background(_))));
+            assert!(matches!(
+                e.put(b"must-reject", b"v"),
+                Err(EngineError::Background(_))
+            ));
+            assert!(matches!(
+                e.write_batch(WriteBatch::new()),
+                Err(EngineError::Background(_))
+            ));
+            let mut batch = WriteBatch::new();
+            batch.put("must-reject", "v");
+            assert!(matches!(
+                e.write_batch(batch),
+                Err(EngineError::Background(_))
+            ));
+        } else {
+            result.unwrap();
+            panic!("batch did not hit failpoint");
+        }
+        return;
     }
     if mode == "error" {
         std::env::set_var("KV_FAIL_ACTION", "error");

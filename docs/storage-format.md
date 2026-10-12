@@ -14,6 +14,14 @@ The in-memory write buffer is called a **memtable**. A **tombstone** is a record
 
 Each write is logged and synced with `sync_all()` before updating memory.
 
+`Engine::write_batch(WriteBatch)` validates all operations, writes one WAL frame,
+syncs once, then applies the entire batch under the state write lock. The writer
+barrier prevents other writes or rotation from splitting the batch. Each
+operation receives a consecutive sequence number, including deletes and repeated
+keys; the last operation on a key wins. Individual reads cannot observe a partially
+applied batch, but separate reads do not form a snapshot. Empty batches only check
+engine health. Validation errors leave the engine usable and apply nothing.
+
 When the memory or WAL limit is reached, the next write starts a new buffer. A background worker saves the old buffer as an SSTable. Writers pause if too many buffers are waiting.
 
 Reads check memory first, then SSTables. Bloom filters skip files that cannot contain the key, indexes locate its block, and a cache holds recently read blocks.
@@ -105,9 +113,28 @@ Recovery accepts an incomplete tail only in the newest WAL. Corrupt records retu
 
 After a write or maintenance I/O error, drop all engine handles and reopen the database. A write that returned an error may still appear after recovery.
 
+A batch is recovered in full or not at all. Recovery validates the whole batch
+before applying any operation. An incomplete batch frame at the newest WAL tail
+is discarded and truncated; a complete frame with a bad checksum or invalid
+batch payload returns a corruption error. A successful batch is synced before
+returning, subject to the filesystem's sync guarantees.
+
 ## File encoding
 
 Records store a sequence number, a value/deletion tag, and key/value lengths and bytes. Empty values and deleted keys have different tags. Numbers use little-endian encoding; CRC32 checksums detect damaged frames.
+
+WAL files retain the `RKVWAL01` magic and the existing length/header-CRC/payload-CRC
+frame layout. Single writes retain their original record payload. Batch payloads
+start with a 16-byte envelope: zero u64 sentinel, version u32 (`1`), operation
+count u32 (nonzero), then that many ordinary encoded records. Batch records must
+have nonzero, consecutive sequence numbers newer than preceding WAL records.
+Trailing payload bytes are rejected. The sentinel is an invalid legacy sequence,
+so old readers reject a batch frame instead of replaying only part of it.
+
+New readers accept both kinds of WAL frame. Older binaries cannot reopen an
+active WAL containing a batch even though the file magic is unchanged. Keep a
+closed-database backup before upgrading if rollback is needed. Batch support
+does not change SSTable or MANIFEST formats.
 
 Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST03`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
 
@@ -134,6 +161,12 @@ Pass an `Options` value to `Engine::open_with_options()`.
 | `max_value_size` | 16 MiB | Maximum value length |
 
 The key, value, and 17-byte record header must fit within 32 MiB. A single record can exceed the memtable or block target. Cache and memtable budgets do not cover all process memory. Index pages bound the serialization buffer, not the in-memory index: all SST indexes and Bloom filters are still loaded at open.
+
+A batch's 16-byte envelope plus all records must fit within the 64 MiB frame
+payload limit. The batch owns copies of its inputs, and WAL serialization requires
+an additional buffer; this limit is not a process-memory budget. A batch can
+exceed the memtable target and is kept intact until the next write or explicit
+flush rotates it. Each resulting SST block still follows the normal block target.
 
 SizeTiered applies the threshold per size group; Full counts all live files. The policy can change on reopen. [Option validation](../src/engine.rs).
 

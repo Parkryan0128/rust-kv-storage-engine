@@ -56,6 +56,30 @@ db.compact()?;
 
 Persistent writes are synced to the WAL before returning. After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
 
+Commit several puts and deletes atomically with `WriteBatch`:
+
+```rust
+use rust_kv_storage_engine::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"name", b"Ryan");
+batch.put(b"status", b"active");
+batch.delete(b"old-name");
+db.write_batch(batch)?;
+```
+
+A persistent batch uses one checksummed WAL frame and one `sync_all()`, then
+publishes all operations together. Operations run in insertion order; the last
+operation on a repeated key wins. Empty batches do nothing on a healthy engine.
+Validation rejects the whole batch before writing. After an I/O failure or crash,
+recovery includes the whole batch or none of it; a failed call may still have
+committed. Separate `get()` calls are not a snapshot or a read/write transaction.
+
+Each entry obeys the configured key/value limits, and the total encoded batch is
+limited to 64 MiB (including headers). A batch is never split across memtables and
+can exceed the memtable target. Older binaries cannot replay WALs containing
+batches; keep a closed-database backup before upgrading if rollback is needed.
+
 Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads. Transactions, range scans, and replication are not implemented.
 
 [Storage format and configuration](docs/storage-format.md)
@@ -111,7 +135,7 @@ To run the growing-database test on a chosen local disk, set `KV_STRESS_DIR` to 
 KV_STRESS_DIR=/mnt/test-disk/kv-scratch cargo test --locked --release --test stress million_distinct_keys -- --ignored --nocapture
 ```
 
-The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. CI runs the million-distinct-key test in a separate Linux job.
+The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. The million-key and extended stress CI jobs run only when the workflow is manually dispatched.
 
 Check formatting and lints:
 
@@ -131,7 +155,15 @@ Tests cover crash recovery, corruption, concurrent operations, and compaction, i
 
 Process-kill tests leave the OS cache intact; physical power loss has not been tested. The `fault-injection` feature is for tests; leave it disabled in applications.
 
+Batch tests cover repeated keys, validation and sequence limits, concurrent
+writes/flushes, every truncation boundary in a small WAL batch, corrupt batch
+payloads, and subprocess crashes or injected I/O errors before/after WAL sync
+and during memory application.
+
 ## Benchmarks
+
+The RocksDB comparison workflow is manual-only; ordinary pushes run correctness
+checks without executing performance benchmarks or the extended stress tests.
 
 Run the Criterion benchmarks:
 

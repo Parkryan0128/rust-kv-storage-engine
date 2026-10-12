@@ -9,6 +9,7 @@ use crate::{
     memtable::{MemTable, Record},
     sstable::{sync_dir, Table},
     wal::Wal,
+    WriteBatch,
 };
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Sender};
@@ -355,6 +356,32 @@ impl Engine {
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.core.mutate(key, None)
     }
+    /// Atomically apply an ordered batch of puts and deletes.
+    ///
+    /// Persistent batches use one checksummed WAL frame and one `sync_all()`.
+    /// Readers see the state before or after the whole batch; separate `get`
+    /// calls do not constitute a snapshot. The last operation on a key wins.
+    /// Empty batches check engine health and otherwise do nothing.
+    ///
+    /// Every entry must fit the configured key/value limits. The encoded batch
+    /// (16-byte envelope plus 17-byte headers and key/value bytes) must fit in
+    /// 64 MiB. Validation errors apply nothing and leave the engine usable.
+    /// A batch may exceed the memtable target; it is never split across WALs.
+    /// After an I/O error, reopen the engine: recovery may contain the entire
+    /// failed batch, but never a committed prefix of it.
+    ///
+    /// ```
+    /// use rust_kv_storage_engine::{Engine, WriteBatch};
+    /// let db = Engine::new();
+    /// let mut batch = WriteBatch::new();
+    /// batch.put(b"name", b"Ryan").delete(b"old-name");
+    /// db.write_batch(batch)?;
+    /// assert_eq!(db.get(b"name")?.as_deref(), Some(&b"Ryan"[..]));
+    /// # Ok::<(), rust_kv_storage_engine::EngineError>(())
+    /// ```
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.inner.core.write_batch(batch)
+    }
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let c = &self.inner.core;
         let s = c.state.read();
@@ -617,7 +644,7 @@ impl Core {
             self.changed.wait(&mut p);
         }
     }
-    fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    fn validate_entry(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         if key.len() > self.options.max_key_size
             || value.is_some_and(|v| v.len() > self.options.max_value_size)
         {
@@ -625,7 +652,9 @@ impl Core {
                 "key or value exceeds configured size limit".into(),
             ));
         }
-        let mut w = self.writer.lock();
+        Ok(())
+    }
+    fn prepare_write(&self, w: &mut Option<Wal>) -> Result<()> {
         self.wait_room()?;
         // Rotate first so a rotation error cannot fail an already-applied write.
         if self.disk.is_some()
@@ -633,12 +662,70 @@ impl Core {
                 || w.as_ref()
                     .is_some_and(|w| w.bytes >= self.options.memtable_size_limit as u64))
         {
-            if let Err(e) = self.freeze(&mut w) {
+            if let Err(e) = self.freeze(w) {
                 self.poison(&e);
                 return Err(e);
             }
             self.wake();
         }
+        Ok(())
+    }
+    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return check(&self.state.read());
+        }
+        for entry in &batch.entries {
+            self.validate_entry(&entry.key, entry.value.as_deref())?;
+        }
+        let size = batch.encoded_len()?;
+        let mut w = self.writer.lock();
+        let start = {
+            let s = self.state.read();
+            check(&s)?;
+            s.sequence
+        };
+        let end = start
+            .checked_add(batch.len() as u64)
+            .ok_or(EngineError::SequenceExhausted)?;
+        self.prepare_write(&mut w)?;
+        if let Some(wal) = w.as_mut() {
+            if let Err(e) = wal.append_batch(&batch, start + 1, size) {
+                self.poison(&e);
+                return Err(e);
+            }
+        }
+        // The writer barrier also excludes flush/rotation; a single state lock
+        // publishes all operations, including repeated keys, as one change.
+        let mut s = self.state.write();
+        for (i, entry) in batch.entries.into_iter().enumerate() {
+            let record = Record {
+                seq: start + 1 + i as u64,
+                value: entry.value,
+            };
+            if self.disk.is_none() && record.value.is_none() {
+                s.mem.remove(&entry.key);
+            } else {
+                s.mem.insert(entry.key, record);
+            }
+            if i == 0 {
+                #[cfg(test)]
+                crate::test_hooks::pause("batch_after_first_apply");
+                if let Err(e) = fault::hit("batch_after_first_apply") {
+                    let e = EngineError::from(e);
+                    s.fatal = Some(e.to_string());
+                    drop(s);
+                    self.progress();
+                    return Err(e);
+                }
+            }
+        }
+        s.sequence = end;
+        Ok(())
+    }
+    fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        self.validate_entry(key, value)?;
+        let mut w = self.writer.lock();
+        self.prepare_write(&mut w)?;
         let seq = self
             .state
             .read()
@@ -809,6 +896,10 @@ impl Core {
         Ok(merged)
     }
 }
+
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod audit_tests {
