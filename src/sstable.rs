@@ -183,7 +183,11 @@ impl Table {
         let max_seq = c.u64()?;
         let bloom = Bloom::decode(&mut c)?;
         let n = if legacy { c.u32()? as u64 } else { c.u64()? };
-        if n > count || n > size / 16 {
+        // Every stored record needs at least its 17-byte header. This is a
+        // conservative bound (frames/directories also consume data bytes), but
+        // prevents a checksummed, impossible count from entering stats and
+        // compaction estimates where multiple counts are added together.
+        if count > (offset - 8) / 17 || n > count || n > size / 16 {
             return Err(corrupt("SST index length"));
         }
         // Grow only as verified entries are decoded, not from an untrusted count.
@@ -459,6 +463,55 @@ mod tests {
     use super::*;
     use crate::{manifest::Manifest, Engine};
     use bytes::Bytes;
+
+    #[test]
+    fn impossible_checksummed_record_counts_are_rejected_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.sst");
+        drop(
+            Table::write(
+                &path,
+                1,
+                std::iter::once(Ok((
+                    b"k".to_vec(),
+                    Record {
+                        seq: 1,
+                        value: Some(Bytes::new()),
+                    },
+                ))),
+                1,
+                64,
+                10,
+            )
+            .unwrap(),
+        );
+        let original = fs::read(&path).unwrap();
+        let footer = original.len() - FOOTER;
+        let offset =
+            u64::from_le_bytes(original[footer + 8..footer + 16].try_into().unwrap()) as usize;
+        let mut input = &original[offset..footer];
+        let summary = read_frame(&mut input, false).unwrap().unwrap();
+        let bound = (offset as u64 - 8) / 17;
+        for count in [bound + 1, u64::MAX / 2 + 1, u64::MAX] {
+            let mut payload = summary.clone();
+            payload[..8].copy_from_slice(&count.to_le_bytes());
+            let mut changed = original[..offset].to_vec();
+            write_frame(&mut changed, &payload).unwrap();
+            changed.extend_from_slice(input);
+            changed.extend_from_slice(&original[footer..]);
+            assert_eq!(changed.len(), original.len());
+            fs::write(&path, changed).unwrap();
+            assert!(
+                matches!(
+                    Table::open(&path, 1),
+                    Err(crate::EngineError::Corruption(_))
+                ),
+                "count {count}"
+            );
+        }
+        fs::write(&path, original).unwrap();
+        assert_eq!(Table::open(&path, 1).unwrap().count, 1);
+    }
 
     #[test]
     fn larger_recycled_frame_remains_cacheable_near_the_budget() {
