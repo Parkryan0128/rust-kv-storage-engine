@@ -1,0 +1,55 @@
+name: workload-comparison
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: workload-comparison-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  compare:
+    # Explicit opt-in; regular pushes never run performance workloads.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[perf-check]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: 3
+      CXXFLAGS: '-g0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: benchmarks/rocksdb-compare/target
+          key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+      - name: Build and lint matching workload harnesses
+        run: |
+          mkdir -p comparison-bin
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Check both backends on a small workload
+        run: python3 benchmarks/rocksdb-compare/workloads.py workload-smoke --smoke
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Run bounded paired comparison
+        timeout-minutes: 10
+        run: python3 benchmarks/rocksdb-compare/workloads.py workload-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workload-comparison
+          path: |
+            workload-results/
+            workload-smoke/
+            benchmarks/rocksdb-compare/Cargo.lock

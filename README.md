@@ -201,6 +201,11 @@ and comparison with a filtered `BTreeMap` through batches, flushes and reopens.
 The RocksDB comparison workflow is manual-only; ordinary pushes run correctness
 checks without executing performance benchmarks or the extended stress tests.
 
+A separate [bounded workload suite](benchmarks/rocksdb-compare/WORKLOADS.md) covers
+misses, hot keys, concurrent readers, ranges, durable batches and compaction, with
+memory/disk metrics and four paired repetitions against RocksDB. Its workflow is
+opt-in through manual dispatch or a `[perf-check]` main-branch commit message.
+
 Run the Criterion benchmarks:
 
 ```bash
