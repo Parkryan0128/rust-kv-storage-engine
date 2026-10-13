@@ -24,14 +24,16 @@ python3 benchmarks/rocksdb-compare/workloads.py workload-results
 - 128-byte and 1,024-byte values with 20,000 keys. The latter exceeds the 8 MiB
   cache budget. Block sizes 4/16 KiB and disabled-cache controls are included.
 - Clean data and overlapping SSTs with overwritten values and 25% deleted keys.
-- Synchronous individual puts and atomic batches of 32/256 operations; 2,048 keys
+- Synchronous individual puts and atomic batches of 32/256 operations; 8,192 keys
   per run. WAL commit time and final flush time are reported separately.
 - Full compaction of copied churn fixtures, with before/after file allocation.
 
 Four trials alternate backend-first order; scenarios rotate and seeds match.
 Results include paired speed-ratio median/min/max, not a confidence interval.
-Fixtures, file-cache warming, statistics and reporting are outside operation
-timing. Each measured read process reopens a fixture, starts with a fresh DB
+Fixtures, copying, file-cache warming, statistics and reporting are outside operation
+timing. Each measured read process opens a fresh copy of the same pristine fixture,
+preventing RocksDB diagnostic-log accumulation or WAL rotation from changing
+later trials' file sizes. It starts with a fresh DB
 block cache, then repeats exactly the same trace. OS cache is warmed for both;
 the first pass is **not** a cold-device measurement.
 
@@ -53,11 +55,14 @@ blocks; this engine bypasses the cache entirely. Both check data integrity.
 RocksDB iterators provide their normal consistent view; engine scans copy matching
 memory keys and pin SST handles. Read fixtures are flushed before timing.
 
-Point latency samples time only the API call. Scan latency includes validation
+Each point pass issues 100,000 reads in total; range passes issue 512 short or
+256 long scans. Point latency samples time only the API call. Scan latency includes validation
 and row destruction as well as the scan. Throughput includes RNG, checks and
 value destruction; four-thread throughput also includes startup/join. Do not
 compare scan-query ops/s with point ops/s; scan row counts are reported separately.
 Writes include native batch construction from the same prebuilt bounded trace.
+Percentiles include sample counts; p95 is omitted below 20 samples and p99 below
+100. These are sampled empirical percentiles, not a tail-latency guarantee.
 
 RSS/peak RSS include the process/runtime, sample arrays and validation, but read
 peaks exclude fixture creation. Write peaks include input traces. RSS excludes OS

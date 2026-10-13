@@ -65,14 +65,14 @@ def main():
         {"keys": 20000, "value": 128, "block": 16384, "cache": 0, "churn": False},
         {"keys": 20000, "value": 128, "block": 16384, "cache": 8388608, "churn": True},
     ]
-    query_count = 64 if args.smoke else 20000
+    query_count = 64 if args.smoke else 100000
     scenarios = [
         {"workload": "uniform", "queries": query_count},
         {"workload": "hot", "queries": query_count},
         {"workload": "miss", "queries": query_count},
         {"workload": "uniform", "queries": query_count // 4, "threads": 4},
-        {"workload": "scan", "span": 16 if args.smoke else 32, "queries": 8 if args.smoke else 128},
-        {"workload": "scan", "span": 64 if args.smoke else 512, "queries": 4 if args.smoke else 64},
+        {"workload": "scan", "span": 16 if args.smoke else 32, "queries": 8 if args.smoke else 512},
+        {"workload": "scan", "span": 64 if args.smoke else 512, "queries": 4 if args.smoke else 256},
     ]
     records = []
     environment = {
@@ -86,7 +86,7 @@ def main():
             "read_layout": "Identical logical public-API write history; automatic compaction disabled; physical SST counts may differ",
             "write_layout": "Each engine's normal background compaction; no compression; 4 MiB memtable target",
             "scan_cache": "No fill on either backend; existing cached blocks may still benefit RocksDB",
-            "cache_state": "Warm OS file cache before every read process; fresh engine cache on first pass; same trace repeated",
+            "cache_state": "Pristine fixture copy and warm OS file cache before every read process; fresh engine cache on first pass; same trace repeated",
             "latency": "Point latency samples API call only; scan latency includes iterator creation, consumption and validation",
             "throughput": "Includes RNG, correctness checks, owned value drop; concurrent reads include thread setup/join",
             "memory": "Read RSS/HWM excludes fixture creation but includes harness/runtime; OS page cache excluded",
@@ -136,8 +136,13 @@ def main():
                         config = dict(profile, **scenario, seed=7919 + trial * 104729)
                         names = list(binaries) if trial % 2 else list(reversed(binaries))
                         for order, name in enumerate(names, 1):
-                            warm(fixtures[name])
-                            run(name, "read", fixtures[name], config, case, label, trial, order)
+                            # Writable opens can rotate WALs/accumulate diagnostic
+                            # logs. Keep every measured process at identical history.
+                            copy = root / f"read-{profile_index}-{trial}-{name}"
+                            shutil.copytree(fixtures[name], copy)
+                            warm(copy)
+                            run(name, "read", copy, config, case, label, trial, order)
+                            shutil.rmtree(copy)
                     if profile["churn"]:
                         for order, name in enumerate(names, 1):
                             copy = root / f"compact-{profile_index}-{trial}-{name}"
@@ -150,7 +155,7 @@ def main():
                     names = list(binaries) if trial % 2 else list(reversed(binaries))
                     for order, name in enumerate(names, 1):
                         directory = root / f"write-{batch}-{trial}-{name}"
-                        config = {"keys": 64 if args.smoke else 2048, "value": 128, "batch": batch,
+                        config = {"keys": 64 if args.smoke else 8192, "value": 128, "batch": batch,
                                   "fixed": False, "workload": "put" if batch == 1 else "batch"}
                         run(name, "write", directory, config, "durable-write", f"batch-{batch}", trial, order)
     result = summarize(records)

@@ -127,7 +127,7 @@ fn distribution(samples: &mut [u64]) -> Value {
             .get(samples.len().saturating_sub(1) * n / 100)
             .map(|v| *v as f64 / 1000.0)
     };
-    json!({"samples":samples.len(),"p50_us":p(50),"p95_us":p(95),"p99_us":p(99)})
+    json!({"samples":samples.len(),"p50_us":p(50),"p95_us":if samples.len()>=20 {p(95)} else {None},"p99_us":if samples.len()>=100 {p(99)} else {None}})
 }
 fn report(stage: &str, config: &Value, fields: Value) {
     println!(
