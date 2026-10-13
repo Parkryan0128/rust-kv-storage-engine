@@ -68,6 +68,30 @@ fn empty_cleared_and_volatile_batches() {
 }
 
 #[test]
+fn delete_only_batch_keeps_its_sequence_after_empty_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(dir.path()).unwrap();
+    db.put(b"old", b"value").unwrap();
+    db.flush().unwrap();
+    let mut batch = WriteBatch::new();
+    batch.delete("old").delete("missing").delete("old");
+    db.write_batch(batch).unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.stats().sst_records, 0);
+    drop(db);
+    let db = Engine::open(dir.path()).unwrap();
+    assert_eq!(db.stats().sequence, 4);
+    assert!(db.get(b"old").unwrap().is_none());
+    let mut batch = WriteBatch::new();
+    batch.put("new", "value");
+    db.write_batch(batch).unwrap();
+    drop(db);
+    let db = Engine::open(dir.path()).unwrap();
+    assert_eq!(db.stats().sequence, 5);
+    assert_eq!(db.get(b"new").unwrap().unwrap(), "value");
+}
+
+#[test]
 fn invalid_later_entries_reject_the_whole_batch_without_touching_wal() {
     let dir = tempfile::tempdir().unwrap();
     let db = Engine::open_with_options(

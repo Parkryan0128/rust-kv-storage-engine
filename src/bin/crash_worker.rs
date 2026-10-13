@@ -69,9 +69,11 @@ fn main() {
         }
         return;
     }
-    if mode == "error" {
+    if mode == "error" || mode == "compact-error" {
         std::env::set_var("KV_FAIL_ACTION", "error");
-        let result = if a[3].starts_with("wal_") {
+        let result = if mode == "compact-error" {
+            e.compact()
+        } else if a[3].starts_with("wal_") {
             e.put(b"uncertain", b"v")
         } else {
             e.flush()

@@ -158,7 +158,9 @@ Process-kill tests leave the OS cache intact; physical power loss has not been t
 Batch tests cover repeated keys, validation and sequence limits, concurrent
 writes/flushes, every truncation boundary in a small WAL batch, corrupt batch
 payloads, and subprocess crashes or injected I/O errors before/after WAL sync
-and during memory application.
+and during memory application. They also cover acknowledged batches across
+flush/compaction publication failures, maintenance errors racing with writes,
+and sequence preservation after compacting a delete-only batch to an empty SST.
 
 ## Benchmarks
 

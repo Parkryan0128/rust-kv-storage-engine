@@ -654,7 +654,16 @@ impl Core {
         }
         Ok(())
     }
-    fn prepare_write(&self, w: &mut Option<Wal>) -> Result<()> {
+    // The caller holds the writer barrier, so no other write can consume these
+    // sequence numbers. Reject exhaustion before waiting or rotating the WAL.
+    fn prepare_write(&self, w: &mut Option<Wal>, operations: u64) -> Result<u64> {
+        let end = {
+            let s = self.state.read();
+            check(&s)?;
+            s.sequence
+                .checked_add(operations)
+                .ok_or(EngineError::SequenceExhausted)?
+        };
         self.wait_room()?;
         // Rotate first so a rotation error cannot fail an already-applied write.
         if self.disk.is_some()
@@ -668,7 +677,7 @@ impl Core {
             }
             self.wake();
         }
-        Ok(())
+        Ok(end)
     }
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         if batch.is_empty() {
@@ -679,15 +688,8 @@ impl Core {
         }
         let size = batch.encoded_len()?;
         let mut w = self.writer.lock();
-        let start = {
-            let s = self.state.read();
-            check(&s)?;
-            s.sequence
-        };
-        let end = start
-            .checked_add(batch.len() as u64)
-            .ok_or(EngineError::SequenceExhausted)?;
-        self.prepare_write(&mut w)?;
+        let end = self.prepare_write(&mut w, batch.len() as u64)?;
+        let start = end - batch.len() as u64;
         if let Some(wal) = w.as_mut() {
             if let Err(e) = wal.append_batch(&batch, start + 1, size) {
                 self.poison(&e);
@@ -696,7 +698,12 @@ impl Core {
         }
         // The writer barrier also excludes flush/rotation; a single state lock
         // publishes all operations, including repeated keys, as one change.
+        #[cfg(test)]
+        crate::test_hooks::pause("write_before_publish");
         let mut s = self.state.write();
+        // Maintenance can fail while WAL I/O runs without the state lock.
+        // Keep that failure visible; the synced batch may reappear on reopen.
+        check(&s)?;
         for (i, entry) in batch.entries.into_iter().enumerate() {
             let record = Record {
                 seq: start + 1 + i as u64,
@@ -725,13 +732,7 @@ impl Core {
     fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         self.validate_entry(key, value)?;
         let mut w = self.writer.lock();
-        self.prepare_write(&mut w)?;
-        let seq = self
-            .state
-            .read()
-            .sequence
-            .checked_add(1)
-            .ok_or(EngineError::SequenceExhausted)?;
+        let seq = self.prepare_write(&mut w, 1)?;
         let record = Record {
             seq,
             value: value.map(Bytes::copy_from_slice),
@@ -742,7 +743,10 @@ impl Core {
                 return Err(e);
             }
         }
+        #[cfg(test)]
+        crate::test_hooks::pause("write_before_publish");
         let mut s = self.state.write();
+        check(&s)?;
         if self.disk.is_none() && record.value.is_none() {
             // No older on-disk values exist to hide in a volatile engine.
             s.mem.remove(key);
@@ -900,6 +904,10 @@ impl Core {
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod batch_tests;
+
+#[cfg(test)]
+#[path = "write_tests.rs"]
+mod write_tests;
 
 #[cfg(test)]
 mod audit_tests {
