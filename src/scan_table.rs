@@ -1,0 +1,98 @@
+use super::*;
+use crate::scan::KeyRange;
+use std::ops::Bound;
+
+pub(crate) struct TableScan {
+    table: Arc<Table>,
+    range: Arc<KeyRange>,
+    next_block: usize,
+    block: Option<ReadBlock>,
+    record: usize,
+    seek: bool,
+    done: bool,
+}
+
+impl Table {
+    pub fn scan(self: &Arc<Self>, range: Arc<KeyRange>) -> TableScan {
+        let next_block = match &range.start {
+            Bound::Included(start) | Bound::Excluded(start) => self
+                .index
+                .partition_point(|entry| entry.first <= *start)
+                .saturating_sub(1),
+            Bound::Unbounded => 0,
+        };
+        TableScan {
+            table: self.clone(),
+            range,
+            next_block,
+            block: None,
+            record: 0,
+            seek: true,
+            done: false,
+        }
+    }
+}
+
+impl TableScan {
+    pub fn next_record(&mut self, counters: &Counters) -> Result<Option<(Vec<u8>, Record)>> {
+        while !self.done {
+            if let Some(block) = &self.block {
+                if self.record < block.record_count() {
+                    let record = block.record_at(self.record)?;
+                    if !self.range.allows_end(record.key) {
+                        self.done = true;
+                        self.block = None;
+                        return Ok(None);
+                    }
+                    self.record += 1;
+                    return Ok(Some((record.key.to_vec(), record.to_owned())));
+                }
+            }
+            let Some(entry) = self.table.index.get(self.next_block) else {
+                break;
+            };
+            if !self.range.allows_end(&entry.first) {
+                break;
+            }
+            let (mut bytes, offsets) = self
+                .block
+                .take()
+                .map(ReadBlock::into_buffers)
+                .unwrap_or_default();
+            let len = entry.len as usize;
+            // Do not retain a large-record buffer for the rest of a sparse scan.
+            if bytes.capacity() > len.saturating_mul(2) {
+                bytes = Vec::new();
+            }
+            resize_frame(&mut bytes, len);
+            counters.reads.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            crate::test_hooks::pause("scan_before_block_read");
+            self.table.file.read_exact_at(&mut bytes, entry.offset)?;
+            let block = self.table.decode(self.next_block, bytes, offsets)?;
+            self.record = 0;
+            if self.seek {
+                if let Bound::Included(start) | Bound::Excluded(start) = &self.range.start {
+                    let excluded = matches!(&self.range.start, Bound::Excluded(_));
+                    let (mut lo, mut hi) = (0, block.record_count());
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let key = block.record_at(mid)?.key;
+                        if key < start.as_slice() || (excluded && key == start.as_slice()) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    self.record = lo;
+                }
+                self.seek = false;
+            }
+            self.next_block += 1;
+            self.block = Some(block);
+        }
+        self.done = true;
+        self.block = None;
+        Ok(None)
+    }
+}

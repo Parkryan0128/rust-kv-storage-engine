@@ -80,7 +80,36 @@ limited to 64 MiB (including headers). A batch is never split across memtables a
 can exceed the memtable target. Older binaries cannot replay WALs containing
 batches; keep a closed-database backup before upgrading if rollback is needed.
 
-Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads. Transactions, range scans, and replication are not implemented.
+Read a range in ascending bytewise key order:
+
+```rust
+for row in db.scan(b"user:1".as_slice()..b"user:9".as_slice())?.take(100) {
+    let (key, value) = row?;
+    // Use this key/value pair.
+}
+```
+
+`scan(start..end)` includes the start and excludes the end. Use `..=end` for an
+inclusive end, `start..` or `..end` for an open end, and `scan(..)` for all keys.
+A pair of `std::ops::Bound` values also supports an excluded start. Reversed
+bounds return `InvalidConfig`; equal endpoints are empty unless both are included.
+Ordering uses raw bytes, so `user:10` sorts before `user:2`.
+
+Each owned `Scan` captures a snapshot when created, including whole atomic batches.
+Later puts, deletes, flushes and compactions do not change its results. Duplicate
+versions are merged and deleted keys are omitted. SST blocks are read lazily,
+bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
+ends the iterator after reporting the error, possibly after some successful rows.
+
+Snapshot creation copies matching in-memory keys and shares their value bytes
+under the state lock; larger memory ranges can delay writers during this step.
+Iteration buffers one block and candidate record per SST, rather than all disk
+results. `.take(n)` limits consumption; `.collect()` allocates the full result.
+Drop or exhaust scans promptly: they retain the database lock and old SST handles,
+which can delay reclaiming disk space after compaction. They also keep selected
+memory values alive. Transactions and replication are not implemented.
+
+Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads.
 
 [Storage format and configuration](docs/storage-format.md)
 
@@ -161,6 +190,11 @@ payloads, and subprocess crashes or injected I/O errors before/after WAL sync
 and during memory application. They also cover acknowledged batches across
 flush/compaction publication failures, maintenance errors racing with writes,
 and sequence preservation after compacting a delete-only batch to an empty SST.
+
+Range tests cover binary and empty keys, inclusive/exclusive bounds, duplicate
+versions and tombstones across memory and disk, snapshots during writes and
+compaction, legacy SST formats, deferred corruption/I/O errors, cache isolation,
+and comparison with a filtered `BTreeMap` through batches, flushes and reopens.
 
 ## Benchmarks
 

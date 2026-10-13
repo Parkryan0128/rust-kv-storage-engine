@@ -7,6 +7,7 @@ use crate::{
     inspection::{Inspection, MemtableInfo, RecordPreview, TableInfo},
     manifest::Manifest,
     memtable::{MemTable, Record},
+    scan::{KeyRange, Scan},
     sstable::{sync_dir, Table},
     wal::Wal,
     WriteBatch,
@@ -17,8 +18,9 @@ use fs2::FileExt;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
+    ops::RangeBounds,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -410,6 +412,56 @@ impl Engine {
             }
         }
         Ok(newest.and_then(|r| r.value))
+    }
+    /// Scan a point-in-time range in ascending bytewise key order.
+    ///
+    /// Bounds are byte slices: `start..end`, `start..=end`, `start..`, `..end`,
+    /// `..`, or a pair of `std::ops::Bound` values. Reversed bounds return
+    /// `InvalidConfig`; equal bounds are empty unless both ends are included.
+    ///
+    /// Creation copies matching in-memory keys and shares their immutable value
+    /// bytes under the state lock. SST data is read lazily without that lock
+    /// and without polluting the point-read cache. Handle each iterator item's
+    /// `Result`: a disk error ends the scan, potentially after earlier results.
+    /// Drop or exhaust the scan to release pinned files and the database lock.
+    ///
+    /// ```
+    /// use rust_kv_storage_engine::{Engine, Result};
+    /// let db = Engine::new();
+    /// db.put(b"user:1", b"Ryan")?;
+    /// db.put(b"user:2", b"Sam")?;
+    /// let rows = db.scan(b"user:1".as_slice()..b"user:3".as_slice())?
+    ///     .collect::<Result<Vec<_>>>()?;
+    /// assert_eq!(rows.len(), 2);
+    /// let all = db.scan(..)?.take(10).collect::<Result<Vec<_>>>()?;
+    /// # Ok::<(), rust_kv_storage_engine::EngineError>(())
+    /// ```
+    pub fn scan<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> Result<Scan> {
+        let range = KeyRange::new(range)?;
+        let s = self.inner.core.state.read();
+        check(&s)?;
+        if range.is_empty() {
+            return Ok(Scan::empty());
+        }
+        let mut memory: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
+        for mem in std::iter::once(&s.mem).chain(s.immutable.iter().map(|f| &f.mem)) {
+            for (key, record) in mem.data.range::<[u8], _>(range.bounds()) {
+                memory
+                    .entry(key.clone())
+                    .and_modify(|old| {
+                        if record.seq > old.seq {
+                            *old = record.clone();
+                        }
+                    })
+                    .or_insert_with(|| record.clone());
+            }
+        }
+        let tables = s.tables.clone();
+        drop(s);
+        Ok(Scan::new(self.clone(), memory, &tables, range))
+    }
+    pub(crate) fn scan_counters(&self) -> &Counters {
+        &self.inner.core.counters
     }
     /// Flush writes before the writer barrier, then drain eligible compactions.
     pub fn flush(&self) -> Result<()> {
@@ -908,6 +960,10 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "write_tests.rs"]
 mod write_tests;
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod scan_tests;
 
 #[cfg(test)]
 mod audit_tests {

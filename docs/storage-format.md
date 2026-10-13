@@ -66,6 +66,31 @@ Strict key ordering lets validation check the next-block upper bound once per
 block. Block splitting includes encoded record lengths and the persisted directory,
 separately from memtable memory charges.
 
+## Range snapshots
+
+`Engine::scan()` copies matching active/frozen memtable keys and shares immutable
+value bytes while holding the state read lock. It captures the SST list under
+that same lock, so it observes one consistent state, including all or none of a
+batch. After creation, the owned iterator requires no engine state lock for I/O.
+Later writes or maintenance failures do not change an already captured snapshot.
+
+Each SST iterator seeks through the index to the lower-bound block, then searches
+within that block. It streams forward up to the upper bound, retaining one encoded
+block and a candidate record per source. A min-heap merges sources by key, chooses
+the highest sequence number, and omits tombstones. Scans use the existing validated
+block decoder for all supported SST versions and do not change any file format.
+They bypass the point-read cache; disk reads still increment `stats().block_reads`.
+Errors are iterator items and terminate the scan; earlier rows may already have
+been returned. Exhausted or failed iterators always return `None` thereafter.
+
+Creating a large memory snapshot can delay writers and allocates copied keys plus
+map entries, while values share immutable bytes. Disk buffering grows with the
+number of SSTs and their block sizes; it is not a fixed process-memory limit.
+The iterator holds an engine handle and its open SSTs until drop, error or
+exhaustion. Compaction can unlink old files, but those handles delay reclaiming
+their space; `sst_bytes` counts current live tables, not unlinked pinned files.
+Drop long-lived or partially consumed scans before reopening the database.
+
 ## Combining files
 
 Compaction merges SSTables and keeps the newest record for each key.

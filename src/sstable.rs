@@ -25,6 +25,9 @@ const MAGIC: &[u8; 8] = b"RKVSST03";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
+#[path = "scan_table.rs"]
+mod scan_table;
+pub(crate) use scan_table::TableScan;
 #[cfg(test)]
 #[path = "read_profile.rs"]
 mod read_profile;
@@ -724,6 +727,16 @@ mod tests {
         db.flush().unwrap();
         assert_eq!(db.get(b"old").unwrap().unwrap(), "v2");
         assert_eq!(db.get(b"new").unwrap().unwrap(), "v3");
+        assert_eq!(
+            db.scan(b"new".as_slice()..=b"old".as_slice())
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            [
+                (b"new".to_vec(), Bytes::from_static(b"v3")),
+                (b"old".to_vec(), Bytes::from_static(b"v2"))
+            ]
+        );
         db.compact().unwrap();
         drop(db);
         let db = Engine::open(dir.path()).unwrap();
@@ -784,6 +797,13 @@ mod tests {
         db.put(b"b", b"new").unwrap();
         db.flush().unwrap();
         assert_eq!(db.stats().sst_files, 2);
+        assert_eq!(
+            db.scan(..).unwrap().collect::<Result<Vec<_>>>().unwrap(),
+            [
+                (b"a".to_vec(), Bytes::from_static(b"old")),
+                (b"b".to_vec(), Bytes::from_static(b"new"))
+            ]
+        );
         db.compact().unwrap();
         drop(db);
         let db = Engine::open(dir.path()).unwrap();

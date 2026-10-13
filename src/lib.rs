@@ -25,6 +25,7 @@ mod memtable;
 mod read_fixture;
 #[cfg(test)]
 mod read_path_tests;
+mod scan;
 mod sstable;
 #[cfg(test)]
 mod test_hooks;
@@ -34,3 +35,4 @@ pub use compaction::CompactionStyle;
 pub use engine::{Engine, KvEngine, Options, Result, Stats};
 pub use error::EngineError;
 pub use inspection::{Inspection, MemtableInfo, RecordPreview, TableInfo};
+pub use scan::Scan;
