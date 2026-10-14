@@ -93,3 +93,24 @@ On the pressure case, background work can continue between the end of timing and
 those snapshots. All three backends retain synchronous WAL durability and disable
 compression. Shared CI timing includes scheduling and storage stalls; report the
 trial spread and latency tails alongside throughput, not a universal winner.
+
+## Compaction comparison
+
+The same workflow additionally runs `compactions.py` when the commit contains
+`[compact-perf]` or manual dispatch enables `compaction`. The focused write cases
+also run, using the pre-push commit as baseline (or the selected manual baseline).
+
+Three fixtures cover disjoint 128-byte values, four generations overwriting
+128-byte values, and four generations overwriting 4096-byte values. Overwrite
+fixtures delete one quarter of keys in the last generation. Preparation uses
+64 MiB memtables and an explicit flush per generation with automatic compaction
+disabled. Neither backend uses compression.
+
+Baseline/current receive copies of the exact same baseline-generated engine
+files; RocksDB receives the same logical history in its native format. Each of
+six trials uses pristine copies, warms OS file cache outside timing, and rotates
+backend order. Timing covers explicit compaction, including its sync/metadata
+work. A fresh process records RSS/peak RSS before correctness reads. Every key is
+checked after compaction and reopen. Baseline/current output SST names, lengths
+and SHA-256 hashes must match. Report time spread as well as medians; differing
+RocksDB layouts/policies and shared-host storage waits limit generalization.

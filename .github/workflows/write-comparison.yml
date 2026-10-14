@@ -5,8 +5,12 @@ on:
       baseline:
         description: Baseline commit supporting WriteBatch (same harness is copied into it)
         required: true
-        default: fb50a48a9266a5e2d76adcbefdd3c4e40f6a6b61
+        default: 6fd6cfbe785777b7890dbd6a888145034fd4e39f
         type: string
+      compaction:
+        description: Also compare compaction on identical engine fixtures and matched RocksDB history
+        default: false
+        type: boolean
   push:
     branches: [main]
 permissions:
@@ -16,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   compare:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -58,3 +62,15 @@ jobs:
         with:
           name: write-comparison
           path: write-results/
+      - name: Compare compaction with disjoint and overwritten values
+        if: inputs.compaction || contains(github.event.head_commit.message, '[compact-perf]')
+        timeout-minutes: 8
+        run: python3 benchmarks/rocksdb-compare/compactions.py compaction-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compaction-comparison
+          path: compaction-results/
+          if-no-files-found: ignore

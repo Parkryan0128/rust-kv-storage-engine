@@ -28,6 +28,9 @@ const INDEX_PAGE_TARGET: usize = 1024 * 1024;
 #[path = "scan_table.rs"]
 mod scan_table;
 pub(crate) use scan_table::TableScan;
+#[path = "compaction_cursor.rs"]
+mod compaction_cursor;
+pub(crate) use compaction_cursor::TableCursor;
 #[cfg(test)]
 #[path = "read_profile.rs"]
 mod read_profile;

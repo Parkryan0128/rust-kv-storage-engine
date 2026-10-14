@@ -20,6 +20,7 @@ struct Config {
     block: usize,
     cache: usize,
     memtable: usize,
+    generations: usize,
     queries: usize,
     seed: u64,
     fixed: bool,
@@ -38,6 +39,7 @@ impl Config {
             block: n("block", 16384) as usize,
             cache: n("cache", 8 * 1024 * 1024) as usize,
             memtable: n("memtable", 4 * 1024 * 1024) as usize,
+            generations: n("generations", 4) as usize,
             queries: n("queries", 20000) as usize,
             seed: n("seed", 7919),
             fixed: v["fixed"].as_bool().unwrap_or(true),
@@ -57,6 +59,7 @@ impl Config {
         );
         assert!(c.span > 0 && c.span <= c.keys);
         assert!(c.memtable > 0);
+        assert!((1..=16).contains(&c.generations));
         c
     }
 }
@@ -203,6 +206,84 @@ fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
     }
     Ok(samples)
 }
+
+fn prepare_merge(path: &Path, c: &Config) -> Result<()> {
+    assert!(!path.exists() && c.fixed);
+    let db = Backend::open(path, c)?;
+    for generation in 0..c.generations {
+        let mut entries = Vec::new();
+        for i in 0..c.keys {
+            if !c.churn && i % c.generations as u64 != generation as u64 {
+                continue;
+            }
+            entries.push((
+                key(i).to_vec(),
+                if c.churn && generation + 1 == c.generations && i.is_multiple_of(4) {
+                    None
+                } else {
+                    Some(value(
+                        i,
+                        if c.churn { generation as u8 } else { 0 },
+                        c.value,
+                    ))
+                },
+            ));
+            if entries.len() == 256 {
+                db.batch(&entries)?;
+                entries.clear();
+            }
+        }
+        if !entries.is_empty() {
+            db.batch(&entries)?;
+        }
+        db.flush()?;
+    }
+    println!(
+        "WORKLOAD_PREPARED {}",
+        json!({"stats":db.stats()?,"metrics":metrics(path)?})
+    );
+    verify_merge(&db, c)
+}
+
+fn verify_merge(db: &Backend, c: &Config) -> Result<()> {
+    for i in 0..c.keys {
+        let got = db.get(&key(i))?;
+        if c.churn && i.is_multiple_of(4) {
+            assert!(got.is_none(), "deleted key {i}");
+        } else {
+            let expected = value(
+                i,
+                if c.churn {
+                    (c.generations - 1) as u8
+                } else {
+                    0
+                },
+                c.value,
+            );
+            assert_eq!(got.as_deref(), Some(expected.as_slice()), "key {i}");
+        }
+    }
+    Ok(())
+}
+
+fn compact_merge(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(c.fixed);
+    let db = Backend::open(path, c)?;
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let start = Instant::now();
+    db.compact()?;
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "compact-merge",
+        raw,
+        json!({"seconds":seconds,"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    verify_merge(&db, c)?;
+    drop(db);
+    let db = Backend::open(path, c)?;
+    verify_merge(&db, c)
+}
 fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     let before_open = metrics(path)?;
     let start = Instant::now();
@@ -322,6 +403,8 @@ fn main() -> Result<()> {
     let raw: Value = serde_json::from_str(&args[3])?;
     let c = Config::parse(&raw);
     match args[1].as_str() {
+        "prepare-merge" => prepare_merge(path, &c)?,
+        "compact-merge" => compact_merge(path, &c, &raw)?,
         "prepare" => prepare(path, &c)?,
         "read" => reads(path, &c, &raw)?,
         "write" => writes(path, &c, &raw)?,

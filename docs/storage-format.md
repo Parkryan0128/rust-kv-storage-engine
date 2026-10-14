@@ -44,7 +44,7 @@ Versions 01/02 rebuild and validate their offset arrays on each cache miss.
 Only the requested value is copied out, so retaining a
 small returned value does not retain the whole block. Cache accounting includes
 the allocated frame/index capacities and an allowance for cache bookkeeping;
-it is not a hard bound on process RSS. Iteration and compaction still decode
+it is not a hard bound on process RSS. Table inspection still materializes
 complete blocks, without allocating a second full payload buffer.
 
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
@@ -102,7 +102,13 @@ Partial merges keep tombstones so old values in other files stay deleted. A full
 
 `flush()` saves earlier writes and waits for eligible compactions. `compact()` also requests a full merge.
 
-Each merge opens at most four input iterators. Larger requests proceed through
+Each merge retains one validated encoded block per input and compares borrowed
+keys and sequence numbers. Only the winning record is copied for output;
+superseded versions and safely discarded tombstones need no owned copies.
+Input frame buffers are reused, with oversized buffers released on smaller blocks.
+Checksums and record validation still cover discarded versions.
+
+Each merge opens at most four input cursors. Larger requests proceed through
 manifest-published partial merges, retaining tombstones until it is safe to remove
 them. Recovery can resume from any published round. This bounds input block/value
 residency by four inputs rather than the total SST count; it does not cap RSS,

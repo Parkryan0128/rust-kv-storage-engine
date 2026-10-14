@@ -1,13 +1,9 @@
 use crate::{
     memtable::Record,
-    sstable::{Table, TableIter},
+    sstable::{Table, TableCursor},
     Result,
 };
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 pub(crate) const MAX_INPUTS: usize = 4;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompactionStyle {
@@ -52,71 +48,200 @@ fn pick_ids(files: &[(u64, u64)], threshold: usize, style: CompactionStyle) -> V
 }
 
 pub(crate) struct Merge {
-    iters: Vec<TableIter>,
-    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
-    records: Vec<Option<Record>>,
-    error: Option<crate::EngineError>,
+    cursors: Vec<TableCursor>,
+    pending: Vec<usize>,
+    finished: bool,
     drop_tombstones: bool,
 }
 impl Merge {
     pub fn new(tables: &[Arc<Table>], drop_tombstones: bool) -> Result<Self> {
-        let mut m = Self {
-            iters: tables.iter().map(|t| t.iter()).collect(),
-            heap: BinaryHeap::new(),
-            records: vec![None; tables.len()],
-            error: None,
+        Ok(Self {
+            cursors: tables
+                .iter()
+                .cloned()
+                .map(TableCursor::new)
+                .collect::<Result<_>>()?,
+            pending: Vec::with_capacity(tables.len()),
+            finished: false,
             drop_tombstones,
-        };
-        for i in 0..m.iters.len() {
-            m.advance(i)?;
-        }
-        Ok(m)
+        })
     }
-    fn advance(&mut self, i: usize) -> Result<()> {
-        if let Some(item) = self.iters[i].next() {
-            let (key, r) = item?;
-            self.heap.push(Reverse((key, i)));
-            self.records[i] = Some(r);
-        }
-        Ok(())
-    }
-}
-impl Iterator for Merge {
-    type Item = Result<(Vec<u8>, Record)>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(e) = self.error.take() {
-            self.heap.clear();
-            return Some(Err(e));
-        }
+
+    fn next_record(&mut self) -> Result<Option<(Vec<u8>, Record)>> {
         loop {
-            let Reverse((key, i)) = self.heap.pop()?;
-            let mut newest = self.records[i].take().unwrap();
-            if let Err(e) = self.advance(i) {
-                self.error = Some(e);
-                return self.next();
+            while let Some(i) = self.pending.pop() {
+                self.cursors[i].advance()?;
             }
-            while self.heap.peek().is_some_and(|Reverse((k, _))| k == &key) {
-                let Reverse((_, j)) = self.heap.pop().unwrap();
-                let r = self.records[j].take().unwrap();
-                if r.seq > newest.seq {
-                    newest = r;
-                }
-                if let Err(e) = self.advance(j) {
-                    self.error = Some(e);
-                    return self.next();
+            // Fan-in is at most four in the engine. Comparing borrowed heads
+            // avoids heap keys and materializing values for superseded versions.
+            let mut newest: Option<crate::codec::RecordRef<'_>> = None;
+            for (i, cursor) in self.cursors.iter().enumerate() {
+                if let Some(record) = cursor.current()? {
+                    if newest.as_ref().is_none_or(|old| record.key < old.key) {
+                        self.pending.clear();
+                        self.pending.push(i);
+                        newest = Some(record);
+                    } else if let Some(old) = &mut newest {
+                        if record.key == old.key {
+                            self.pending.push(i);
+                            if record.seq > old.seq {
+                                *old = record;
+                            }
+                        }
+                    }
                 }
             }
+            let Some(newest) = newest else {
+                return Ok(None);
+            };
             // Partial merges must keep deletions that hide records in other SSTs.
+            // Advance these cursors only on the next call: the winner still
+            // borrows its block until its sole owned copy has been produced.
             if newest.value.is_some() || !self.drop_tombstones {
-                return Some(Ok((key, newest)));
+                return Ok(Some((newest.key.to_vec(), newest.to_owned())));
             }
         }
     }
 }
 
+impl Iterator for Merge {
+    type Item = Result<(Vec<u8>, Record)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match self.next_record() {
+            Ok(Some(record)) => Some(Ok(record)),
+            result => {
+                self.finished = true;
+                self.cursors.clear();
+                self.pending.clear();
+                result.err().map(Err)
+            }
+        }
+    }
+}
+impl std::iter::FusedIterator for Merge {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn borrowed_merge_selects_newest_across_blocks_and_preserves_partial_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = [
+            vec![
+                (b'a', 9, Some(4096)),
+                (b'b', 1, Some(4096)),
+                (b'c', 8, Some(128)),
+            ],
+            vec![
+                (b'a', 5, Some(128)),
+                (b'b', 12, None),
+                (b'd', 7, Some(128)),
+                (b'y', 100, Some(128)),
+            ],
+            vec![
+                (b'a', 13, None),
+                (b'b', 15, Some(0)),
+                (b'c', 2, Some(8192)),
+                (b'e', 14, None),
+            ],
+            vec![
+                (b'a', 11, Some(128)),
+                (b'c', 16, Some(128)),
+                (b'd', 17, None),
+                (b'e', 4, Some(128)),
+            ],
+        ];
+        let mut model = BTreeMap::<Vec<u8>, Record>::new();
+        let mut tables = Vec::new();
+        for (i, rows) in versions.into_iter().enumerate() {
+            let records: Vec<_> = rows
+                .into_iter()
+                .map(|(key, seq, len)| {
+                    let record = Record {
+                        seq,
+                        value: len.map(|len| Bytes::from(vec![seq as u8; len])),
+                    };
+                    if model.get([key].as_slice()).is_none_or(|old| old.seq < seq) {
+                        model.insert(vec![key], record.clone());
+                    }
+                    (vec![key], record)
+                })
+                .collect();
+            tables.push(Arc::new(
+                Table::write(
+                    &dir.path().join(format!("{i}.sst")),
+                    i as u64,
+                    records.iter().cloned().map(Ok),
+                    records.len() as u64,
+                    64,
+                    10,
+                )
+                .unwrap(),
+            ));
+        }
+        for order in [[0, 1, 2, 3], [3, 0, 2, 1], [1, 3, 0, 2]] {
+            let inputs: Vec<_> = order.map(|i| tables[i].clone()).into();
+            for drop_deletions in [false, true] {
+                let actual = Merge::new(&inputs, drop_deletions)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+                let expected: Vec<_> = model
+                    .iter()
+                    .filter(|(_, r)| !drop_deletions || r.value.is_some())
+                    .map(|(k, r)| (k.clone(), r.clone()))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        let mut empty = Merge::new(&[], true).unwrap();
+        assert!(empty.next().is_none());
+        assert!(empty.next().is_none());
+    }
+
+    #[test]
+    fn corruption_in_a_superseded_block_still_aborts_merge_and_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.sst");
+        let make = |seq| {
+            (b'a'..=b'c').map(move |key| {
+                Ok((
+                    vec![key],
+                    Record {
+                        seq: seq + u64::from(key),
+                        value: Some(Bytes::from(vec![key; 256])),
+                    },
+                ))
+            })
+        };
+        let old = Arc::new(Table::write(&old_path, 1, make(1), 3, 64, 10).unwrap());
+        let new =
+            Arc::new(Table::write(&dir.path().join("new.sst"), 2, make(1000), 3, 64, 10).unwrap());
+        let mut bytes = std::fs::read(&old_path).unwrap();
+        let first_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let second = 8 + crate::codec::HEADER + first_len;
+        bytes[second + crate::codec::HEADER + 18] ^= 1;
+        std::fs::write(&old_path, bytes).unwrap();
+        let tables = [old, new];
+        let mut merge = Merge::new(&tables, true).unwrap();
+        assert_eq!(merge.next().unwrap().unwrap().0, b"a");
+        assert!(matches!(
+            merge.next(),
+            Some(Err(crate::EngineError::Corruption(_)))
+        ));
+        assert!(merge.next().is_none());
+        let output = dir.path().join("merged.sst");
+        assert!(matches!(
+            Table::write(&output, 3, Merge::new(&tables, true).unwrap(), 6, 64, 10),
+            Err(crate::EngineError::Corruption(_))
+        ));
+        assert!(!output.exists());
+    }
 
     #[test]
     fn picker_uses_smallest_ready_bucket_and_oldest_ids() {
