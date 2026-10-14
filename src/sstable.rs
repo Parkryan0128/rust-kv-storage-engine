@@ -1,7 +1,7 @@
 use crate::{
     block::{indexed_records, ReadBlock},
     bloom::Bloom,
-    cache::{Block, Cache, Counters},
+    cache::{Cache, Counters},
     codec::*,
     error::corrupt,
     fault,
@@ -10,6 +10,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use std::{
+    borrow::Borrow,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
@@ -25,6 +26,8 @@ const MAGIC: &[u8; 8] = b"RKVSST03";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
+#[cfg(test)]
+type Block = Vec<(Vec<u8>, Record)>;
 #[path = "scan_table.rs"]
 mod scan_table;
 pub(crate) use scan_table::TableScan;
@@ -57,10 +60,10 @@ fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 impl Table {
-    pub fn write(
+    pub fn write<K: AsRef<[u8]>, R: Borrow<Record>>(
         path: &Path,
         id: u64,
-        records: impl Iterator<Item = Result<(Vec<u8>, Record)>>,
+        records: impl Iterator<Item = Result<(K, R)>>,
         estimate: u64,
         block_size: usize,
         bloom_bits: usize,
@@ -77,25 +80,27 @@ impl Table {
         let mut block = vec![];
         let mut offsets = vec![];
         let mut first = vec![];
-        let mut previous: Option<Vec<u8>> = None;
+        let mut previous: Option<K> = None;
         let mut count = 0;
         let mut max_seq = 0;
         for item in records {
             let (key, r) = item?;
-            if previous.as_ref().is_some_and(|p| p >= &key) {
+            let key_bytes = key.as_ref();
+            let r = r.borrow();
+            if previous.as_ref().is_some_and(|p| p.as_ref() >= key_bytes) {
                 return Err(corrupt("unsorted SST input"));
             }
             if !block.is_empty()
-                && block.len() + r.encoded_len(&key) + (offsets.len() + 1) * 4 + 4 > block_size
+                && block.len() + r.encoded_len(key_bytes) + (offsets.len() + 1) * 4 + 4 > block_size
             {
                 write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
             }
             if block.is_empty() {
-                first = key.clone();
+                first = key_bytes.to_vec();
             }
-            bloom.insert(&key);
+            bloom.insert(key_bytes);
             offsets.push(block.len() as u32);
-            encode_record(&key, &r, &mut block);
+            encode_record(key_bytes, r, &mut block);
             max_seq = max_seq.max(r.seq);
             count += 1;
             previous = Some(key);
@@ -238,6 +243,7 @@ impl Table {
             indexed: magic == MAGIC,
         })
     }
+    #[cfg(test)]
     pub fn block(&self, n: usize) -> Result<Block> {
         let i = &self.index[n];
         let bytes = at(&self.file, i.offset, i.len as usize)?;
@@ -248,6 +254,20 @@ impl Table {
                 Ok((record.key.to_vec(), record.to_owned()))
             })
             .collect()
+    }
+
+    // Sequential readers share buffer reuse and validation without admitting
+    // blocks to the point-read cache. Callers account for their own read stats.
+    fn read_stream_block(&self, n: usize, previous: Option<ReadBlock>) -> Result<ReadBlock> {
+        let entry = &self.index[n];
+        let (mut bytes, offsets) = previous.map(ReadBlock::into_buffers).unwrap_or_default();
+        let len = entry.len as usize;
+        if bytes.capacity() > len.saturating_mul(2) {
+            bytes = Vec::new();
+        }
+        resize_frame(&mut bytes, len);
+        self.file.read_exact_at(&mut bytes, entry.offset)?;
+        self.decode(n, bytes, offsets)
     }
 
     fn decode(&self, n: usize, bytes: Vec<u8>, offsets: Vec<u32>) -> Result<ReadBlock> {
@@ -316,14 +336,6 @@ impl Table {
             b
         };
         block.lookup(key)
-    }
-    pub fn iter(self: &Arc<Self>) -> TableIter {
-        TableIter {
-            table: self.clone(),
-            next_block: 0,
-            block: vec![].into_iter(),
-            failed: false,
-        }
     }
     // Call while holding the same cache mutex used by get's admission check.
     // An old snapshot can still read the file, but cannot refill the cache.
@@ -429,43 +441,92 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
-pub(crate) struct TableIter {
-    table: Arc<Table>,
-    next_block: usize,
-    block: std::vec::IntoIter<(Vec<u8>, Record)>,
-    failed: bool,
-}
-impl Iterator for TableIter {
-    type Item = Result<(Vec<u8>, Record)>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        if let Some(x) = self.block.next() {
-            return Some(Ok(x));
-        }
-        if self.next_block == self.table.index.len() {
-            return None;
-        }
-        match self.table.block(self.next_block) {
-            Ok(b) => {
-                self.next_block += 1;
-                self.block = b.into_iter();
-                self.next()
-            }
-            Err(e) => {
-                self.failed = true;
-                Some(Err(e))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{manifest::Manifest, Engine};
     use bytes::Bytes;
+
+    #[test]
+    fn borrowed_writer_preserves_bytes_and_rejects_unsorted_input() {
+        // The borrowed writer must not require cloning input keys or records.
+        struct Key<'a>(&'a [u8]);
+        impl AsRef<[u8]> for Key<'_> {
+            fn as_ref(&self) -> &[u8] {
+                self.0
+            }
+        }
+        let records = [
+            (
+                vec![],
+                Record {
+                    seq: 1,
+                    value: Some(Bytes::new()),
+                },
+            ),
+            (
+                b"a".to_vec(),
+                Record {
+                    seq: 2,
+                    value: None,
+                },
+            ),
+            (
+                b"b".to_vec(),
+                Record {
+                    seq: 3,
+                    value: Some(Bytes::from(vec![42; 8192])),
+                },
+            ),
+            (
+                b"z".to_vec(),
+                Record {
+                    seq: 4,
+                    value: Some(Bytes::from_static(b"last")),
+                },
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for block_size in [64, 16384] {
+            for count in [0, records.len()] {
+                let owned = dir.path().join(format!("owned-{block_size}-{count}.sst"));
+                let borrowed = dir
+                    .path()
+                    .join(format!("borrowed-{block_size}-{count}.sst"));
+                Table::write(
+                    &owned,
+                    1,
+                    records.iter().take(count).cloned().map(Ok),
+                    1000,
+                    block_size,
+                    10,
+                )
+                .unwrap();
+                let table = Table::write(
+                    &borrowed,
+                    2,
+                    records.iter().take(count).map(|(k, r)| Ok((Key(k), r))),
+                    1000,
+                    block_size,
+                    10,
+                )
+                .unwrap();
+                assert_eq!(table.count, count as u64);
+                assert_eq!(fs::read(owned).unwrap(), fs::read(borrowed).unwrap());
+            }
+        }
+        for (i, order) in [[0, 0], [1, 0]].into_iter().enumerate() {
+            let path = dir.path().join(format!("unsorted-{i}.sst"));
+            let input = order
+                .into_iter()
+                .map(|n| Ok((Key(&records[n].0), &records[n].1)));
+            assert!(matches!(
+                Table::write(&path, 3, input, 2, 64, 10),
+                Err(crate::EngineError::Corruption(_))
+            ));
+            assert!(!path.exists());
+        }
+    }
 
     #[test]
     fn impossible_checksummed_record_counts_are_rejected_at_open() {

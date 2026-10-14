@@ -1,7 +1,7 @@
 use super::*;
 
-// One validated encoded block per input. Values remain borrowed until the
-// merge has selected the winning version; old versions need no owned copies.
+// One validated encoded block per input. Compaction can select a winning
+// version and inspection can truncate a preview before copying any value.
 pub(crate) struct TableCursor {
     table: Arc<Table>,
     next_block: usize,
@@ -35,23 +35,14 @@ impl TableCursor {
                 return Ok(());
             }
         }
-        let Some(entry) = self.table.index.get(self.next_block) else {
+        if self.next_block == self.table.index.len() {
             self.block = None;
             return Ok(());
-        };
-        let (mut bytes, offsets) = self
-            .block
-            .take()
-            .map(ReadBlock::into_buffers)
-            .unwrap_or_default();
-        let len = entry.len as usize;
-        // Release a rare large-record allocation before reading small blocks.
-        if bytes.capacity() > len.saturating_mul(2) {
-            bytes = Vec::new();
         }
-        resize_frame(&mut bytes, len);
-        self.table.file.read_exact_at(&mut bytes, entry.offset)?;
-        self.block = Some(self.table.decode(self.next_block, bytes, offsets)?);
+        self.block = Some(
+            self.table
+                .read_stream_block(self.next_block, self.block.take())?,
+        );
         self.next_block += 1;
         self.record = 0;
         Ok(())

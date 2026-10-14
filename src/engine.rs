@@ -8,7 +8,7 @@ use crate::{
     manifest::Manifest,
     memtable::{MemTable, Record},
     scan::{KeyRange, Scan},
-    sstable::{sync_dir, Table},
+    sstable::{sync_dir, Table, TableCursor},
     wal::Wal,
     WriteBatch,
 };
@@ -418,8 +418,9 @@ impl Engine {
     /// `..`, or a pair of `std::ops::Bound` values. Reversed bounds return
     /// `InvalidConfig`; equal bounds are empty unless both ends are included.
     ///
-    /// Creation copies matching in-memory keys and shares their immutable value
-    /// bytes under the state lock. SST data is read lazily without that lock
+    /// Creation copies matching active keys and shares their immutable value
+    /// bytes under the state lock. Frozen buffers are captured there and merged
+    /// after releasing it. SST data is read lazily without that lock
     /// and without polluting the point-read cache. Handle each iterator item's
     /// `Result`: a disk error ends the scan, potentially after earlier results.
     /// Drop or exhaust the scan to release pinned files and the database lock.
@@ -443,8 +444,18 @@ impl Engine {
             return Ok(Scan::empty());
         }
         let mut memory: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
-        for mem in std::iter::once(&s.mem).chain(s.immutable.iter().map(|f| &f.mem)) {
-            for (key, record) in mem.data.range::<[u8], _>(range.bounds()) {
+        for (key, record) in s.mem.data.range::<[u8], _>(range.bounds()) {
+            memory.insert(key.clone(), record.clone());
+        }
+        let frozen: Vec<_> = s.immutable.iter().cloned().collect();
+        let tables = s.tables.clone();
+        drop(s);
+        // Frozen buffers never change. Pin the same snapshot as active memory
+        // and SSTs, but do their potentially large merge without blocking writes.
+        #[cfg(test)]
+        crate::test_hooks::pause("scan_before_frozen_merge");
+        for frozen in frozen {
+            for (key, record) in frozen.mem.data.range::<[u8], _>(range.bounds()) {
                 memory
                     .entry(key.clone())
                     .and_modify(|old| {
@@ -455,8 +466,6 @@ impl Engine {
                     .or_insert_with(|| record.clone());
             }
         }
-        let tables = s.tables.clone();
-        drop(s);
         Ok(Scan::new(self.clone(), memory, &tables, range))
     }
     pub(crate) fn scan_counters(&self) -> &Counters {
@@ -562,14 +571,20 @@ impl Engine {
                 .cloned()
                 .ok_or_else(|| EngineError::InvalidConfig("table is no longer live".into()))?
         };
-        table
-            .iter()
-            .take(32)
-            .map(|item| {
-                let (key, record) = item?;
-                Ok(RecordPreview::new(&key, &record))
-            })
-            .collect()
+        let mut cursor = TableCursor::new(table)?;
+        let mut preview = Vec::new();
+        while let Some(record) = cursor.current()? {
+            preview.push(RecordPreview::from_parts(
+                record.key,
+                record.seq,
+                record.value,
+            ));
+            if preview.len() == 32 {
+                break;
+            }
+            cursor.advance()?;
+        }
+        Ok(preview)
     }
     pub fn stats(&self) -> Stats {
         let c = &self.inner.core;
@@ -835,11 +850,7 @@ impl Core {
         let table = Arc::new(Table::write(
             &sst_path(dir, id),
             id,
-            frozen
-                .mem
-                .data
-                .iter()
-                .map(|(k, r)| Ok((k.clone(), r.clone()))),
+            frozen.mem.data.iter().map(Ok),
             frozen.mem.data.len() as u64,
             self.options.block_size,
             self.options.bloom_filter_bits_per_key,

@@ -10,15 +10,16 @@ pub struct RecordPreview {
 }
 impl RecordPreview {
     pub(crate) fn new(key: &[u8], record: &Record) -> Self {
+        Self::from_parts(key, record.seq, record.value.as_deref())
+    }
+
+    pub(crate) fn from_parts(key: &[u8], sequence: u64, value: Option<&[u8]>) -> Self {
         Self {
             key: key[..key.len().min(128)].to_vec(),
             key_len: key.len(),
-            value: record
-                .value
-                .as_ref()
-                .map(|v| v[..v.len().min(128)].to_vec()),
-            value_len: record.value.as_ref().map_or(0, |v| v.len()),
-            sequence: record.seq,
+            value: value.map(|v| v[..v.len().min(128)].to_vec()),
+            value_len: value.map_or(0, <[u8]>::len),
+            sequence,
         }
     }
 }

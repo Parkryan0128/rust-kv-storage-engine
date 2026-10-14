@@ -101,8 +101,10 @@ versions are merged and deleted keys are omitted. SST blocks are read lazily,
 bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
 ends the iterator after reporting the error, possibly after some successful rows.
 
-Snapshot creation copies matching in-memory keys and shares their value bytes
-under the state lock; larger memory ranges can delay writers during this step.
+Snapshot creation copies matching active-buffer keys and shares their value bytes
+under the state lock; larger active ranges can delay writers during this step.
+Frozen buffers and SST handles are captured in the same snapshot; frozen-buffer
+merging runs after releasing the lock.
 Iteration buffers one block and candidate record per SST, rather than all disk
 results. `.take(n)` limits consumption; `.collect()` allocates the full result.
 Drop or exhaust scans promptly: they retain the database lock and old SST handles,

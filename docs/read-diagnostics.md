@@ -12,9 +12,9 @@ not a performance threshold enforced by ordinary tests.
 
 After the encoded-block cache optimization, the public Get sweep uses the new
 production path. The materialized-block phase and control continue to measure
-`Table::block`, used by table inspection, to preserve the original diagnostic.
-Compaction now streams encoded blocks and copies only surviving records, so this
-control no longer represents its current allocation path.
+the test-only `Table::block` helper to preserve the original diagnostic.
+Compaction and inspection now stream encoded blocks and copy only surviving
+records or bounded previews, so this control represents their old allocation path.
 Use the paired RocksDB benchmark for end-to-end performance comparisons.
 
 Fixtures contain one million eight-byte keys and 128-byte values. They are
@@ -36,9 +36,9 @@ All timed query variants validate returned values. OS file cache is retained.
   binary search/value cloning; and buffer/record destruction. Phase timers
   add overhead and alter temporary-buffer lifetimes, so proportions are
   approximate. Full decoding duplicates the production validation logic for
-  instrumentation; the separate baseline below calls production `Table::block`.
+  instrumentation; the separate baseline below calls test-only `Table::block`.
 - **Materialization control:** on the same query sequence and file, compare
-  production `Table::block` plus lookup against a diagnostic implementation
+  test-only `Table::block` plus lookup against a diagnostic implementation
   that traverses borrowed record slices and copies only the requested value.
   Both read and checksum the entire frame and validate all record headers,
   order, sequence bounds and block boundaries. Queries force cache misses;

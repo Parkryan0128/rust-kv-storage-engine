@@ -1,4 +1,4 @@
-use crate::{block::ReadBlock, memtable::Record};
+use crate::block::ReadBlock;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -6,7 +6,6 @@ use std::{
         Arc,
     },
 };
-pub(crate) type Block = Vec<(Vec<u8>, Record)>;
 type Key = (u64, usize);
 const NONE: usize = usize::MAX;
 const ENTRY_OVERHEAD: usize = 96;
@@ -171,6 +170,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memtable::Record;
     use bytes::Bytes;
 
     fn block(value_len: usize) -> Arc<ReadBlock> {

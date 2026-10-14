@@ -54,22 +54,12 @@ impl TableScan {
             if !self.range.allows_end(&entry.first) {
                 break;
             }
-            let (mut bytes, offsets) = self
-                .block
-                .take()
-                .map(ReadBlock::into_buffers)
-                .unwrap_or_default();
-            let len = entry.len as usize;
-            // Do not retain a large-record buffer for the rest of a sparse scan.
-            if bytes.capacity() > len.saturating_mul(2) {
-                bytes = Vec::new();
-            }
-            resize_frame(&mut bytes, len);
             counters.reads.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             crate::test_hooks::pause("scan_before_block_read");
-            self.table.file.read_exact_at(&mut bytes, entry.offset)?;
-            let block = self.table.decode(self.next_block, bytes, offsets)?;
+            let block = self
+                .table
+                .read_stream_block(self.next_block, self.block.take())?;
             self.record = 0;
             if self.seek {
                 if let Bound::Included(start) | Bound::Excluded(start) = &self.range.start {

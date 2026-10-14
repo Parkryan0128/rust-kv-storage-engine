@@ -44,8 +44,8 @@ Versions 01/02 rebuild and validate their offset arrays on each cache miss.
 Only the requested value is copied out, so retaining a
 small returned value does not retain the whole block. Cache accounting includes
 the allocated frame/index capacities and an allowance for cache bookkeeping;
-it is not a hard bound on process RSS. Table inspection still materializes
-complete blocks, without allocating a second full payload buffer.
+it is not a hard bound on process RSS. Table inspection reads one encoded block
+at a time and copies only the preview's first 128 bytes of each key/value.
 
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
 order through indexed links rather than a tree. When a miss requires eviction,
@@ -68,10 +68,12 @@ separately from memtable memory charges.
 
 ## Range snapshots
 
-`Engine::scan()` copies matching active/frozen memtable keys and shares immutable
-value bytes while holding the state read lock. It captures the SST list under
-that same lock, so it observes one consistent state, including all or none of a
-batch. After creation, the owned iterator requires no engine state lock for I/O.
+`Engine::scan()` copies matching active memtable keys and shares immutable value
+bytes while holding the state read lock. It captures frozen-buffer handles and
+the SST list under that same lock, so it observes one consistent state, including
+all or none of a batch. Frozen buffers are merged after releasing the lock;
+their captured handles remain valid across concurrent flushes and compactions.
+After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
 
 Each SST iterator seeks through the index to the lower-bound block, then searches
@@ -83,9 +85,10 @@ They bypass the point-read cache; disk reads still increment `stats().block_read
 Errors are iterator items and terminate the scan; earlier rows may already have
 been returned. Exhausted or failed iterators always return `None` thereafter.
 
-Creating a large memory snapshot can delay writers and allocates copied keys plus
-map entries, while values share immutable bytes. Disk buffering grows with the
-number of SSTs and their block sizes; it is not a fixed process-memory limit.
+Copying a large active-buffer snapshot can still delay writers. The complete
+memory snapshot allocates copied keys plus map entries, while values share
+immutable bytes. Disk buffering grows with the number of SSTs and their block
+sizes; it is not a fixed process-memory limit.
 The iterator holds an engine handle and its open SSTs until drop, error or
 exhaustion. Compaction can unlink old files, but those handles delay reclaiming
 their space; `sst_bytes` counts current live tables, not unlinked pinned files.
@@ -94,6 +97,10 @@ Drop long-lived or partially consumed scans before reopening the database.
 ## Combining files
 
 Compaction merges SSTables and keeps the newest record for each key.
+
+Flush writes borrow keys and records directly from the frozen memtable. The SST
+writer accepts both borrowed flush input and owned compaction output, preserving
+the same ordering checks, encoding and checksums without temporary flush copies.
 
 - **SizeTiered** (default) merges similarly sized files, avoiding repeated rewrites of large files.
 - **Full** merges all live SSTables when the file-count threshold is reached.
