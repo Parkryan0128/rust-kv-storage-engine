@@ -114,3 +114,21 @@ work. A fresh process records RSS/peak RSS before correctness reads. Every key i
 checked after compaction and reopen. Baseline/current output SST names, lengths
 and SHA-256 hashes must match. Report time spread as well as medians; differing
 RocksDB layouts/policies and shared-host storage waits limit generalization.
+
+## Cleanup comparison
+
+`[cleanup-perf]` on a main commit runs the focused write and compaction suites,
+then `workloads.py --baseline --reads-only` in the same job. The marker pins the
+baseline to `c372eba`, immediately before the `ba9d436` cleanup. Manual dispatch
+can select another compatible baseline and enable `reads` and/or `compaction`.
+The engine source is not changed by running this comparison.
+
+Paired reads use six trials so baseline, current and RocksDB each occupy every
+order position twice. Baseline/current receive copies of the same baseline-made
+fixture; RocksDB has the same logical history in its native format. Summaries
+include current/baseline as well as current/RocksDB ratios and trial ranges.
+Read scenarios remain bounded to the cases above, with a ten-minute deadline.
+All read fixtures are flushed: these scans check the disk iterator path, not
+writer interference while constructing active/frozen memory snapshots. Table
+preview performance is also outside this suite. No such speedup may be inferred
+from these results.

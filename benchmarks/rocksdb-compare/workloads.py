@@ -23,7 +23,7 @@ def warm(path):
                     pass
 
 
-def summarize(records):
+def summarize(records, baseline=False):
     groups = {}
     for row in records:
         if row["stage"] == "open":
@@ -32,21 +32,30 @@ def summarize(records):
         groups.setdefault(key, {}).setdefault(row["backend"], []).append(row)
     summary = []
     for (case, scenario, stage), backends in sorted(groups.items()):
-        if set(backends) != {"engine", "rocksdb"}:
+        if set(backends) != ({"baseline", "engine", "rocksdb"} if baseline else {"engine", "rocksdb"}):
             raise AssertionError("unpaired backend result")
         unit = "seconds" if stage == "compact" else "ops_per_second"
         a = {r["trial"]: r["metrics"][unit] for r in backends["engine"]}
         b = {r["trial"]: r["metrics"][unit] for r in backends["rocksdb"]}
         assert a.keys() == b.keys()
         ratios = [b[t] / a[t] if stage == "compact" else a[t] / b[t] for t in a]
-        summary.append({"case": case, "scenario": scenario, "stage": stage,
+        row = {"case": case, "scenario": scenario, "stage": stage,
                         "unit": unit, "engine_median": statistics.median(a.values()),
                         "rocksdb_median": statistics.median(b.values()),
                         "engine_speed_ratio_median": statistics.median(ratios),
                         "engine_speed_ratio_min": min(ratios), "engine_speed_ratio_max": max(ratios),
                         "trials": len(ratios),
                         "engine_peak_rss_kib_median": statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in backends["engine"]),
-                        "rocksdb_peak_rss_kib_median": statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in backends["rocksdb"])})
+                        "rocksdb_peak_rss_kib_median": statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in backends["rocksdb"])}
+        if baseline:
+            old = {r["trial"]: r["metrics"][unit] for r in backends["baseline"]}
+            assert old.keys() == a.keys()
+            change = [old[t] / a[t] if stage == "compact" else a[t] / old[t] for t in a]
+            row.update(baseline_median=statistics.median(old.values()),
+                       baseline_peak_rss_kib_median=statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in backends["baseline"]),
+                       vs_baseline_speed_ratio_median=statistics.median(change),
+                       vs_baseline_speed_ratio_min=min(change), vs_baseline_speed_ratio_max=max(change))
+        summary.append(row)
     return summary
 
 
@@ -54,10 +63,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--baseline", action="store_true", help="Include workloads-baseline, using identical engine read fixture bytes")
+    parser.add_argument("--reads-only", action="store_true", help="Skip writes and compaction when separate suites already cover them")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    binaries = {name: Path("comparison-bin", "workloads-" + name).resolve() for name in ("engine", "rocksdb")}
-    trials = 1 if args.smoke else 4
+    names = ["baseline", "engine", "rocksdb"] if args.baseline else ["engine", "rocksdb"]
+    binaries = {name: Path("comparison-bin", "workloads-" + name).resolve() for name in names}
+    trials = 1 if args.smoke else (6 if args.baseline else 4)
     profiles = [{"keys": 128, "value": 32, "block": 4096, "cache": 8192, "churn": True}] if args.smoke else [
         {"keys": 20000, "value": 128, "block": 4096, "cache": 8388608, "churn": False},
         {"keys": 20000, "value": 128, "block": 16384, "cache": 8388608, "churn": False},
@@ -94,6 +106,9 @@ def main():
             "limits": "Small bounded workloads on shared CI; no cold-device, power-loss or long-duration steady-state claims",
         },
     }
+    if args.baseline:
+        environment["baseline"] = capture("git", "-C", "baseline", "rev-parse", "HEAD")
+        environment["semantics"]["baseline_layout"] = "Baseline and current use exact copies of the baseline-generated engine fixture, with the identical harness and query trace"
     with tempfile.TemporaryDirectory(prefix="kv-workloads-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
@@ -113,8 +128,8 @@ def main():
                 for line in completed.stdout.splitlines():
                     if line.startswith("WORKLOAD_RESULT "):
                         row = json.loads(line.removeprefix("WORKLOAD_RESULT "))
-                        assert row["backend"] == name and row["config"] == config
-                        row.update(case=case, scenario=scenario, trial=trial, order=order)
+                        assert row["backend"] == ("rocksdb" if name == "rocksdb" else "engine") and row["config"] == config
+                        row.update(backend=name, case=case, scenario=scenario, trial=trial, order=order)
                         stages.append(row["stage"])
                         records.append(row)
                         output.write(json.dumps(row) + "\n"); output.flush()
@@ -127,15 +142,20 @@ def main():
                 case = f"p{profile_index}-{profile['value']}b-{profile['block']}block-{profile['cache']}cache-{'churn' if profile['churn'] else 'clean'}"
                 fixtures = {name: root / (case + name) for name in binaries}
                 for name, directory in fixtures.items():
+                    if args.baseline and name == "engine":
+                        continue
                     run(name, "prepare", directory, profile, case, "prepare", 0, 0)
+                if args.baseline:
+                    fixtures["engine"] = fixtures["baseline"]
                 for trial in range(1, trials + 1):
-                    # Rotate scenarios and balance backend-first order across four trials.
+                    # Each backend occupies every position equally across the full run.
                     offset = (trial - 1) % len(scenarios)
                     for scenario in scenarios[offset:] + scenarios[:offset]:
                         label = scenario["workload"] + f"-t{scenario.get('threads',1)}-span{scenario.get('span',0)}"
                         config = dict(profile, **scenario, seed=7919 + trial * 104729)
-                        names = list(binaries) if trial % 2 else list(reversed(binaries))
-                        for order, name in enumerate(names, 1):
+                        offset_backend = (trial - 1) % len(binaries)
+                        order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
+                        for order, name in enumerate(order_names, 1):
                             # Writable opens can rotate WALs/accumulate diagnostic
                             # logs. Keep every measured process at identical history.
                             copy = root / f"read-{profile_index}-{trial}-{name}"
@@ -143,22 +163,23 @@ def main():
                             warm(copy)
                             run(name, "read", copy, config, case, label, trial, order)
                             shutil.rmtree(copy)
-                    if profile["churn"]:
-                        for order, name in enumerate(names, 1):
+                    if profile["churn"] and not args.reads_only:
+                        for order, name in enumerate(order_names, 1):
                             copy = root / f"compact-{profile_index}-{trial}-{name}"
                             shutil.copytree(fixtures[name], copy)
                             warm(copy)
                             run(name, "compact", copy, dict(profile, queries=query_count, seed=trial*7919), case, "compact", trial, order)
                             shutil.rmtree(copy)
-            for batch in [1, 32, 256]:
+            for batch in ([] if args.reads_only else [1, 32, 256]):
                 for trial in range(1, trials + 1):
-                    names = list(binaries) if trial % 2 else list(reversed(binaries))
-                    for order, name in enumerate(names, 1):
+                    offset_backend = (trial - 1) % len(binaries)
+                    order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
+                    for order, name in enumerate(order_names, 1):
                         directory = root / f"write-{batch}-{trial}-{name}"
                         config = {"keys": 64 if args.smoke else 8192, "value": 128, "batch": batch,
                                   "fixed": False, "workload": "put" if batch == 1 else "batch"}
                         run(name, "write", directory, config, "durable-write", f"batch-{batch}", trial, order)
-    result = summarize(records)
+    result = summarize(records, args.baseline)
     (args.output / "summary.json").write_text(json.dumps(result, indent=2))
     for row in result:
         print("WORKLOAD_SUMMARY " + json.dumps(row), flush=True)
