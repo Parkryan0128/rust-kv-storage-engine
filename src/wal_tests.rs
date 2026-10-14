@@ -155,3 +155,66 @@ fn sequence_limit_and_legacy_rejection_are_explicit() {
     assert!(decode_record(&mut Cursor { b: &bytes }).is_err());
     assert!(replay(&bytes, &mut table, &mut seq).is_err());
 }
+
+#[test]
+fn contiguous_frames_keep_legacy_bytes_and_bound_retained_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("1.wal");
+    let mut wal = Wal::create(&path, 1).unwrap();
+    let mut expected = MAGIC.to_vec();
+    let first = single(b"value", 1);
+    let mut encoded = Vec::new();
+    encode_record(b"key", &first, &mut encoded);
+    write_frame(&mut expected, &encoded).unwrap();
+    wal.append(b"key", &first).unwrap();
+    let capacity = wal.buffer.capacity();
+    let address = wal.buffer.as_ptr();
+    assert!(capacity > 0 && capacity <= MAX_RETAINED_BUFFER);
+
+    let deletion = Record {
+        seq: 2,
+        value: None,
+    };
+    encoded.clear();
+    encode_record(b"key", &deletion, &mut encoded);
+    write_frame(&mut expected, &encoded).unwrap();
+    wal.append(b"key", &deletion).unwrap();
+    assert_eq!(wal.buffer.as_ptr(), address);
+    assert_eq!(wal.buffer.capacity(), capacity);
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    assert_eq!(wal.bytes as usize, expected.len());
+
+    let mut batch = WriteBatch::new();
+    let large = vec![19; MAX_RETAINED_BUFFER * 2];
+    batch.put(b"large", &large).put(b"key", b"restored");
+    encoded.clear();
+    put_u64(&mut encoded, 0);
+    put_u32(&mut encoded, BATCH_VERSION);
+    put_u32(&mut encoded, 2);
+    encode_record(
+        b"large",
+        &Record {
+            seq: 3,
+            value: Some(Bytes::copy_from_slice(&large)),
+        },
+        &mut encoded,
+    );
+    encode_record(b"key", &single(b"restored", 4), &mut encoded);
+    write_frame(&mut expected, &encoded).unwrap();
+    wal.append_batch(&batch, 3, batch.encoded_len().unwrap())
+        .unwrap();
+    assert_eq!(wal.buffer.capacity(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    drop(wal);
+    let (mut wal, table) = Wal::recover(&path, 1, true, &mut 0).unwrap();
+    assert_eq!(
+        table.get(b"large").unwrap().value.as_deref(),
+        Some(large.as_slice())
+    );
+    assert_eq!(
+        table.get(b"key").unwrap().value.as_deref(),
+        Some(&b"restored"[..])
+    );
+    wal.append(b"after", &single(b"ok", 5)).unwrap();
+    assert!(wal.buffer.capacity() <= MAX_RETAINED_BUFFER);
+}

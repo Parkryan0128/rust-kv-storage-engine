@@ -19,6 +19,7 @@ struct Config {
     value: usize,
     block: usize,
     cache: usize,
+    memtable: usize,
     queries: usize,
     seed: u64,
     fixed: bool,
@@ -36,6 +37,7 @@ impl Config {
             value: n("value", 128) as usize,
             block: n("block", 16384) as usize,
             cache: n("cache", 8 * 1024 * 1024) as usize,
+            memtable: n("memtable", 4 * 1024 * 1024) as usize,
             queries: n("queries", 20000) as usize,
             seed: n("seed", 7919),
             fixed: v["fixed"].as_bool().unwrap_or(true),
@@ -54,6 +56,7 @@ impl Config {
                 && (1..=16).contains(&c.threads)
         );
         assert!(c.span > 0 && c.span <= c.keys);
+        assert!(c.memtable > 0);
         c
     }
 }
@@ -117,7 +120,7 @@ fn metrics(path: &Path) -> Result<Value> {
         })
     };
     Ok(
-        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:")}),
+        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:"),"write_syscalls":number("syscw:"),"voluntary_switches":kb("voluntary_ctxt_switches:"),"involuntary_switches":kb("nonvoluntary_ctxt_switches:")}),
     )
 }
 fn distribution(samples: &mut [u64]) -> Value {
@@ -127,7 +130,7 @@ fn distribution(samples: &mut [u64]) -> Value {
             .get(samples.len().saturating_sub(1) * n / 100)
             .map(|v| *v as f64 / 1000.0)
     };
-    json!({"samples":samples.len(),"p50_us":p(50),"p95_us":if samples.len()>=20 {p(95)} else {None},"p99_us":if samples.len()>=100 {p(99)} else {None}})
+    json!({"samples":samples.len(),"p50_us":p(50),"p95_us":if samples.len()>=20 {p(95)} else {None},"p99_us":if samples.len()>=100 {p(99)} else {None},"max_us":samples.last().map(|v| *v as f64 / 1000.0)})
 }
 fn report(stage: &str, config: &Value, fields: Value) {
     println!(
@@ -292,13 +295,15 @@ fn writes(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         samples.push(one.elapsed().as_nanos() as u64);
     }
     let commit_seconds = start.elapsed().as_secs_f64();
+    let after_commits = metrics(path)?;
+    let stats_before_flush = db.stats()?;
     let f = Instant::now();
     db.flush()?;
     let flush_seconds = f.elapsed().as_secs_f64();
     report(
         "write",
         raw,
-        json!({"operations":c.keys,"commit_seconds":commit_seconds,"ops_per_second":c.keys as f64/commit_seconds,"flush_seconds":flush_seconds,"including_flush_ops_per_second":c.keys as f64/(commit_seconds+flush_seconds),"commit_latency":distribution(&mut samples),"before":before,"after":metrics(path)?,"stats":db.stats()?}),
+        json!({"operations":c.keys,"commit_seconds":commit_seconds,"ops_per_second":c.keys as f64/commit_seconds,"flush_seconds":flush_seconds,"including_flush_ops_per_second":c.keys as f64/(commit_seconds+flush_seconds),"commit_latency":distribution(&mut samples),"before":before,"after_commits":after_commits,"stats_before_flush":stats_before_flush,"after":metrics(path)?,"stats":db.stats()?}),
     );
     for (k, v) in &entries {
         assert_eq!(db.get(k)?.as_deref(), v.as_deref());

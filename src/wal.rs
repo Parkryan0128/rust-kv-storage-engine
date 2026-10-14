@@ -14,6 +14,8 @@ const MAGIC: &[u8; 8] = b"RKVWAL01";
 // Sequence zero is invalid in legacy records. Older readers reject this envelope
 // rather than replaying a prefix of its operations as independent writes.
 const BATCH_VERSION: u32 = 1;
+// Reuse ordinary commit buffers without retaining a rare multi-megabyte batch.
+const MAX_RETAINED_BUFFER: usize = 64 * 1024;
 #[cfg(test)]
 #[path = "wal_tests.rs"]
 mod tests;
@@ -21,6 +23,7 @@ pub(crate) struct Wal {
     pub file: File,
     pub bytes: u64,
     pub id: u64,
+    buffer: Vec<u8>,
 }
 impl Wal {
     pub fn create(path: &Path, id: u64) -> Result<Self> {
@@ -31,7 +34,12 @@ impl Wal {
             .open(path)?;
         file.write_all(MAGIC)?;
         file.sync_all()?;
-        Ok(Self { file, bytes: 8, id })
+        Ok(Self {
+            file,
+            bytes: 8,
+            id,
+            buffer: Vec::new(),
+        })
     }
     pub fn recover(
         path: &Path,
@@ -45,7 +53,15 @@ impl Wal {
             file.set_len(0)?;
             file.write_all(MAGIC)?;
             file.sync_all()?;
-            return Ok((Self { file, bytes: 8, id }, MemTable::default()));
+            return Ok((
+                Self {
+                    file,
+                    bytes: 8,
+                    id,
+                    buffer: Vec::new(),
+                },
+                MemTable::default(),
+            ));
         }
         let mut magic = [0; 8];
         file.read_exact(&mut magic)
@@ -69,39 +85,60 @@ impl Wal {
                 file,
                 bytes: valid,
                 id,
+                buffer: Vec::new(),
             },
             table,
         ))
     }
     pub fn append(&mut self, key: &[u8], r: &Record) -> Result<()> {
-        let mut b = Vec::with_capacity(r.encoded_len(key));
-        encode_record(key, r, &mut b);
-        self.append_payload(&b)
+        self.begin_frame(r.encoded_len(key));
+        encode_record(key, r, &mut self.buffer);
+        self.append_frame()
     }
 
     pub fn append_batch(&mut self, batch: &WriteBatch, first_seq: u64, size: usize) -> Result<()> {
-        let mut b = Vec::with_capacity(size);
-        put_u64(&mut b, 0);
-        put_u32(&mut b, BATCH_VERSION);
-        put_u32(&mut b, batch.len() as u32);
+        self.begin_frame(size);
+        put_u64(&mut self.buffer, 0);
+        put_u32(&mut self.buffer, BATCH_VERSION);
+        put_u32(&mut self.buffer, batch.len() as u32);
         for (i, entry) in batch.entries.iter().enumerate() {
-            let record = Record {
-                seq: first_seq + i as u64,
-                value: entry.value.clone(),
-            };
-            encode_record(&entry.key, &record, &mut b);
+            encode_record_parts(
+                &entry.key,
+                first_seq + i as u64,
+                entry.value.as_deref(),
+                &mut self.buffer,
+            );
         }
-        debug_assert_eq!(b.len(), size);
-        self.append_payload(&b)
+        debug_assert_eq!(self.buffer.len(), HEADER + size);
+        self.append_frame()
     }
 
-    fn append_payload(&mut self, b: &[u8]) -> Result<()> {
-        fault::hit("wal_before_append")?;
-        self.bytes += write_frame(&mut self.file, b)?;
-        fault::hit("wal_before_sync")?;
-        self.file.sync_all()?;
-        fault::hit("wal_after_sync")?;
-        Ok(())
+    fn begin_frame(&mut self, payload_len: usize) {
+        self.buffer.clear();
+        self.buffer.reserve(HEADER + payload_len);
+        self.buffer.resize(HEADER, 0);
+    }
+
+    fn append_frame(&mut self) -> Result<()> {
+        let result = (|| {
+            let header = frame_header(&self.buffer[HEADER..])?;
+            self.buffer[..HEADER].copy_from_slice(&header);
+            fault::hit("wal_before_append")?;
+            // Header and payload share one allocation and one write_all call.
+            // write_all still retries interrupted/short writes before syncing.
+            self.file.write_all(&self.buffer)?;
+            self.bytes += self.buffer.len() as u64;
+            fault::hit("wal_before_sync")?;
+            self.file.sync_all()?;
+            fault::hit("wal_after_sync")?;
+            Ok(())
+        })();
+        if self.buffer.capacity() > MAX_RETAINED_BUFFER {
+            self.buffer = Vec::new();
+        } else {
+            self.buffer.clear();
+        }
+        result
     }
 }
 

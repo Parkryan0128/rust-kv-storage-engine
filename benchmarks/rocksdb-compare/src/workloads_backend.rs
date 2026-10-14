@@ -14,6 +14,7 @@ impl Backend {
             rust_kv_storage_engine::Options {
                 block_size: c.block,
                 block_cache_capacity: c.cache,
+                memtable_size_limit: c.memtable,
                 // Fixed-layout read fixtures disable automatic merging. Mutating
                 // workloads use the engine's normal background compaction policy.
                 compaction_file_threshold: if c.fixed { usize::MAX } else { 4 },
@@ -70,7 +71,7 @@ impl Backend {
         o.create_if_missing(true);
         o.set_compression_type(DBCompressionType::None);
         o.set_bottommost_compression_type(DBCompressionType::None);
-        o.set_write_buffer_size(4 * 1024 * 1024);
+        o.set_write_buffer_size(c.memtable);
         o.set_max_write_buffer_number(3);
         o.set_use_fsync(true);
         o.set_disable_auto_compactions(c.fixed);

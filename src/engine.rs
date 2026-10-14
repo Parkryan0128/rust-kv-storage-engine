@@ -39,7 +39,7 @@ pub trait KvEngine {
 pub struct Options {
     /// Rotation threshold for memory or WAL bytes.
     pub memtable_size_limit: usize,
-    /// Writers wait when this queue is full.
+    /// Writers wait for room in this queue when rotating a full active buffer.
     pub max_immutable_memtables: usize,
     pub block_size: usize,
     pub block_cache_capacity: usize,
@@ -130,12 +130,15 @@ impl Drop for Disk {
         let _ = FileExt::unlock(&self._lock);
     }
 }
+struct Maintenance {
+    prefer_flush: bool,
+}
 struct Core {
     options: Options,
     disk: Option<Disk>,
     state: RwLock<State>,
     writer: Mutex<Option<Wal>>,
-    maintenance: Mutex<()>,
+    maintenance: Mutex<Maintenance>,
     cache: Mutex<Cache>,
     counters: Counters,
     notify: Sender<()>,
@@ -295,7 +298,7 @@ impl Engine {
             disk,
             state: RwLock::new(state),
             writer: Mutex::new(wal),
-            maintenance: Mutex::new(()),
+            maintenance: Mutex::new(Maintenance { prefer_flush: true }),
             cache: Mutex::new(Cache::new(capacity)),
             counters: Counters::default(),
             notify: tx,
@@ -314,24 +317,20 @@ impl Engine {
                                 break;
                             }
                             loop {
-                                let guard = c.maintenance.lock();
+                                let mut guard = c.maintenance.lock();
                                 if c.stop.load(Ordering::Acquire) {
                                     break;
                                 }
                                 if c.state.read().fatal.is_some() {
                                     break;
                                 }
-                                let inputs = c.compaction_inputs();
-                                let work = if !inputs.is_empty() {
-                                    c.compact_tables(inputs)
-                                } else if !c.state.read().immutable.is_empty() {
-                                    c.flush_one()
-                                } else {
-                                    break;
-                                };
-                                if let Err(e) = work {
-                                    c.poison(&e);
-                                    break;
+                                match c.maintenance_step(true, &mut guard) {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(e) => {
+                                        c.poison(&e);
+                                        break;
+                                    }
                                 }
                                 // Hand off between jobs so a flush with a finite
                                 // WAL goal cannot wait for all future writes.
@@ -480,19 +479,14 @@ impl Engine {
             s.immutable.back().map_or(s.manifest.wal_floor, |f| f.id)
         };
         c.wake();
-        let _guard = c.maintenance.lock();
+        let mut guard = c.maintenance.lock();
         let result = (|| loop {
             let s = c.state.read();
             check(&s)?;
             let flushed = s.manifest.wal_floor >= goal;
             drop(s);
-            let inputs = c.compaction_inputs();
-            if !inputs.is_empty() {
-                c.compact_tables(inputs)?;
-            } else if flushed {
+            if !c.maintenance_step(!flushed, &mut guard)? {
                 return Ok(());
-            } else {
-                c.flush_one()?;
             }
         })();
         if let Err(e) = &result {
@@ -692,6 +686,8 @@ impl Core {
                 return Ok(());
             }
             drop(s);
+            #[cfg(test)]
+            crate::test_hooks::pause("write_backpressure");
             self.wake();
             self.changed.wait(&mut p);
         }
@@ -716,13 +712,15 @@ impl Core {
                 .checked_add(operations)
                 .ok_or(EngineError::SequenceExhausted)?
         };
-        self.wait_room()?;
         // Rotate first so a rotation error cannot fail an already-applied write.
         if self.disk.is_some()
             && (self.state.read().mem.bytes >= self.options.memtable_size_limit
                 || w.as_ref()
                     .is_some_and(|w| w.bytes >= self.options.memtable_size_limit as u64))
         {
+            // A full frozen queue does not prevent filling the current buffer.
+            // Only rotation needs another slot; the writer barrier serializes it.
+            self.wait_room()?;
             if let Err(e) = self.freeze(w) {
                 self.poison(&e);
                 return Err(e);
@@ -868,6 +866,30 @@ impl Core {
         sync_dir(&dir.join("wal"))?;
         Ok(())
     }
+    // The caller holds maintenance. Alternate urgent flushes with eligible
+    // compactions so continuous writers cannot starve either kind of work.
+    // Explicit flush passes false after reaching its finite WAL goal, so later
+    // writers cannot make it drain an indefinitely replenished frozen queue.
+    fn maintenance_step(&self, allow_flush: bool, schedule: &mut Maintenance) -> Result<bool> {
+        let queued = self.state.read().immutable.len();
+        if allow_flush && queued >= self.options.max_immutable_memtables && schedule.prefer_flush {
+            self.flush_one()?;
+            schedule.prefer_flush = false;
+        } else {
+            let inputs = self.compaction_inputs();
+            if !inputs.is_empty() {
+                self.compact_tables(inputs)?;
+                schedule.prefer_flush = true;
+            } else if allow_flush && queued != 0 {
+                self.flush_one()?;
+                schedule.prefer_flush = false;
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn compaction_inputs(&self) -> Vec<Arc<Table>> {
         compaction::pick(
             &self.state.read().tables,

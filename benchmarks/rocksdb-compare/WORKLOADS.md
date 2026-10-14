@@ -74,3 +74,22 @@ saved as artifacts. Every measured operation checks returned data; failures or
 missing backend/stage results fail the runner. Shared CI and four short trials
 are screening evidence. Cold-device latency, long steady-state writes, power-loss
 durability and large-scale memory/compaction pressure still require dedicated runs.
+# Focused durable-write comparison
+
+The `write-comparison` workflow runs only on manual dispatch or a main commit
+containing `[write-perf]`. It builds the same workload harness against the
+pre-push baseline, current engine, and RocksDB, and rotates their execution order
+over three trials on one host. Manual dispatch accepts a baseline commit.
+
+It measures single puts, 32-operation batches, 256-operation batches with small
+values, and writes with a 256 KiB memtable to exercise flushing and compaction.
+The first three cases fit the engine's default active buffer; the batch cases
+have at least 100 commit samples. Every key is checked before and after reopen.
+The baseline must support the current harness's Engine/WriteBatch API.
+
+Commit time and final flush time are reported separately. Resource snapshots
+before the final flush expose write syscall counts and whether maintenance ran.
+On the pressure case, background work can continue between the end of timing and
+those snapshots. All three backends retain synchronous WAL durability and disable
+compression. Shared CI timing includes scheduling and storage stalls; report the
+trial spread and latency tails alongside throughput, not a universal winner.

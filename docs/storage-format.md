@@ -176,7 +176,7 @@ Pass an `Options` value to `Engine::open_with_options()`.
 | Option | Default | Meaning |
 |---|---:|---|
 | `memtable_size_limit` | 4 MiB | Memory or WAL size that triggers a new buffer |
-| `max_immutable_memtables` | 2 | Maximum waiting buffers before writers pause |
+| `max_immutable_memtables` | 2 | Maximum waiting buffers; a writer pauses only when rotation needs another slot |
 | `block_size` | 16 KiB | Target size of an SST data block |
 | `block_cache_capacity` | 8 MiB | Block-cache budget; zero disables it |
 | `bloom_filter_bits_per_key` | 10 | Filter space per key; allowed range 1–30 |

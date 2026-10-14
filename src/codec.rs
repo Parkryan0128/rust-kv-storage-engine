@@ -38,12 +38,15 @@ impl<'a> Cursor<'a> {
     }
 }
 pub(crate) fn encode_record(key: &[u8], r: &Record, out: &mut Vec<u8>) {
-    put_u64(out, r.seq);
-    out.push(u8::from(r.value.is_some()));
+    encode_record_parts(key, r.seq, r.value.as_deref(), out);
+}
+pub(crate) fn encode_record_parts(key: &[u8], seq: u64, value: Option<&[u8]>, out: &mut Vec<u8>) {
+    put_u64(out, seq);
+    out.push(u8::from(value.is_some()));
     put_u32(out, key.len() as u32);
-    put_u32(out, r.value.as_ref().map_or(0, Bytes::len) as u32);
+    put_u32(out, value.map_or(0, <[u8]>::len) as u32);
     out.extend(key);
-    if let Some(v) = &r.value {
+    if let Some(v) = value {
         out.extend(v);
     }
 }
@@ -104,14 +107,19 @@ pub(crate) fn frame_payload(bytes: &[u8]) -> Result<&[u8]> {
     }
     Ok(payload)
 }
-pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<u64> {
+pub(crate) fn frame_header(payload: &[u8]) -> Result<[u8; HEADER]> {
     if payload.len() > MAX_FRAME {
         return Err(corrupt("frame exceeds format limit"));
     }
     let len = (payload.len() as u32).to_le_bytes();
-    w.write_all(&len)?;
-    w.write_all(&crc32fast::hash(&len).to_le_bytes())?;
-    w.write_all(&crc32fast::hash(payload).to_le_bytes())?;
+    let mut header = [0; HEADER];
+    header[..4].copy_from_slice(&len);
+    header[4..8].copy_from_slice(&crc32fast::hash(&len).to_le_bytes());
+    header[8..].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    Ok(header)
+}
+pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<u64> {
+    w.write_all(&frame_header(payload)?)?;
     w.write_all(payload)?;
     Ok((HEADER + payload.len()) as u64)
 }
