@@ -79,7 +79,8 @@ durability and large-scale memory/compaction pressure still require dedicated ru
 The `write-comparison` workflow runs only on manual dispatch or a main commit
 containing `[write-perf]`. It builds the same workload harness against the
 pre-push baseline, current engine, and RocksDB, and rotates their execution order
-over three trials on one host. Manual dispatch accepts a baseline commit.
+over three trials on one host, with twelve trials for the 32-operation batch
+case to expose intermittent storage stalls. Manual dispatch accepts a baseline commit.
 
 It measures single puts, 32-operation batches, 256-operation batches with small
 values, and writes with a 256 KiB memtable to exercise flushing and compaction.
@@ -93,6 +94,26 @@ On the pressure case, background work can continue between the end of timing and
 those snapshots. All three backends retain synchronous WAL durability and disable
 compression. Shared CI timing includes scheduling and storage stalls; report the
 trial spread and latency tails alongside throughput, not a universal winner.
+
+## Write latency diagnostics
+
+`write-diagnostics.yml` runs on manual dispatch or a main commit containing
+`[write-diag]`. It builds separate normal, `write-profiling`, and RocksDB binaries.
+Six rotating trials collect the usual batch32 score and per-commit phase timings.
+The opt-in feature measures validation, locks, preparation, encoding, checksum,
+allocation, WAL write/sync and memory publication. Default builds compile out
+these clocks and counters. Instrumented scores are diagnostics, not performance
+claims; both clock reads and sample collection perturb timing.
+
+The workflow also probes synthetic files with growing, KEEP_SIZE-preallocated
+and logically preallocated storage, using both fsync and fdatasync. These controls
+do not establish WAL compatibility: extending a real WAL with zeros would break
+strict recovery. Finally, strace records file writes, syncs and allocations for
+both engines. Traces include setup/teardown and instrumentation overhead, so
+their timings must not be used as benchmark scores. Artifacts retain every trial,
+raw phase sample, probe and trace, including outliers. Shared storage can still
+stall even after preallocation; syscall timing alone cannot identify host/device
+contention or prove power-loss behavior.
 
 ## Compaction comparison
 

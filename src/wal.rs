@@ -138,6 +138,7 @@ impl Wal {
                     self.bytes.saturating_add(self.buffer.len() as u64),
                 )
             );
+            fault::hit("wal_after_reserve")?;
             // Header and payload share one allocation and one write_all call.
             // write_all still retries interrupted/short writes before syncing.
             write_timed!(WalWrite, self.file.write_all(&self.buffer))?;

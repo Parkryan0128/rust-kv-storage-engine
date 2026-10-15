@@ -8,6 +8,7 @@ fn crash_and_io_error_recover_the_entire_batch_or_none() {
     for mode in ["batch", "batch-error"] {
         for point in [
             "wal_before_append",
+            "wal_after_reserve",
             "wal_before_sync",
             "wal_after_sync",
             "batch_after_first_apply",
@@ -46,7 +47,7 @@ fn crash_and_io_error_recover_the_entire_batch_or_none() {
                 (!committed).then_some(&b"old"[..])
             );
             assert_eq!(db.stats().sequence, if committed { 5 } else { 2 });
-            if point == "wal_before_append" {
+            if matches!(point, "wal_before_append" | "wal_after_reserve") {
                 assert!(!committed);
             } else if point != "wal_before_sync" {
                 assert!(committed, "{mode}/{point}");
