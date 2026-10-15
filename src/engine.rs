@@ -1018,7 +1018,7 @@ mod audit_tests {
             )
             .unwrap();
             for i in 0..8u8 {
-                db.put([i], [i]).unwrap();
+                db.put(&[i], &[i]).unwrap();
                 db.flush().unwrap();
             }
             let inputs: Vec<_> = db
