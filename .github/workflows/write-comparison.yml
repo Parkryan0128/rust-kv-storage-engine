@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   compare:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -32,10 +32,30 @@ jobs:
       CXXFLAGS: '-g0'
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve comparison baseline
+        id: baseline
+        env:
+          REQUESTED_BASELINE: ${{ inputs.baseline }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          message = os.environ.get("COMMIT_MESSAGE", "")
+          markers = re.findall(r"\[baseline:([0-9a-fA-F]{40})\]", message)
+          if len(markers) > 1:
+              raise ValueError("Specify only one baseline marker")
+          fallback = "9b50fb6f330d5c78b8c8e8f205578686624da7db" if "[cleanup-perf]" in message else os.environ.get("PUSH_BEFORE", "")
+          ref = os.environ.get("REQUESTED_BASELINE") or (markers[0] if markers else fallback)
+          if not ref or "\n" in ref or "\r" in ref:
+              raise ValueError("Missing or invalid baseline")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ref={ref}\n")
+          print(f"Comparison baseline: {ref}")
+          PY
       - uses: actions/checkout@v4
         with:
-          # Pin the pre-streaming engine for the complete paired comparison.
-          ref: ${{ inputs.baseline || (contains(github.event.head_commit.message, '[cleanup-perf]') && '9b50fb6f330d5c78b8c8e8f205578686624da7db') || github.event.before }}
+          ref: ${{ steps.baseline.outputs.ref }}
           path: baseline
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
@@ -80,7 +100,7 @@ jobs:
           path: compaction-results/
           if-no-files-found: ignore
       - name: Check paired read orchestration
-        if: inputs.reads || contains(github.event.head_commit.message, '[cleanup-perf]')
+        if: inputs.reads || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]')
         run: python3 benchmarks/rocksdb-compare/workloads.py read-smoke --smoke --baseline --reads-only
         env:
           KV_BENCH_DIR: ${{ runner.temp }}
@@ -97,4 +117,16 @@ jobs:
           path: |
             read-results/
             read-smoke/
+          if-no-files-found: ignore
+      - name: Compare paired reads, writes, and compaction
+        if: contains(github.event.head_commit.message, '[paired-perf]')
+        timeout-minutes: 10
+        run: python3 benchmarks/rocksdb-compare/workloads.py paired-results --baseline
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paired-workload-comparison
+          path: paired-results/
           if-no-files-found: ignore

@@ -138,6 +138,15 @@ RocksDB layouts/policies and shared-host storage waits limit generalization.
 
 ## Cleanup comparison
 
+For a full same-run baseline/current/RocksDB comparison, a main commit can use
+`[paired-perf] [baseline:<40-character commit SHA>]`. This runs the focused write
+suite and `workloads.py --baseline`, including all read profiles, native-layout
+churn compactions and bounded durable writes. The harness and query traces are
+identical across baseline/current; engine read/compaction fixtures are copied
+from the baseline. Six rotating trials balance backend order. This marker does
+not change engine code. A baseline marker also overrides the usual push baseline
+for the other comparison markers; a manual baseline input takes precedence.
+
 `[cleanup-perf]` on a main commit runs the focused write and compaction suites,
 then `workloads.py --baseline --reads-only` in the same job. The marker pins the
 baseline to `9b50fb6`, immediately before the streaming SST/scan changes. Manual dispatch
