@@ -590,6 +590,7 @@ impl Engine {
     pub fn stats(&self) -> Stats {
         let c = &self.inner.core;
         let s = c.state.read();
+        let (cache_bytes, cache_hits) = c.cache.stats();
         Stats {
             sequence: s.sequence,
             active_memtable_bytes: s.mem.bytes,
@@ -598,9 +599,9 @@ impl Engine {
             sst_files: s.tables.len(),
             sst_records: s.tables.iter().map(|t| t.count).sum(),
             block_reads: c.counters.reads.load(Ordering::Relaxed),
-            cache_hits: c.counters.hits.load(Ordering::Relaxed),
+            cache_hits,
             bloom_negatives: c.counters.bloom_negatives.load(Ordering::Relaxed),
-            cache_bytes: c.cache.bytes(),
+            cache_bytes,
             sst_bytes: s.tables.iter().map(|t| t.file_bytes).sum(),
             flush_bytes: c.counters.flush_bytes.load(Ordering::Relaxed),
             compaction_input_bytes: c.counters.compaction_input_bytes.load(Ordering::Relaxed),

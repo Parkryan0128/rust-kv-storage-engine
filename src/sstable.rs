@@ -3,7 +3,7 @@ use crate::cache::Cache;
 use crate::{
     block::{indexed_records, ReadBlock},
     bloom::Bloom,
-    cache::{BlockCache, Counters},
+    cache::{BlockCache, CacheKey, Counters},
     codec::*,
     error::corrupt,
     fault,
@@ -73,14 +73,15 @@ impl Table {
         block_size: usize,
         bloom_bits: usize,
     ) -> Result<Self> {
-        Self::write_with(path, id, estimate, block_size, bloom_bits, |writer| {
-            for item in records {
-                let (key, record) = item?;
-                let record = record.borrow();
-                writer.push(key.as_ref(), record.seq, record.value.as_deref())?;
-            }
-            Ok(())
-        })
+        // Flushes know the exact count, so do not retain hashes for a rebuild.
+        // An overestimated iterator still has the bounded readback fallback.
+        let mut writer = TableWriter::new(path, estimate, block_size, bloom_bits, false)?;
+        for item in records {
+            let (key, record) = item?;
+            let record = record.borrow();
+            writer.push(key.as_ref(), record.seq, record.value.as_deref())?;
+        }
+        writer.finish(path, id, bloom_bits)
     }
     pub(crate) fn write_with(
         path: &Path,
@@ -90,7 +91,7 @@ impl Table {
         bloom_bits: usize,
         fill: impl FnOnce(&mut TableWriter) -> Result<()>,
     ) -> Result<Self> {
-        let mut writer = TableWriter::new(path, estimate, block_size, bloom_bits)?;
+        let mut writer = TableWriter::new(path, estimate, block_size, bloom_bits, true)?;
         fill(&mut writer)?;
         writer.finish(path, id, bloom_bits)
     }
@@ -270,9 +271,10 @@ impl Table {
         }
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
+        let cache_key = CacheKey::from((self.id, n));
         let (cached, reusable, budget) = {
-            let mut cache = cache.lock((self.id, n));
-            let cached = cache.get((self.id, n), counters);
+            let mut cache = cache.lock(cache_key);
+            let cached = cache.get(cache_key);
             let reusable = if cached.is_none() && self.cacheable.load(Ordering::Acquire) {
                 cache.take_reusable(i.len as usize, self.indexed)
             } else {
@@ -292,9 +294,9 @@ impl Table {
             let b = Arc::new(block);
             #[cfg(test)]
             crate::test_hooks::pause("cache_before_admission");
-            let mut cache = cache.lock((self.id, n));
+            let mut cache = cache.lock(cache_key);
             if self.cacheable.load(Ordering::Acquire) {
-                cache.insert((self.id, n), b.clone());
+                cache.insert(cache_key, b.clone());
             }
             b
         };
@@ -558,7 +560,7 @@ mod tests {
         assert_eq!(counters.reads.load(Ordering::Relaxed), 2);
         assert_eq!(table.get(b"b", &cache, &counters).unwrap().unwrap().seq, 2);
         assert_eq!(counters.reads.load(Ordering::Relaxed), 2);
-        assert_eq!(counters.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().1, 1);
         assert!(cache.bytes() <= 1200);
     }
 
@@ -683,7 +685,7 @@ mod tests {
         let counters = Counters::default();
         table.get(b"key", &cache, &counters).unwrap();
         let capacity = cache.bytes();
-        let held = cache.lock((1, 0)).get((1, 0), &counters).unwrap();
+        let held = cache.lock((1, 0)).get((1, 0)).unwrap();
         table.retire();
         cache.remove_tables(&std::collections::HashSet::from([1]));
         {
@@ -700,8 +702,8 @@ mod tests {
             1
         );
         assert_eq!(cache.bytes(), live_bytes);
-        assert!(cache.lock((1, 0)).get((1, 0), &counters).is_none());
-        assert!(cache.lock((1, 0)).get((2, 0), &counters).is_some());
+        assert!(cache.lock((1, 0)).get((1, 0)).is_none());
+        assert!(cache.lock((1, 0)).get((2, 0)).is_some());
         assert_eq!(held.get(b"key").unwrap().value.unwrap(), "value");
     }
 

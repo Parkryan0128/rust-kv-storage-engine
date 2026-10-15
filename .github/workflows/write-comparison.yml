@@ -58,6 +58,8 @@ jobs:
           ref: ${{ steps.baseline.outputs.ref }}
           path: baseline
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify engine before benchmarking
+        run: cargo test --locked --release --all-features
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - uses: actions/cache@v4
         with:

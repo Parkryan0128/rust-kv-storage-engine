@@ -3,6 +3,7 @@ use std::io::BufWriter;
 use std::ops::Range;
 
 const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
+const MAX_BLOOM_HASHES: usize = 64 * 1024 / std::mem::size_of::<u64>();
 
 // Both frozen memory and a borrowed merge stream through the same publisher.
 // The last key stays in the encoded block, avoiding an extra key allocation.
@@ -10,6 +11,8 @@ pub(crate) struct TableWriter {
     file: BufWriter<File>,
     index: Vec<Index>,
     bloom: Bloom,
+    // A bounded compaction-only shortcut. None uses output readback if needed.
+    bloom_hashes: Option<Vec<u64>>,
     block: Vec<u8>,
     offsets: Vec<u32>,
     first: Vec<u8>,
@@ -26,6 +29,7 @@ impl TableWriter {
         estimate: u64,
         block_size: usize,
         bloom_bits: usize,
+        retain_hashes: bool,
     ) -> Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
@@ -38,6 +42,7 @@ impl TableWriter {
             file,
             index: Vec::new(),
             bloom: Bloom::new(estimate, bloom_bits),
+            bloom_hashes: retain_hashes.then(Vec::new),
             block: vec![0; HEADER],
             offsets: Vec::new(),
             first: Vec::new(),
@@ -68,7 +73,16 @@ impl TableWriter {
         if self.offsets.is_empty() {
             self.first = key.to_vec();
         }
-        self.bloom.insert(key);
+        let hash = crate::bloom::hash(key);
+        self.bloom.insert_hash(hash);
+        if let Some(hashes) = &mut self.bloom_hashes {
+            if hashes.len() == MAX_BLOOM_HASHES {
+                // Release the allocation on overflow, not just its contents.
+                self.bloom_hashes = None;
+            } else {
+                hashes.push(hash);
+            }
+        }
         self.offsets.push((self.block.len() - HEADER) as u32);
         let start = self.block.len() + 17;
         encode_record_parts(key, seq, value, &mut self.block);
@@ -107,23 +121,32 @@ impl TableWriter {
     pub(super) fn finish(mut self, path: &Path, id: u64, bloom_bits: usize) -> Result<Table> {
         self.flush_block()?;
         if self.bloom.needs_rebuild(self.count, bloom_bits) {
-            // Positional reads must see every buffered output block.
-            self.file.flush()?;
+            fault::hit("bloom_rebuild")?;
             self.bloom = Bloom::new(self.count, bloom_bits);
-            for i in &self.index {
-                resize_frame(&mut self.block, i.len as usize);
-                fault::hit("bloom_rebuild_read")?;
-                self.file
-                    .get_ref()
-                    .read_exact_at(&mut self.block, i.offset)?;
-                let mut c = Cursor {
-                    b: indexed_records(frame_payload(&self.block)?)?,
-                };
-                while !c.b.is_empty() {
-                    self.bloom.insert(decode_record_ref(&mut c)?.key);
+            if let Some(hashes) = self.bloom_hashes.take() {
+                debug_assert_eq!(hashes.len() as u64, self.count);
+                for hash in hashes {
+                    self.bloom.insert_hash(hash);
+                }
+            } else {
+                // Positional reads must see every buffered output block.
+                self.file.flush()?;
+                for i in &self.index {
+                    resize_frame(&mut self.block, i.len as usize);
+                    fault::hit("bloom_rebuild_read")?;
+                    self.file
+                        .get_ref()
+                        .read_exact_at(&mut self.block, i.offset)?;
+                    let mut c = Cursor {
+                        b: indexed_records(frame_payload(&self.block)?)?,
+                    };
+                    while !c.b.is_empty() {
+                        self.bloom.insert(decode_record_ref(&mut c)?.key);
+                    }
                 }
             }
         }
+        self.bloom_hashes = None;
         let meta_len = write_metadata(
             &mut self.file,
             self.count,
@@ -157,6 +180,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_hashes_match_readback_at_cap_and_after_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [0, 1, MAX_BLOOM_HASHES, MAX_BLOOM_HASHES + 1] {
+            let mut outputs = Vec::new();
+            for retain in [false, true] {
+                let path = dir.path().join(format!("hash-{count}-{retain}.sst"));
+                let mut writer =
+                    TableWriter::new(&path, (count as u64 + 100) * 3, 1024, 10, retain).unwrap();
+                for n in 0..count as u64 {
+                    let value = (n % 7 != 0).then_some([42; 32]);
+                    writer
+                        .push(
+                            &n.to_be_bytes(),
+                            n + 1,
+                            value.as_ref().map(|v| v.as_slice()),
+                        )
+                        .unwrap();
+                }
+                assert!(writer.bloom.needs_rebuild(count as u64, 10));
+                assert_eq!(
+                    writer.bloom_hashes.is_some(),
+                    retain && count <= MAX_BLOOM_HASHES
+                );
+                if let Some(hashes) = &writer.bloom_hashes {
+                    assert_eq!(hashes.len(), count);
+                    assert!(hashes.capacity() <= MAX_BLOOM_HASHES);
+                }
+                let table = writer.finish(&path, 1, 10).unwrap();
+                assert_eq!(table.count, count as u64);
+                for n in 0..count as u64 {
+                    assert!(table.bloom.contains(&n.to_be_bytes()));
+                }
+                outputs.push(fs::read(path).unwrap());
+            }
+            assert_eq!(outputs[0], outputs[1], "count={count}");
+        }
+    }
+
+    #[test]
     fn buffering_preserves_bytes_with_bloom_rebuild_empty_and_oversized_blocks() {
         let dir = tempfile::tempdir().unwrap();
         for sizes in [
@@ -167,7 +229,7 @@ mod tests {
             let mut outputs = Vec::new();
             for buffered in [false, true] {
                 let path = dir.path().join(format!("{}-{buffered}.sst", sizes.len()));
-                let mut writer = TableWriter::new(&path, 1000, 1024, 10).unwrap();
+                let mut writer = TableWriter::new(&path, 1000, 1024, 10, false).unwrap();
                 if !buffered {
                     writer.file = BufWriter::with_capacity(0, writer.file.into_inner().unwrap());
                 }

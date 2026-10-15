@@ -60,7 +60,11 @@ at a time and copies only the preview's first 128 bytes of each key/value.
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
 order through indexed links rather than a tree. Up to eight independently locked
 shards share the configured entry budget; both table and block identity select a
-shard. Small caches and large configured block targets use fewer shards. The
+shard. One mixed internal identity hash serves both routing and map lookup;
+collisions still compare the full table/block identity. Cumulative hit counts
+live under each shard's existing lock and are summed by `stats()`. Retained
+hashes are included in the per-entry bookkeeping allowance. Small caches and
+large configured block targets use fewer shards. The
 default 8 MiB cache has eight 1 MiB shards. Capacity is not borrowed across shards:
 a skewed workload can use the budget less effectively, and a block larger than
 its shard's budget bypasses admission even if it could fit in the total cache.
@@ -153,9 +157,13 @@ buffer rather than growing it.
 The background worker releases the maintenance lock fairly between jobs so a
 manual flush does not wait for a continuously replenished background queue.
 When compaction discards enough records to overallocate the Bloom filter by more
-than roughly two times, the writer rebuilds it from output blocks with bounded
-scratch space. Empty output always uses the minimum filter size. This adds an
-output read pass only for such shrinking merges and does not change the file format.
+than roughly two times, the writer rebuilds it at the final record count.
+Compactions retain at most 64 KiB of base key hashes to rebuild the identical
+filter without rereading values. Above that cap the hash buffer is released and
+the writer falls back to reading output blocks with bounded scratch space.
+Ordinary memtable flushes do not retain hashes because their count is exact.
+Empty output always uses the minimum filter size. Neither path changes the file
+format, Bloom probes, or publication ordering.
 
 ## Saving files and recovering
 

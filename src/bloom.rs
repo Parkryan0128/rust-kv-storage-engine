@@ -5,7 +5,7 @@ pub(crate) struct Bloom {
     probes: u32,
 }
 // Bloom format depends on this hash; bump the version if it changes.
-fn hash(key: &[u8]) -> (u64, u64) {
+pub(crate) fn hash(key: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in key {
         h ^= *b as u64;
@@ -14,7 +14,10 @@ fn hash(key: &[u8]) -> (u64, u64) {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
     h ^= h >> 33;
-    (h, h.rotate_left(31).wrapping_mul(0xc4ceb9fe1a85ec53) | 1)
+    h
+}
+fn delta(hash: u64) -> u64 {
+    hash.rotate_left(31).wrapping_mul(0xc4ceb9fe1a85ec53) | 1
 }
 impl Bloom {
     pub fn new(count: u64, bits_per_key: usize) -> Self {
@@ -31,7 +34,10 @@ impl Bloom {
         (count == 0 && needed < self.bits.len()) || needed < self.bits.len() / 2
     }
     pub fn insert(&mut self, key: &[u8]) {
-        let (mut h, delta) = hash(key);
+        self.insert_hash(hash(key));
+    }
+    pub fn insert_hash(&mut self, mut h: u64) {
+        let delta = delta(h);
         let n = self.bits.len() as u64 * 8;
         for _ in 0..self.probes {
             let bit = (h % n) as usize;
@@ -40,7 +46,8 @@ impl Bloom {
         }
     }
     pub fn contains(&self, key: &[u8]) -> bool {
-        let (mut h, delta) = hash(key);
+        let mut h = hash(key);
+        let delta = delta(h);
         let n = self.bits.len() as u64 * 8;
         for _ in 0..self.probes {
             let bit = (h % n) as usize;
@@ -71,6 +78,29 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_hashes_preserve_persisted_bits_and_binary_keys() {
+        let keys: &[&[u8]] = &[b"", b"a", b"b", b"a\0", &[0, 255, 128], b"long-key"];
+        let mut golden = Bloom::new(keys.len() as u64, 10);
+        for key in keys {
+            golden.insert_hash(hash(key));
+        }
+        // Golden bytes from the pre-hash-retention storage-format algorithm.
+        assert_eq!(golden.bits, [158, 37, 100, 240, 129, 3, 3, 242]);
+        for bits in [1, 10, 30] {
+            let mut direct = Bloom::new(1000, bits);
+            let mut retained = Bloom::new(1000, bits);
+            for n in 0u64..1000 {
+                let key = n.to_be_bytes();
+                direct.insert(&key);
+                retained.insert_hash(hash(&key));
+            }
+            assert_eq!(direct.bits, retained.bits);
+            for n in 0u64..1000 {
+                assert!(retained.contains(&n.to_be_bytes()));
+            }
+        }
+    }
     #[test]
     fn rebuilding_respects_half_size_boundary_minimum_and_cap() {
         let bloom = Bloom::new(160, 10); // 200 bytes

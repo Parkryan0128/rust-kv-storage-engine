@@ -188,11 +188,56 @@ fn second_process_cannot_open_a_locked_database() {
 }
 
 #[test]
+fn bloom_hash_overflow_readback_failure_preserves_committed_data() {
+    use rust_kv_storage_engine::{Options, WriteBatch};
+    for mode in ["compact", "compact-error"] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            memtable_size_limit: 8 * 1024 * 1024,
+            compaction_file_threshold: 10000,
+            ..Options::default()
+        };
+        let db = Engine::open_with_options(dir.path(), options.clone()).unwrap();
+        // Exceed 64 KiB of hashes and discard enough versions to shrink Bloom.
+        // Batches keep fixture construction bounded and quick.
+        for generation in 1..=3u8 {
+            let mut batch = WriteBatch::new();
+            for n in 0..8193u64 {
+                batch.put(n.to_be_bytes(), [generation; 16]);
+            }
+            db.write_batch(batch).unwrap();
+            db.flush().unwrap();
+        }
+        drop(db);
+        let out = worker()
+            .arg(dir.path())
+            .arg(mode)
+            .arg("bloom_rebuild_read")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(if mode == "compact" { 86 } else { 0 }),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let db = Engine::open_with_options(dir.path(), options).unwrap();
+        for n in 0..8193u64 {
+            assert_eq!(
+                db.get(&n.to_be_bytes()).unwrap().as_deref(),
+                Some(&[3; 16][..])
+            );
+        }
+        assert_eq!(db.get(b"must-reject").unwrap(), None);
+    }
+}
+
+#[test]
 fn partial_compaction_crashes_and_io_errors_preserve_unselected_files() {
     use rust_kv_storage_engine::Options;
     for mode in ["tiered", "tiered-error"] {
         for point in [
-            "bloom_rebuild_read",
+            "bloom_rebuild",
             "sst_before_sync",
             "sst_after_sync",
             "sst_after_rename",

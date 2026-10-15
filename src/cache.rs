@@ -2,14 +2,51 @@ use crate::block::ReadBlock;
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    hash::{BuildHasherDefault, Hash, Hasher},
+    sync::{atomic::AtomicU64, Arc},
 };
 type Key = (u64, usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CacheKey {
+    identity: Key,
+    hash: u64,
+}
+impl From<Key> for CacheKey {
+    fn from(identity: Key) -> Self {
+        let mut h = identity
+            .0
+            .wrapping_add((identity.1 as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
+        Self {
+            identity,
+            hash: h ^ (h >> 31),
+        }
+    }
+}
+impl Hash for CacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+// Only internally generated table/block identities use this map. Mix once for
+// both shard routing and lookup; equality still checks the complete identity.
+#[derive(Default)]
+struct KeyHasher(u64);
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("CacheKey hashes exactly one u64")
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
 const NONE: usize = usize::MAX;
-const ENTRY_OVERHEAD: usize = 96;
+// Includes the retained hash in both the map key and the LRU entry.
+const ENTRY_OVERHEAD: usize = 112;
 const MAX_SHARDS: usize = 8;
 const MIN_SHARD_BYTES: usize = 256 * 1024;
 
@@ -46,22 +83,24 @@ impl BlockCache {
             capacity,
         }
     }
-    fn shard_index(&self, key: Key) -> usize {
-        let mut h = key
-            .0
-            .wrapping_add((key.1 as u64).wrapping_mul(0x9e3779b97f4a7c15));
-        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
-        ((h ^ (h >> 31)) as usize) & (self.shards.len() - 1)
+    fn shard_index(&self, key: impl Into<CacheKey>) -> usize {
+        key.into().hash as usize & (self.shards.len() - 1)
     }
-    pub fn lock(&self, key: Key) -> MutexGuard<'_, Cache> {
+    pub fn lock(&self, key: impl Into<CacheKey>) -> MutexGuard<'_, Cache> {
         self.shards[self.shard_index(key)].0.lock()
     }
     pub fn is_disabled(&self) -> bool {
         self.capacity == 0
     }
+    pub fn stats(&self) -> (usize, u64) {
+        self.shards.iter().fold((0, 0u64), |(bytes, hits), shard| {
+            let cache = shard.0.lock();
+            (bytes + cache.bytes(), hits.wrapping_add(cache.hits))
+        })
+    }
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.0.lock().bytes()).sum()
+        self.stats().0
     }
     // Mark tables retired before calling this. An admission already in progress
     // finishes before its shard is purged; later admissions see the retirement.
@@ -72,7 +111,7 @@ impl BlockCache {
     }
 }
 struct Entry {
-    key: Key,
+    key: CacheKey,
     block: Arc<ReadBlock>,
     size: usize,
     prev: usize,
@@ -86,13 +125,13 @@ pub(crate) struct Counters {
     pub compaction_output_bytes: AtomicU64,
     pub compactions: AtomicU64,
     pub max_compaction_inputs: AtomicU64,
-    pub hits: AtomicU64,
     pub bloom_negatives: AtomicU64,
 }
 pub(crate) struct Cache {
     capacity: usize,
     bytes: usize,
-    entries: HashMap<Key, usize>,
+    entries: HashMap<CacheKey, usize, BuildHasherDefault<KeyHasher>>,
+    hits: u64,
     slots: Vec<Option<Entry>>,
     free: Vec<usize>,
     head: usize,
@@ -103,7 +142,8 @@ impl Cache {
         Self {
             capacity,
             bytes: 0,
-            entries: HashMap::new(),
+            entries: HashMap::default(),
+            hits: 0,
             slots: Vec::new(),
             free: Vec::new(),
             head: NONE,
@@ -143,16 +183,19 @@ impl Cache {
         self.free.push(index);
         e
     }
-    pub fn get(&mut self, key: Key, counters: &Counters) -> Option<Arc<ReadBlock>> {
+    pub fn get(&mut self, key: impl Into<CacheKey>) -> Option<Arc<ReadBlock>> {
+        let key = key.into();
         let index = *self.entries.get(&key)?;
         if index != self.head {
             self.unlink(index);
             self.link_front(index);
         }
-        counters.hits.fetch_add(1, Ordering::Relaxed);
+        // Already protected by this shard's mutex; no shared atomic cache line.
+        self.hits = self.hits.wrapping_add(1);
         Some(self.slots[index].as_ref().unwrap().block.clone())
     }
-    pub fn insert(&mut self, key: Key, block: Arc<ReadBlock>) {
+    pub fn insert(&mut self, key: impl Into<CacheKey>, block: Arc<ReadBlock>) {
+        let key = key.into();
         let size = block.allocated_bytes() + ENTRY_OVERHEAD;
         if size > self.capacity {
             return;
@@ -215,7 +258,7 @@ impl Cache {
         let mut index = self.head;
         while index != NONE {
             let e = self.slots[index].as_ref().unwrap();
-            let (next, table) = (e.next, e.key.0);
+            let (next, table) = (e.next, e.key.identity.0);
             if retired.contains(&table) {
                 self.remove(index);
             }
@@ -234,6 +277,66 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn prehashed_collisions_keep_full_identity_and_retirement() {
+        let a = CacheKey {
+            identity: (1, 0),
+            hash: 7,
+        };
+        let b = CacheKey {
+            identity: (2, 0),
+            hash: 7,
+        };
+        let mut cache = Cache::new(4096);
+        let first = block(15);
+        let second = block(31);
+        cache.insert(a, first.clone());
+        cache.insert(b, second.clone());
+        assert!(Arc::ptr_eq(&cache.get(a).unwrap(), &first));
+        assert!(Arc::ptr_eq(&cache.get(b).unwrap(), &second));
+        cache.remove_tables(&HashSet::from([1]));
+        assert!(cache.get(a).is_none());
+        assert!(Arc::ptr_eq(&cache.get(b).unwrap(), &second));
+        assert_eq!(cache.hits, 3);
+        for identity in [(0, 0), (u64::MAX, usize::MAX), (1, 0), (1, 1)] {
+            let key = CacheKey::from(identity);
+            let mut hasher = KeyHasher::default();
+            key.hash(&mut hasher);
+            assert_eq!(hasher.finish(), key.hash);
+            assert_eq!(key, CacheKey::from(identity));
+        }
+    }
+
+    #[test]
+    fn concurrent_shard_hits_are_cumulative_across_retirement() {
+        let cache = Arc::new(BlockCache::new(8 * MIN_SHARD_BYTES));
+        let mut keys = Vec::new();
+        for shard in 0..8 {
+            let key = (0..1000)
+                .map(|n| CacheKey::from((1, n)))
+                .find(|key| cache.shard_index(*key) == shard)
+                .unwrap();
+            cache.lock(key).insert(key, block(15));
+            keys.push(key);
+        }
+        std::thread::scope(|scope| {
+            for key in keys {
+                let cache = &cache;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        assert!(cache.lock(key).get(key).is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(cache.stats().1, 8000);
+        cache.remove_tables(&HashSet::from([1]));
+        assert_eq!(cache.stats(), (0, 8000));
+        cache.lock((2, 0)).insert((2, 0), block(15));
+        assert!(cache.lock((2, 0)).get((2, 0)).is_some());
+        assert_eq!(cache.stats().1, 8001);
+    }
 
     #[test]
     fn shards_share_one_budget_and_do_not_serialize_unrelated_blocks() {
@@ -305,19 +408,18 @@ mod tests {
         let first = block(15);
         let size = first.allocated_bytes() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(size * 2);
-        let counters = Counters::default();
         cache.insert((1, 0), first.clone());
         cache.insert((1, 1), block(15));
-        let reader = cache.get((1, 0), &counters).unwrap();
+        let reader = cache.get((1, 0)).unwrap();
         assert!(Arc::ptr_eq(&reader, &first));
         cache.insert((2, 0), block(15));
-        assert!(cache.get((1, 1), &counters).is_none());
-        assert!(cache.get((1, 0), &counters).is_some());
-        assert!(cache.get((2, 0), &counters).is_some());
-        assert_eq!(counters.hits.load(Ordering::Relaxed), 3);
+        assert!(cache.get((1, 1)).is_none());
+        assert!(cache.get((1, 0)).is_some());
+        assert!(cache.get((2, 0)).is_some());
+        assert_eq!(cache.hits, 3);
         assert_eq!(cache.bytes(), size * 2);
         cache.insert((3, 0), block(15));
-        assert!(cache.get((1, 0), &counters).is_none());
+        assert!(cache.get((1, 0)).is_none());
         assert_eq!(
             reader.get(b"k").unwrap().value.as_deref(),
             Some(&[42; 15][..])
@@ -328,44 +430,39 @@ mod tests {
     fn replacements_oversized_blocks_and_disabled_cache_respect_capacity() {
         let size = block(15).allocated_bytes() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(size * 2);
-        let counters = Counters::default();
         cache.insert((1, 0), block(15));
         cache.insert((2, 0), block(15));
         let smaller = block(0);
         cache.insert((1, 0), smaller.clone());
         let smaller_size = smaller.allocated_bytes() + ENTRY_OVERHEAD;
         assert_eq!(cache.bytes(), size + smaller_size);
-        assert!(Arc::ptr_eq(
-            &cache.get((1, 0), &counters).unwrap(),
-            &smaller
-        ));
+        assert!(Arc::ptr_eq(&cache.get((1, 0)).unwrap(), &smaller));
         cache.insert((3, 0), block(256));
         assert_eq!(cache.bytes(), size + smaller_size);
-        assert!(cache.get((3, 0), &counters).is_none());
+        assert!(cache.get((3, 0)).is_none());
         let larger = block(100);
         let larger_size = larger.allocated_bytes() + ENTRY_OVERHEAD;
         assert!(larger_size <= size * 2 && larger_size + smaller_size > size * 2);
         cache.insert((2, 0), larger);
         assert_eq!(cache.bytes(), larger_size);
-        assert!(cache.get((1, 0), &counters).is_none());
-        assert!(cache.get((2, 0), &counters).is_some());
+        assert!(cache.get((1, 0)).is_none());
+        assert!(cache.get((2, 0)).is_some());
         let mut disabled = Cache::new(0);
         disabled.insert((1, 0), block(0));
         assert_eq!(disabled.bytes(), 0);
-        assert!(disabled.get((1, 0), &counters).is_none());
+        assert!(disabled.get((1, 0)).is_none());
     }
 
     #[test]
     fn dense_legacy_blocks_that_cannot_fit_do_not_evict_for_recycling() {
         let mut cache = Cache::new(1200);
-        let counters = Counters::default();
         cache.insert((1, 0), block(920));
         let before = cache.bytes();
         assert!(before > 0);
         // 55 empty values with one-byte keys: frame 1002, required offsets 220.
         assert!(cache.take_reusable(1002, false).is_none());
         assert_eq!(cache.bytes(), before);
-        assert!(cache.get((1, 0), &counters).is_some());
+        assert!(cache.get((1, 0)).is_some());
         // V3 carries its directory within the frame, so this bound is exact.
         assert!(cache.take_reusable(1226, true).is_none());
         assert_eq!(cache.bytes(), before);
@@ -380,7 +477,7 @@ mod tests {
         // though the conservative dense-record upper bound would not.
         assert!(cache.take_reusable(200, false).is_none());
         assert_eq!(cache.bytes(), before);
-        assert!(cache.get((1, 0), &Counters::default()).is_some());
+        assert!(cache.get((1, 0)).is_some());
     }
 
     #[test]
@@ -426,7 +523,6 @@ mod tests {
     #[test]
     fn indexed_lru_matches_a_reference_under_mixed_sizes_and_replacements() {
         let mut cache = Cache::new(2048);
-        let counters = Counters::default();
         let mut reference: Vec<(Key, Arc<ReadBlock>, usize)> = Vec::new();
         let mut rng = 0x12345678u64;
         for step in 0..10_000 {
@@ -442,7 +538,7 @@ mod tests {
                     reference.insert(0, e);
                     block
                 });
-                let actual = cache.get(key, &counters);
+                let actual = cache.get(key);
                 assert_eq!(actual.is_some(), expected.is_some());
                 if let (Some(actual), Some(expected)) = (actual, expected) {
                     assert!(Arc::ptr_eq(&actual, &expected));
@@ -465,7 +561,7 @@ mod tests {
             let mut previous = NONE;
             for (key, _, _) in &reference {
                 let e = cache.slots[index].as_ref().unwrap();
-                assert_eq!(e.key, *key);
+                assert_eq!(e.key.identity, *key);
                 assert_eq!(e.prev, previous);
                 previous = index;
                 index = e.next;
@@ -478,17 +574,16 @@ mod tests {
     #[test]
     fn retiring_tables_preserves_live_lru_entries_and_outstanding_values() {
         let mut cache = Cache::new(4096);
-        let counters = Counters::default();
         let old = block(15);
         cache.insert((1, 0), old.clone());
         cache.insert((2, 0), block(15));
         cache.insert((1, 1), block(15));
         cache.insert((3, 0), block(15));
         cache.remove_tables(&HashSet::from([1, 3]));
-        assert!(cache.get((1, 0), &counters).is_none());
-        assert!(cache.get((1, 1), &counters).is_none());
-        assert!(cache.get((3, 0), &counters).is_none());
-        assert!(cache.get((2, 0), &counters).is_some());
+        assert!(cache.get((1, 0)).is_none());
+        assert!(cache.get((1, 1)).is_none());
+        assert!(cache.get((3, 0)).is_none());
+        assert!(cache.get((2, 0)).is_some());
         assert_eq!(cache.head, cache.tail);
         assert_eq!(old.get(b"k").unwrap().value.unwrap().len(), 15);
         cache.remove_tables(&HashSet::from([2]));
@@ -496,6 +591,6 @@ mod tests {
         assert_eq!((cache.head, cache.tail), (NONE, NONE));
         assert!(cache.slots.is_empty());
         cache.insert((4, 0), block(0));
-        assert!(cache.get((4, 0), &counters).is_some());
+        assert!(cache.get((4, 0)).is_some());
     }
 }
