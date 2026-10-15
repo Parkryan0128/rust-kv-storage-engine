@@ -451,7 +451,7 @@ fn full_compaction_bounds_fan_in_and_preserves_deletions_across_rounds() {
     assert_eq!(db.stats().sst_files, 11);
     db.compact().unwrap();
     assert_eq!(db.stats().sst_files, 1);
-    assert_eq!(db.stats().max_compaction_inputs, 4);
+    assert_eq!(db.stats().max_compaction_inputs, 2);
     assert!(db.stats().compactions > 1);
     assert_eq!(db.get(b"deleted").unwrap(), None);
     drop(db);
@@ -464,6 +464,52 @@ fn full_compaction_bounds_fan_in_and_preserves_deletions_across_rounds() {
     }
     assert_eq!(db.get(b"hot").unwrap().unwrap().as_ref(), &[10]);
     assert_eq!(db.get(b"deleted").unwrap(), None);
+}
+
+#[test]
+fn seven_small_block_tables_compact_once_and_preserve_newest_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        compaction_file_threshold: 1000,
+        ..Options::default()
+    };
+    let db = Engine::open_with_options(dir.path(), options.clone()).unwrap();
+    for generation in 0..7u8 {
+        let mut batch = rust_kv_storage_engine::WriteBatch::new();
+        for key in 0..64u64 {
+            batch.put(key.to_be_bytes(), vec![generation; 4096]);
+        }
+        if generation == 6 {
+            batch.delete(0u64.to_be_bytes());
+        }
+        db.write_batch(batch).unwrap();
+        db.flush().unwrap();
+    }
+    let before = db.stats();
+    assert_eq!(before.sst_files, 7);
+    db.compact().unwrap();
+    let after = db.stats();
+    assert_eq!(after.compactions - before.compactions, 1);
+    assert_eq!(after.max_compaction_inputs, 7);
+    assert_eq!(
+        after.compaction_input_bytes - before.compaction_input_bytes,
+        before.sst_bytes
+    );
+    assert_eq!(
+        after.compaction_output_bytes - before.compaction_output_bytes,
+        after.sst_bytes
+    );
+    assert_eq!(after.sst_files, 1);
+    assert_eq!(after.sst_records, 63);
+    drop(db);
+    let db = Engine::open_with_options(dir.path(), options).unwrap();
+    assert!(db.get(&0u64.to_be_bytes()).unwrap().is_none());
+    for key in 1..64u64 {
+        assert_eq!(
+            db.get(&key.to_be_bytes()).unwrap().unwrap().as_ref(),
+            &[6; 4096]
+        );
+    }
 }
 
 #[test]

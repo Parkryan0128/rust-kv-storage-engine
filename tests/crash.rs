@@ -269,7 +269,7 @@ fn interrupted_multi_round_compaction_recovers_published_prefix() {
             ..Options::default()
         };
         let db = Engine::open_with_options(dir.path(), opts.clone()).unwrap();
-        for generation in 0..11u8 {
+        for generation in 0..19u8 {
             db.put(&[generation], &[generation]).unwrap();
             db.put(b"hot", &[generation]).unwrap();
             if generation == 0 {
@@ -292,13 +292,13 @@ fn interrupted_multi_round_compaction_recovers_published_prefix() {
             Some(86)
         );
         let db = Engine::open_with_options(dir.path(), opts).unwrap();
-        for generation in 0..11u8 {
+        for generation in 0..19u8 {
             assert_eq!(
                 db.get(&[generation]).unwrap().unwrap().as_ref(),
                 &[generation]
             );
         }
-        assert_eq!(db.get(b"hot").unwrap().unwrap().as_ref(), &[10]);
+        assert_eq!(db.get(b"hot").unwrap().unwrap().as_ref(), &[18]);
         assert_eq!(db.get(b"deleted").unwrap(), None);
         db.compact().unwrap();
         assert_eq!(db.stats().sst_files, 1);

@@ -5,7 +5,35 @@ use crate::{
     Result,
 };
 use std::{collections::BTreeMap, sync::Arc};
-pub(crate) const MAX_INPUTS: usize = 4;
+pub(crate) const MAX_INPUTS: usize = 16;
+pub(crate) const INPUT_BUFFER_BUDGET: usize = 512 * 1024;
+
+// Budget encoded input buffers, including reuse slack and legacy offset arrays.
+// Two inputs are always allowed so oversized records cannot prevent progress.
+pub(crate) fn input_count(costs: impl Iterator<Item = usize>) -> usize {
+    let mut bytes = 0usize;
+    let mut count = 0;
+    for cost in costs.take(MAX_INPUTS) {
+        let next = bytes.saturating_add(cost);
+        if count >= 2 && next > INPUT_BUFFER_BUDGET {
+            break;
+        }
+        bytes = next;
+        count += 1;
+    }
+    count
+}
+
+#[cfg(test)]
+#[test]
+fn fan_in_respects_buffer_budget_hard_cap_and_oversized_progress() {
+    assert_eq!(input_count(std::iter::empty()), 0);
+    assert_eq!(input_count([usize::MAX].into_iter()), 1);
+    assert_eq!(input_count([usize::MAX; 3].into_iter()), 2);
+    assert_eq!(input_count([INPUT_BUFFER_BUDGET / 4; 8].into_iter()), 4);
+    assert_eq!(input_count([1; MAX_INPUTS + 1].into_iter()), MAX_INPUTS);
+    assert_eq!(input_count([32 * 1024 + 64; 7].into_iter()), 7);
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompactionStyle {
     #[default]
@@ -78,7 +106,8 @@ impl Merge {
             while let Some(i) = self.pending.pop() {
                 self.cursors[i].advance()?;
             }
-            // Fan-in is at most four in the engine. Comparing borrowed heads
+            // Fan-in is bounded by both input memory and a small hard cap.
+            // Comparing borrowed heads
             // avoids heap keys and materializing values for superseded versions.
             let mut newest: Option<crate::codec::RecordRef<'_>> = None;
             for (i, cursor) in self.cursors.iter().enumerate() {

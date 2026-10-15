@@ -1,4 +1,5 @@
 use crate::block::ReadBlock;
+use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -9,6 +10,67 @@ use std::{
 type Key = (u64, usize);
 const NONE: usize = usize::MAX;
 const ENTRY_OVERHEAD: usize = 96;
+const MAX_SHARDS: usize = 8;
+const MIN_SHARD_BYTES: usize = 256 * 1024;
+
+#[repr(align(64))]
+struct Shard(Mutex<Cache>);
+
+// Small caches stay whole. Larger caches divide the same total entry budget
+// across independent LRUs; table AND block identity distribute a single SST.
+pub(crate) struct BlockCache {
+    shards: Vec<Shard>,
+    capacity: usize,
+}
+impl BlockCache {
+    #[cfg(test)]
+    pub fn new(capacity: usize) -> Self {
+        Self::with_block_size(capacity, 0)
+    }
+    pub fn with_block_size(capacity: usize, block_size: usize) -> Self {
+        let minimum = MIN_SHARD_BYTES.max(block_size.saturating_mul(2).saturating_add(
+            crate::codec::HEADER + std::mem::size_of::<ReadBlock>() + ENTRY_OVERHEAD,
+        ));
+        let mut count = 1;
+        while count < MAX_SHARDS && capacity / (count * 2) >= minimum {
+            count *= 2;
+        }
+        Self {
+            shards: (0..count)
+                .map(|n| {
+                    Shard(Mutex::new(Cache::new(
+                        capacity / count + usize::from(n < capacity % count),
+                    )))
+                })
+                .collect(),
+            capacity,
+        }
+    }
+    fn shard_index(&self, key: Key) -> usize {
+        let mut h = key
+            .0
+            .wrapping_add((key.1 as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
+        ((h ^ (h >> 31)) as usize) & (self.shards.len() - 1)
+    }
+    pub fn lock(&self, key: Key) -> MutexGuard<'_, Cache> {
+        self.shards[self.shard_index(key)].0.lock()
+    }
+    pub fn is_disabled(&self) -> bool {
+        self.capacity == 0
+    }
+    pub fn bytes(&self) -> usize {
+        self.shards.iter().map(|s| s.0.lock().bytes()).sum()
+    }
+    // Mark tables retired before calling this. An admission already in progress
+    // finishes before its shard is purged; later admissions see the retirement.
+    pub fn remove_tables(&self, retired: &HashSet<u64>) {
+        for shard in &self.shards {
+            shard.0.lock().remove_tables(retired);
+        }
+    }
+}
 struct Entry {
     key: Key,
     block: Arc<ReadBlock>,
@@ -172,6 +234,56 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn shards_share_one_budget_and_do_not_serialize_unrelated_blocks() {
+        use std::{sync::mpsc::sync_channel, thread, time::Duration};
+        let capacity = 8 * MIN_SHARD_BYTES + 3;
+        let cache = Arc::new(BlockCache::new(capacity));
+        assert_eq!(cache.shards.len(), 8);
+        assert_eq!(
+            cache
+                .shards
+                .iter()
+                .map(|s| s.0.lock().capacity)
+                .sum::<usize>(),
+            capacity
+        );
+        assert_eq!(BlockCache::new(1024).shards.len(), 1);
+        assert_eq!(
+            BlockCache::with_block_size(8 * 1024 * 1024, 1024 * 1024)
+                .shards
+                .len(),
+            2
+        );
+        assert!(BlockCache::new(0).is_disabled());
+        let first = (1, 0);
+        let second = (1..100)
+            .map(|n| (1, n))
+            .find(|&key| cache.shard_index(key) != cache.shard_index(first))
+            .unwrap();
+        let held = cache.lock(first);
+        let worker_cache = cache.clone();
+        let (tx, rx) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            worker_cache.lock(second).insert(second, block(15));
+            tx.send(()).unwrap();
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        completed.unwrap();
+        let used: HashSet<_> = (0..256).map(|n| cache.shard_index((1, n))).collect();
+        assert_eq!(used.len(), 8, "blocks of one table must reach every shard");
+        let value = block(64 * 1024);
+        for n in 0..256 {
+            cache.lock((1, n)).insert((1, n), value.clone());
+        }
+        assert!(cache.bytes() <= capacity);
+        assert!(cache.bytes() > 0);
+        cache.remove_tables(&HashSet::from([1]));
+        assert_eq!(cache.bytes(), 0);
+    }
 
     fn block(value_len: usize) -> Arc<ReadBlock> {
         let mut payload = Vec::new();

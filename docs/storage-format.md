@@ -58,7 +58,14 @@ it is not a hard bound on process RSS. Table inspection reads one encoded block
 at a time and copies only the preview's first 128 bytes of each key/value.
 
 Point reads share an immutable table-list snapshot. The block cache tracks LRU
-order through indexed links rather than a tree. When a miss requires eviction,
+order through indexed links rather than a tree. Up to eight independently locked
+shards share the configured entry budget; both table and block identity select a
+shard. Small caches and large configured block targets use fewer shards. The
+default 8 MiB cache has eight 1 MiB shards. Capacity is not borrowed across shards:
+a skewed workload can use the budget less effectively, and a block larger than
+its shard's budget bypasses admission even if it could fit in the total cache.
+A disabled cache bypasses cache locks and admission entirely.
+When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
 block; outstanding readers retain their original immutable block. Frames that
 cannot fit the budget do not evict entries for recycling: legacy blocks use a
@@ -125,14 +132,23 @@ superseded versions and safely discarded tombstones need no owned copies.
 Input frame buffers are reused, with oversized buffers released on smaller blocks.
 Checksums and record validation still cover discarded versions.
 
-Each merge opens at most four input cursors. Larger requests proceed through
+Each merge selects up to sixteen input cursors under a 512 KiB input-buffer
+estimate, accounting for the largest encoded block in each file, buffer reuse
+slack and legacy offset arrays. At least two inputs are allowed even when their
+records exceed that budget, so every merge can make progress. This is not a hard
+RSS bound: indexes, filters, output buffers and concurrent operations are separate.
+Requests that exceed either limit proceed through
 manifest-published partial merges, retaining tombstones until it is safe to remove
-them. Recovery can resume from any published round. This bounds input block/value
-residency by four inputs rather than the total SST count; it does not cap RSS,
-which also includes indexes, filters, output buffers and concurrent operations.
-The tradeoff is additional intermediate write I/O for merges with more than four
-inputs. `stats().max_compaction_inputs` reports the observed maximum since open.
+them. Recovery can resume from any published round. Small-block inputs can merge
+together without an intermediate file; large-record inputs use fewer cursors.
+`stats().max_compaction_inputs` reports the observed maximum since open.
 Obsolete-cache cleanup runs after releasing the engine state write lock.
+
+SST publication coalesces sequential block and metadata writes through a fixed
+256 KiB output buffer without changing the file format or block target. The
+buffer is explicitly flushed before Bloom-filter readback and before file sync
+and rename; a flush error prevents publication. Oversized writes can bypass the
+buffer rather than growing it.
 
 The background worker releases the maintenance lock fairly between jobs so a
 manual flush does not wait for a continuously replenished background queue.

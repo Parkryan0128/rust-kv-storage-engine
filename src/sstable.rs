@@ -1,14 +1,15 @@
+#[cfg(test)]
+use crate::cache::Cache;
 use crate::{
     block::{indexed_records, ReadBlock},
     bloom::Bloom,
-    cache::{Cache, Counters},
+    cache::{BlockCache, Counters},
     codec::*,
     error::corrupt,
     fault,
     memtable::Record,
     Result,
 };
-use parking_lot::Mutex;
 use std::{
     borrow::Borrow,
     fs::{self, File, OpenOptions},
@@ -54,6 +55,7 @@ pub(crate) struct Table {
     pub count: u64,
     pub file_bytes: u64,
     pub max_seq: u64,
+    pub compaction_buffer_bytes: usize,
     cacheable: AtomicBool,
     indexed: bool,
 }
@@ -179,6 +181,14 @@ impl Table {
         {
             return Err(corrupt("SST index/count mismatch"));
         }
+        let frame = index.iter().map(|i| i.len as usize).max().unwrap_or(0);
+        let offsets = if magic == MAGIC {
+            0
+        } else {
+            frame.saturating_sub(HEADER) / 17 * std::mem::size_of::<u32>()
+        };
+        // A reused frame/index may retain up to twice the current requirement.
+        let compaction_buffer_bytes = (frame + offsets) * 2 + std::mem::size_of::<ReadBlock>();
         Ok(Self {
             id,
             file,
@@ -187,6 +197,7 @@ impl Table {
             count,
             file_bytes: len,
             max_seq,
+            compaction_buffer_bytes,
             cacheable: AtomicBool::new(true),
             indexed: magic == MAGIC,
         })
@@ -238,7 +249,7 @@ impl Table {
     pub fn get(
         &self,
         key: &[u8],
-        cache: &Mutex<Cache>,
+        cache: &BlockCache,
         counters: &Counters,
     ) -> Result<Option<Record>> {
         if self.index.first().is_none_or(|i| key < i.first.as_slice()) {
@@ -253,12 +264,16 @@ impl Table {
             return Ok(None);
         }
         let n = p - 1;
+        if cache.is_disabled() {
+            counters.reads.fetch_add(1, Ordering::Relaxed);
+            return self.read_stream_block(n, None)?.lookup(key);
+        }
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
         let (cached, reusable, budget) = {
-            let mut cache = cache.lock();
+            let mut cache = cache.lock((self.id, n));
             let cached = cache.get((self.id, n), counters);
-            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Relaxed) {
+            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Acquire) {
                 cache.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
@@ -277,18 +292,18 @@ impl Table {
             let b = Arc::new(block);
             #[cfg(test)]
             crate::test_hooks::pause("cache_before_admission");
-            let mut cache = cache.lock();
-            if self.cacheable.load(Ordering::Relaxed) {
+            let mut cache = cache.lock((self.id, n));
+            if self.cacheable.load(Ordering::Acquire) {
                 cache.insert((self.id, n), b.clone());
             }
             b
         };
         block.lookup(key)
     }
-    // Call while holding the same cache mutex used by get's admission check.
-    // An old snapshot can still read the file, but cannot refill the cache.
+    // Mark before purging all cache shards. Once each shard's purge finishes,
+    // an old snapshot can still read the file but cannot refill that shard.
     pub fn retire(&self) {
-        self.cacheable.store(false, Ordering::Relaxed);
+        self.cacheable.store(false, Ordering::Release);
     }
 }
 fn resize_frame(bytes: &mut Vec<u8>, len: usize) {
@@ -536,7 +551,7 @@ mod tests {
         .unwrap();
         assert_eq!(table.index[0].len, 958);
         assert_eq!(table.index[1].len, 1008);
-        let cache = Mutex::new(Cache::new(1200));
+        let cache = BlockCache::new(1200);
         let counters = Counters::default();
         assert_eq!(table.get(b"a", &cache, &counters).unwrap().unwrap().seq, 1);
         assert_eq!(table.get(b"b", &cache, &counters).unwrap().unwrap().seq, 2);
@@ -544,7 +559,7 @@ mod tests {
         assert_eq!(table.get(b"b", &cache, &counters).unwrap().unwrap().seq, 2);
         assert_eq!(counters.reads.load(Ordering::Relaxed), 2);
         assert_eq!(counters.hits.load(Ordering::Relaxed), 1);
-        assert!(cache.lock().bytes() <= 1200);
+        assert!(cache.bytes() <= 1200);
     }
 
     #[test]
@@ -631,7 +646,7 @@ mod tests {
             if count == 0 {
                 assert_eq!(actual.file_bytes, 88);
             }
-            let cache = Mutex::new(Cache::new(0));
+            let cache = BlockCache::new(0);
             let counters = Counters::default();
             for key in 0..count {
                 assert_eq!(
@@ -664,29 +679,29 @@ mod tests {
             10,
         )
         .unwrap();
-        let cache = Mutex::new(Cache::new(512));
+        let cache = BlockCache::new(512);
         let counters = Counters::default();
         table.get(b"key", &cache, &counters).unwrap();
-        let capacity = cache.lock().bytes();
-        let held = cache.lock().get((1, 0), &counters).unwrap();
+        let capacity = cache.bytes();
+        let held = cache.lock((1, 0)).get((1, 0), &counters).unwrap();
+        table.retire();
+        cache.remove_tables(&std::collections::HashSet::from([1]));
         {
-            let mut cache = cache.lock();
-            table.retire();
-            cache.remove_tables(&std::collections::HashSet::from([1]));
+            let mut cache = cache.lock((1, 0));
             assert_eq!(cache.bytes(), 0);
             *cache = Cache::new(capacity);
             cache.insert((2, 0), held.clone());
         }
-        let live_bytes = cache.lock().bytes();
+        let live_bytes = cache.bytes();
         // A retired file stays usable through its open handle after unlink.
         fs::remove_file(dir.path().join("retired.sst")).unwrap();
         assert_eq!(
             table.get(b"key", &cache, &counters).unwrap().unwrap().seq,
             1
         );
-        assert_eq!(cache.lock().bytes(), live_bytes);
-        assert!(cache.lock().get((1, 0), &counters).is_none());
-        assert!(cache.lock().get((2, 0), &counters).is_some());
+        assert_eq!(cache.bytes(), live_bytes);
+        assert!(cache.lock((1, 0)).get((1, 0), &counters).is_none());
+        assert!(cache.lock((1, 0)).get((2, 0), &counters).is_some());
         assert_eq!(held.get(b"key").unwrap().value.unwrap(), "value");
     }
 
@@ -712,7 +727,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let cache = Arc::new(Mutex::new(Cache::new(512)));
+        let cache = Arc::new(BlockCache::new(8 * 1024 * 1024));
         let (entered_tx, entered_rx) = sync_channel(1);
         let (resume_tx, resume_rx) = sync_channel(1);
         let reader_table = table.clone();
@@ -722,18 +737,60 @@ mod tests {
             reader_table.get(b"key", &reader_cache, &Counters::default())
         });
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        {
-            let mut cache = cache.lock();
-            table.retire();
-            cache.remove_tables(&std::collections::HashSet::from([1]));
-        }
+        table.retire();
+        cache.remove_tables(&std::collections::HashSet::from([1]));
         fs::remove_file(path).unwrap();
         resume_tx.send(()).unwrap();
         assert_eq!(
             reader.join().unwrap().unwrap().unwrap().value.unwrap(),
             "value"
         );
-        assert_eq!(cache.lock().bytes(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn retirement_purges_every_shard_while_pinned_files_remain_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retired-shards.sst");
+        let table = Table::write(
+            &path,
+            7,
+            (0..128u64).map(|key| {
+                Ok((
+                    key.to_be_bytes(),
+                    Record {
+                        seq: key + 1,
+                        value: Some(Bytes::from(vec![42; 128])),
+                    },
+                ))
+            }),
+            128,
+            64,
+            10,
+        )
+        .unwrap();
+        let cache = BlockCache::new(8 * 1024 * 1024);
+        let counters = Counters::default();
+        for key in 0..128u64 {
+            table.get(&key.to_be_bytes(), &cache, &counters).unwrap();
+        }
+        assert!(cache.bytes() > 0);
+        table.retire();
+        cache.remove_tables(&std::collections::HashSet::from([7]));
+        assert_eq!(cache.bytes(), 0);
+        fs::remove_file(path).unwrap();
+        for key in 0..128u64 {
+            assert_eq!(
+                table
+                    .get(&key.to_be_bytes(), &cache, &counters)
+                    .unwrap()
+                    .unwrap()
+                    .seq,
+                key + 1
+            );
+        }
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(counters.reads.load(Ordering::Relaxed), 256);
     }
 
     #[test]

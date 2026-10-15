@@ -1,10 +1,13 @@
 use super::*;
+use std::io::BufWriter;
 use std::ops::Range;
+
+const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 
 // Both frozen memory and a borrowed merge stream through the same publisher.
 // The last key stays in the encoded block, avoiding an extra key allocation.
 pub(crate) struct TableWriter {
-    file: File,
+    file: BufWriter<File>,
     index: Vec<Index>,
     bloom: Bloom,
     block: Vec<u8>,
@@ -24,11 +27,12 @@ impl TableWriter {
         block_size: usize,
         bloom_bits: usize,
     ) -> Result<Self> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(path.with_extension("tmp"))?;
+        let mut file = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file);
         file.write_all(MAGIC)?;
         Ok(Self {
             file,
@@ -84,9 +88,8 @@ impl TableWriter {
         put_u32(&mut self.block, self.offsets.len() as u32);
         let header = frame_header(&self.block[HEADER..])?;
         self.block[..HEADER].copy_from_slice(&header);
-        // One contiguous frame, including retries for short/interrupted writes.
-        // All writes are sequential; pread during Bloom rebuilding does not
-        // change this tracked file position.
+        // Coalesce small frames without changing their on-disk boundaries.
+        // Position counts buffered bytes too; pread never changes it.
         self.file.write_all(&self.block)?;
         self.index.push(Index {
             first: std::mem::take(&mut self.first),
@@ -104,11 +107,15 @@ impl TableWriter {
     pub(super) fn finish(mut self, path: &Path, id: u64, bloom_bits: usize) -> Result<Table> {
         self.flush_block()?;
         if self.bloom.needs_rebuild(self.count, bloom_bits) {
+            // Positional reads must see every buffered output block.
+            self.file.flush()?;
             self.bloom = Bloom::new(self.count, bloom_bits);
             for i in &self.index {
                 resize_frame(&mut self.block, i.len as usize);
                 fault::hit("bloom_rebuild_read")?;
-                self.file.read_exact_at(&mut self.block, i.offset)?;
+                self.file
+                    .get_ref()
+                    .read_exact_at(&mut self.block, i.offset)?;
                 let mut c = Cursor {
                     b: indexed_records(frame_payload(&self.block)?)?,
                 };
@@ -131,8 +138,10 @@ impl TableWriter {
         let checksum = crc32fast::hash(&footer);
         put_u32(&mut footer, checksum);
         self.file.write_all(&footer)?;
+        // Propagate buffered write errors before syncing or publishing the SST.
+        self.file.flush()?;
         fault::hit("sst_before_sync")?;
-        self.file.sync_all()?;
+        self.file.get_ref().sync_all()?;
         fault::hit("sst_after_sync")?;
         fs::rename(path.with_extension("tmp"), path)?;
         sync_dir(path.parent().unwrap())?;
@@ -140,5 +149,55 @@ impl TableWriter {
         // Release the buffers and metadata before reopening the published table.
         drop(self);
         Table::open(path, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffering_preserves_bytes_with_bloom_rebuild_empty_and_oversized_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        for sizes in [
+            vec![],
+            vec![128; 100],
+            vec![128, OUTPUT_BUFFER_BYTES + 17, 128],
+        ] {
+            let mut outputs = Vec::new();
+            for buffered in [false, true] {
+                let path = dir.path().join(format!("{}-{buffered}.sst", sizes.len()));
+                let mut writer = TableWriter::new(&path, 1000, 1024, 10).unwrap();
+                if !buffered {
+                    writer.file = BufWriter::with_capacity(0, writer.file.into_inner().unwrap());
+                }
+                for (n, &len) in sizes.iter().enumerate() {
+                    writer
+                        .push(
+                            &(n as u64).to_be_bytes(),
+                            n as u64 + 1,
+                            Some(&vec![42; len]),
+                        )
+                        .unwrap();
+                }
+                writer.flush_block().unwrap();
+                if buffered && sizes.iter().sum::<usize>() < OUTPUT_BUFFER_BYTES / 2 {
+                    assert_eq!(writer.file.get_ref().metadata().unwrap().len(), 0);
+                    assert_eq!(writer.file.buffer().len() as u64, writer.position);
+                }
+                // The large estimate forces Bloom rebuilding to read buffered data.
+                let table = Arc::new(writer.finish(&path, 1, 10).unwrap());
+                let mut cursor = TableCursor::new(table).unwrap();
+                for (n, &len) in sizes.iter().enumerate() {
+                    let record = cursor.current().unwrap().unwrap();
+                    assert_eq!(record.key, (n as u64).to_be_bytes());
+                    assert_eq!(record.value.unwrap(), vec![42; len]);
+                    cursor.advance().unwrap();
+                }
+                assert!(cursor.current().unwrap().is_none());
+                outputs.push(fs::read(path).unwrap());
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
     }
 }

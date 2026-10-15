@@ -1,5 +1,5 @@
 use crate::{
-    cache::{Cache, Counters},
+    cache::{BlockCache, Counters},
     codec::MAX_RECORD,
     compaction::{self, CompactionStyle, Merge},
     error::{corrupt, EngineError},
@@ -104,7 +104,7 @@ pub struct Stats {
     pub compaction_input_bytes: u64,
     pub compaction_output_bytes: u64,
     pub compactions: u64,
-    /// Largest number of input SSTs in a single merge since open (at most four).
+    /// Largest number of input SSTs in a single merge since open (at most sixteen).
     pub max_compaction_inputs: u64,
 }
 struct Frozen {
@@ -139,7 +139,7 @@ struct Core {
     state: RwLock<State>,
     writer: Mutex<Option<Wal>>,
     maintenance: Mutex<Maintenance>,
-    cache: Mutex<Cache>,
+    cache: BlockCache,
     counters: Counters,
     notify: Sender<()>,
     stop: AtomicBool,
@@ -292,6 +292,7 @@ impl Engine {
     fn build(options: Options, disk: Option<Disk>, wal: Option<Wal>, state: State) -> Result<Self> {
         let (tx, rx) = bounded(1);
         let capacity = options.block_cache_capacity;
+        let cache = BlockCache::with_block_size(capacity, options.block_size);
         let persistent = disk.is_some();
         let core = Arc::new(Core {
             options,
@@ -299,7 +300,7 @@ impl Engine {
             state: RwLock::new(state),
             writer: Mutex::new(wal),
             maintenance: Mutex::new(Maintenance { prefer_flush: true }),
-            cache: Mutex::new(Cache::new(capacity)),
+            cache,
             counters: Counters::default(),
             notify: tx,
             stop: AtomicBool::new(false),
@@ -599,7 +600,7 @@ impl Engine {
             block_reads: c.counters.reads.load(Ordering::Relaxed),
             cache_hits: c.counters.hits.load(Ordering::Relaxed),
             bloom_negatives: c.counters.bloom_negatives.load(Ordering::Relaxed),
-            cache_bytes: c.cache.lock().bytes(),
+            cache_bytes: c.cache.bytes(),
             sst_bytes: s.tables.iter().map(|t| t.file_bytes).sum(),
             flush_bytes: c.counters.flush_bytes.load(Ordering::Relaxed),
             compaction_input_bytes: c.counters.compaction_input_bytes.load(Ordering::Relaxed),
@@ -925,14 +926,17 @@ impl Core {
         // Publish bounded partial merges. A crash between rounds leaves a valid
         // manifest, and tombstones survive until all remaining SSTs are selected.
         let mut pending: VecDeque<_> = tables.into();
-        while pending.len() > compaction::MAX_INPUTS {
-            let inputs = pending.drain(..compaction::MAX_INPUTS).collect();
-            pending.push_back(self.compact_group(inputs)?);
+        loop {
+            let count = compaction::input_count(pending.iter().map(|t| t.compaction_buffer_bytes));
+            let inputs = pending.drain(..count).collect();
+            let merged = self.compact_group(inputs)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.push_back(merged);
             #[cfg(test)]
             crate::test_hooks::pause("compaction_between_groups");
         }
-        self.compact_group(pending.into())?;
-        Ok(())
     }
     fn compact_group(&self, tables: Vec<Arc<Table>>) -> Result<Arc<Table>> {
         debug_assert!((1..=compaction::MAX_INPUTS).contains(&tables.len()));
@@ -972,17 +976,15 @@ impl Core {
             live.push(merged.clone());
             live.sort_unstable_by_key(|table| Reverse(table.max_seq));
         }
-        // Retiring/admitting blocks share the cache mutex, but an O(cache size)
-        // purge must not hold the state lock needed by unrelated memtable reads.
+        // Retire before purging each shard. Readers may finish an admission that
+        // started earlier, but cannot refill a shard after its purge completes.
+        // Do not hold the state lock needed by unrelated memtable reads.
         #[cfg(test)]
         crate::test_hooks::pause("before_cache_purge");
-        {
-            let mut cache = self.cache.lock();
-            for table in &tables {
-                table.retire();
-            }
-            cache.remove_tables(&selected);
+        for table in &tables {
+            table.retire();
         }
+        self.cache.remove_tables(&selected);
         fault::hit("compaction_before_old_delete")?;
         for old in tables {
             fs::remove_file(sst_path(dir, old.id))?;
@@ -1023,7 +1025,7 @@ mod audit_tests {
                 },
             )
             .unwrap();
-            for i in 0..8u8 {
+            for i in 0..(compaction::MAX_INPUTS + 1) as u8 {
                 db.put(&[i], &[i]).unwrap();
                 db.flush().unwrap();
             }
@@ -1062,7 +1064,7 @@ mod audit_tests {
                     .collect::<Result<Vec<_>>>()
                     .unwrap()
                     .len(),
-                8
+                compaction::MAX_INPUTS + 1
             );
         }
     }
