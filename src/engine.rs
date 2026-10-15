@@ -745,15 +745,19 @@ impl Core {
         Ok(end)
     }
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        #[cfg(feature = "write-profiling")]
+        crate::write_profile::reset();
         if batch.is_empty() {
             return check(&self.state.read());
         }
-        for entry in &batch.entries {
-            self.validate_entry(&entry.key, entry.value.as_deref())?;
-        }
-        let size = batch.encoded_len()?;
-        let mut w = self.writer.lock();
-        let end = self.prepare_write(&mut w, batch.len() as u64)?;
+        let size = write_timed!(Validate, {
+            for entry in &batch.entries {
+                self.validate_entry(&entry.key, entry.value.as_deref())?;
+            }
+            batch.encoded_len()?
+        });
+        let mut w = write_timed!(WriterLock, self.writer.lock());
+        let end = write_timed!(Prepare, self.prepare_write(&mut w, batch.len() as u64))?;
         let start = end - batch.len() as u64;
         if let Some(wal) = w.as_mut() {
             if let Err(e) = wal.append_batch(&batch, start + 1, size) {
@@ -765,33 +769,35 @@ impl Core {
         // publishes all operations, including repeated keys, as one change.
         #[cfg(test)]
         crate::test_hooks::pause("write_before_publish");
-        let mut s = self.state.write();
-        // Maintenance can fail while WAL I/O runs without the state lock.
-        // Keep that failure visible; the synced batch may reappear on reopen.
-        check(&s)?;
-        for (i, entry) in batch.entries.into_iter().enumerate() {
-            let record = Record {
-                seq: start + 1 + i as u64,
-                value: entry.value,
-            };
-            if self.disk.is_none() && record.value.is_none() {
-                s.mem.remove(&entry.key);
-            } else {
-                s.mem.insert(entry.key, record);
-            }
-            if i == 0 {
-                #[cfg(test)]
-                crate::test_hooks::pause("batch_after_first_apply");
-                if let Err(e) = fault::hit("batch_after_first_apply") {
-                    let e = EngineError::from(e);
-                    s.fatal = Some(e.to_string());
-                    drop(s);
-                    self.progress();
-                    return Err(e);
+        let mut s = write_timed!(StateLock, self.state.write());
+        write_timed!(Apply, {
+            // Maintenance can fail while WAL I/O runs without the state lock.
+            // Keep that failure visible; the synced batch may reappear on reopen.
+            check(&s)?;
+            for (i, entry) in batch.entries.into_iter().enumerate() {
+                let record = Record {
+                    seq: start + 1 + i as u64,
+                    value: entry.value,
+                };
+                if self.disk.is_none() && record.value.is_none() {
+                    s.mem.remove(&entry.key);
+                } else {
+                    s.mem.insert(entry.key, record);
+                }
+                if i == 0 {
+                    #[cfg(test)]
+                    crate::test_hooks::pause("batch_after_first_apply");
+                    if let Err(e) = fault::hit("batch_after_first_apply") {
+                        let e = EngineError::from(e);
+                        s.fatal = Some(e.to_string());
+                        drop(s);
+                        self.progress();
+                        return Err(e);
+                    }
                 }
             }
-        }
-        s.sequence = end;
+            s.sequence = end;
+        });
         Ok(())
     }
     fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {

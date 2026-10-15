@@ -9,6 +9,14 @@
 //! engine.delete(b"hello")?;
 //! # Ok::<(), rust_kv_storage_engine::EngineError>(())
 //! ```
+// No timing overhead in normal builds.
+macro_rules! write_timed {
+    ($phase:ident, $body:expr) => {{
+        #[cfg(feature = "write-profiling")]
+        let _timer = crate::write_profile::Timer::new(crate::write_profile::Phase::$phase);
+        $body
+    }};
+}
 mod batch;
 mod block;
 mod bloom;
@@ -30,6 +38,9 @@ mod sstable;
 #[cfg(test)]
 mod test_hooks;
 mod wal;
+#[cfg(feature = "write-profiling")]
+#[doc(hidden)]
+pub mod write_profile;
 pub use batch::WriteBatch;
 pub use compaction::CompactionStyle;
 pub use engine::{Engine, KvEngine, Options, Result, Stats};

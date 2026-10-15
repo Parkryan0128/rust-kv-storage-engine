@@ -97,19 +97,21 @@ impl Wal {
     }
 
     pub fn append_batch(&mut self, batch: &WriteBatch, first_seq: u64, size: usize) -> Result<()> {
-        self.begin_frame(size);
-        put_u64(&mut self.buffer, 0);
-        put_u32(&mut self.buffer, BATCH_VERSION);
-        put_u32(&mut self.buffer, batch.len() as u32);
-        for (i, entry) in batch.entries.iter().enumerate() {
-            encode_record_parts(
-                &entry.key,
-                first_seq + i as u64,
-                entry.value.as_deref(),
-                &mut self.buffer,
-            );
-        }
-        debug_assert_eq!(self.buffer.len(), HEADER + size);
+        write_timed!(WalEncode, {
+            self.begin_frame(size);
+            put_u64(&mut self.buffer, 0);
+            put_u32(&mut self.buffer, BATCH_VERSION);
+            put_u32(&mut self.buffer, batch.len() as u32);
+            for (i, entry) in batch.entries.iter().enumerate() {
+                encode_record_parts(
+                    &entry.key,
+                    first_seq + i as u64,
+                    entry.value.as_deref(),
+                    &mut self.buffer,
+                );
+            }
+            debug_assert_eq!(self.buffer.len(), HEADER + size);
+        });
         self.append_frame()
     }
 
@@ -121,15 +123,15 @@ impl Wal {
 
     fn append_frame(&mut self) -> Result<()> {
         let result = (|| {
-            let header = frame_header(&self.buffer[HEADER..])?;
+            let header = write_timed!(WalChecksum, frame_header(&self.buffer[HEADER..]))?;
             self.buffer[..HEADER].copy_from_slice(&header);
             fault::hit("wal_before_append")?;
             // Header and payload share one allocation and one write_all call.
             // write_all still retries interrupted/short writes before syncing.
-            self.file.write_all(&self.buffer)?;
+            write_timed!(WalWrite, self.file.write_all(&self.buffer))?;
             self.bytes += self.buffer.len() as u64;
             fault::hit("wal_before_sync")?;
-            self.file.sync_all()?;
+            write_timed!(WalSync, self.file.sync_all())?;
             fault::hit("wal_after_sync")?;
             Ok(())
         })();

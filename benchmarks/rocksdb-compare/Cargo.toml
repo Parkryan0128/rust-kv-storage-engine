@@ -10,6 +10,7 @@ rust-version = "1.88"
 
 [features]
 rocks = ["dep:rocksdb"]
+write-profiling = ["rust-kv-storage-engine/write-profiling"]
 
 [dependencies]
 rust-kv-storage-engine = { path = "../.." }

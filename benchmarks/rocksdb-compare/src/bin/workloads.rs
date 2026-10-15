@@ -363,6 +363,8 @@ fn writes(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         .collect();
     let before = metrics(path)?;
     let mut samples = Vec::new();
+    #[cfg(feature = "write-profiling")]
+    let mut phase_samples = Vec::new();
     let start = Instant::now();
     for chunk in entries.chunks(c.batch) {
         let one = Instant::now();
@@ -373,10 +375,20 @@ fn writes(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         } else {
             db.batch(chunk)?;
         }
-        samples.push(one.elapsed().as_nanos() as u64);
+        let elapsed = one.elapsed().as_nanos() as u64;
+        samples.push(elapsed);
+        #[cfg(feature = "write-profiling")]
+        phase_samples.push(
+            json!({"total_ns": elapsed, "phase_ns":rust_kv_storage_engine::write_profile::take()}),
+        );
     }
     let commit_seconds = start.elapsed().as_secs_f64();
     let after_commits = metrics(path)?;
+    #[cfg(feature = "write-profiling")]
+    println!(
+        "WRITE_TIMINGS {}",
+        json!({"phases":rust_kv_storage_engine::write_profile::PHASES,"samples":phase_samples})
+    );
     let stats_before_flush = db.stats()?;
     let f = Instant::now();
     db.flush()?;
