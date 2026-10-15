@@ -70,7 +70,10 @@ impl Merge {
         })
     }
 
-    fn next_index(&mut self) -> Result<Option<usize>> {
+    fn consume_next<T>(
+        &mut self,
+        consume: impl FnOnce(crate::codec::RecordRef<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
         loop {
             while let Some(i) = self.pending.pop() {
                 self.cursors[i].advance()?;
@@ -78,20 +81,17 @@ impl Merge {
             // Fan-in is at most four in the engine. Comparing borrowed heads
             // avoids heap keys and materializing values for superseded versions.
             let mut newest: Option<crate::codec::RecordRef<'_>> = None;
-            let mut winner = 0;
             for (i, cursor) in self.cursors.iter().enumerate() {
                 if let Some(record) = cursor.current()? {
                     if newest.as_ref().is_none_or(|old| record.key < old.key) {
                         self.pending.clear();
                         self.pending.push(i);
                         newest = Some(record);
-                        winner = i;
                     } else if let Some(old) = &mut newest {
                         if record.key == old.key {
                             self.pending.push(i);
                             if record.seq > old.seq {
                                 *old = record;
-                                winner = i;
                             }
                         }
                     }
@@ -104,15 +104,15 @@ impl Merge {
             // Advance these cursors only on the next call: the winner still
             // borrows its block until it has been serialized.
             if newest.value.is_some() || !self.drop_tombstones {
-                return Ok(Some(winner));
+                return consume(newest).map(Some);
             }
         }
     }
     pub fn write_into(mut self, writer: &mut TableWriter) -> Result<()> {
-        while let Some(index) = self.next_index()? {
-            let record = self.cursors[index].current()?.unwrap();
-            writer.push(record.key, record.seq, record.value)?;
-        }
+        while self
+            .consume_next(|record| writer.push(record.key, record.seq, record.value))?
+            .is_some()
+        {}
         Ok(())
     }
 }
@@ -124,11 +124,8 @@ impl Iterator for Merge {
         if self.finished {
             return None;
         }
-        match self.next_index() {
-            Ok(Some(index)) => Some(self.cursors[index].current().map(|record| {
-                let record = record.unwrap();
-                (record.key.to_vec(), record.to_owned())
-            })),
+        match self.consume_next(|record| Ok((record.key.to_vec(), record.to_owned()))) {
+            Ok(Some(record)) => Some(Ok(record)),
             result => {
                 self.finished = true;
                 self.cursors.clear();

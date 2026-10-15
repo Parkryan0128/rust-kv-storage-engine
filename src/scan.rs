@@ -138,10 +138,10 @@ impl Scan {
                 }
             }
             Source::Table(iter) => {
-                iter.advance(self.engine.as_ref().unwrap().scan_counters())?;
-                if let Some(record) = iter.current()? {
-                    self.heap
-                        .push(Reverse((record.key.to_vec(), index, record.seq)));
+                if let Some((key, seq)) =
+                    iter.advance(self.engine.as_ref().unwrap().scan_counters())?
+                {
+                    self.heap.push(Reverse((key, index, seq)));
                 }
             }
         }

@@ -41,7 +41,7 @@ impl TableScan {
             .transpose()
     }
 
-    pub fn advance(&mut self, counters: &Counters) -> Result<()> {
+    pub fn advance(&mut self, counters: &Counters) -> Result<Option<(Vec<u8>, u64)>> {
         if self.block.is_some() {
             self.record += 1;
         }
@@ -52,9 +52,9 @@ impl TableScan {
                     if !self.range.allows_end(record.key) {
                         self.done = true;
                         self.block = None;
-                        return Ok(());
+                        return Ok(None);
                     }
-                    return Ok(());
+                    return Ok(Some((record.key.to_vec(), record.seq)));
                 }
             }
             let Some(entry) = self.table.index.get(self.next_block) else {
@@ -92,6 +92,6 @@ impl TableScan {
         }
         self.done = true;
         self.block = None;
-        Ok(())
+        Ok(None)
     }
 }
