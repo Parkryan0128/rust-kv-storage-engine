@@ -10,7 +10,14 @@ fn single_source_scan_keeps_bounds_deletions_and_snapshot() {
         batch
             .put("a", "first")
             .put("b", "deleted")
-           …65 tokens truncated…slice()).unwrap();
+            .put("c", "last")
+            .put("z", "excluded")
+            .delete("b");
+        db.write_batch(batch).unwrap();
+        if disk {
+            db.flush().unwrap();
+        }
+        let mut scan = db.scan(b"a".as_slice()..=b"c".as_slice()).unwrap();
         db.put(b"c", b"later").unwrap();
         assert_eq!(
             scan.next().unwrap().unwrap(),
