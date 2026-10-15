@@ -17,6 +17,8 @@ def capture(*command):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--case", choices=["put-128b", "batch32-128b", "batch256-16b", "flush-pressure"])
+    parser.add_argument("--trials", type=int, choices=range(1, 31))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -25,7 +27,8 @@ def main():
         "commit": capture("git", "rev-parse", "HEAD"),
         "baseline": capture("git", "-C", "baseline", "rev-parse", "HEAD"),
         "platform": platform.platform(), "cpu": capture("lscpu"),
-        "rust": capture("rustc", "--version"), "trials": 3, "batch32_trials": 12,
+        "rust": capture("rustc", "--version"), "trials": args.trials or 3, "batch32_trials": args.trials or 12,
+        "selected_case": args.case,
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
         "semantics": "Identical harness for baseline/current; WAL enabled, sync per commit for all backends; no compression. Batch construction included. Validate all keys before and after reopen.",
         "limits": "Shared CI host; bounded workloads, not long-duration steady state or cold-device results. Wall time includes OS scheduling and sync tails. No per-fsync timing. Resource snapshots occur outside timing; pressure-case worker may continue between snapshots.",
@@ -38,18 +41,20 @@ def main():
         ("flush-pressure", {"keys": 32768, "value": 128, "batch": 32, "workload": "batch", "memtable": 262144}),
     ]
     records = []
+    if args.case:
+        cases = [(name, config) for name, config in cases if name == args.case]
     with tempfile.TemporaryDirectory(prefix="kv-writes-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("WRITE_ENV " + json.dumps(environment), flush=True)
         with (args.output / "results.jsonl").open("w") as output:
-            for trial in range(12):
+            for trial in range(args.trials or 12):
                 # Each backend occupies every order position; rotate cases too.
                 case_order = trial % len(cases)
                 backend_order = trial % len(names)
                 for case, settings in cases[case_order:] + cases[:case_order]:
-                    if trial >= 3 and case != "batch32-128b":
+                    if trial >= (args.trials or (12 if case == "batch32-128b" else 3)):
                         continue
                     config = dict(settings, fixed=False)
                     for order, name in enumerate(names[backend_order:] + names[:backend_order], 1):

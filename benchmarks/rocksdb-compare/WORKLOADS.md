@@ -138,6 +138,14 @@ RocksDB layouts/policies and shared-host storage waits limit generalization.
 
 ## Cleanup comparison
 
+Focused rechecks can select an existing workload without changing its query trace:
+`writes.py OUT --case batch256-16b --trials 12` and
+`workloads.py OUT --baseline --reads-only --profile 5 --scenario scan-t1-span512 --trials 12`.
+Profile/scenario filters require `--reads-only` and are incompatible with `--smoke`.
+Defaults preserve the full suite. A main commit with `[followup-perf]` and an
+explicit `[baseline:<40-character SHA>]` runs these two rechecks, rotating backend
+order over twelve trials. Retain the original full-run results alongside rechecks.
+
 For a full same-run baseline/current/RocksDB comparison, a main commit can use
 `[paired-perf] [baseline:<40-character commit SHA>]`. This runs the focused write
 suite and `workloads.py --baseline`, including all read profiles, native-layout

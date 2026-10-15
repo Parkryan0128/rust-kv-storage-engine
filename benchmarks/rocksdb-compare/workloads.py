@@ -65,11 +65,16 @@ def main():
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--baseline", action="store_true", help="Include workloads-baseline, using identical engine read fixture bytes")
     parser.add_argument("--reads-only", action="store_true", help="Skip writes and compaction when separate suites already cover them")
+    parser.add_argument("--profile", type=int, choices=range(6), help="Run one numbered read profile")
+    parser.add_argument("--scenario", choices=["uniform-t1-span0", "uniform-t4-span0", "hot-t1-span0", "miss-t1-span0", "scan-t1-span32", "scan-t1-span512"])
+    parser.add_argument("--trials", type=int, choices=range(1, 31))
     args = parser.parse_args()
+    if (args.profile is not None or args.scenario) and (args.smoke or not args.reads_only):
+        parser.error("Profile/scenario selection requires --reads-only and cannot use --smoke")
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"] if args.baseline else ["engine", "rocksdb"]
     binaries = {name: Path("comparison-bin", "workloads-" + name).resolve() for name in names}
-    trials = 1 if args.smoke else (6 if args.baseline else 4)
+    trials = args.trials or (1 if args.smoke else (6 if args.baseline else 4))
     profiles = [{"keys": 128, "value": 32, "block": 4096, "cache": 8192, "churn": True}] if args.smoke else [
         {"keys": 20000, "value": 128, "block": 4096, "cache": 8388608, "churn": False},
         {"keys": 20000, "value": 128, "block": 16384, "cache": 8388608, "churn": False},
@@ -92,6 +97,7 @@ def main():
         "commit": capture("git", "rev-parse", "HEAD"), "platform": platform.platform(),
         "rust": capture("rustc", "--version"), "cpu": capture("lscpu"),
         "memory": Path("/proc/meminfo").read_text(), "trials": trials, "profiles": profiles,
+        "selected_profile": args.profile, "selected_scenario": args.scenario,
         "binaries": {name: {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for name, p in binaries.items()},
         "semantics": {
             "durability": "WAL enabled; sync_all/fsync per put or whole batch",
@@ -140,6 +146,8 @@ def main():
                 assert stages == {"prepare": [], "read": ["open", "first", "repeat"], "write": ["write"], "compact": ["compact"]}[mode]
 
             for profile_index, profile in enumerate(profiles):
+                if args.profile is not None and profile_index != args.profile:
+                    continue
                 case = f"p{profile_index}-{profile['value']}b-{profile['block']}block-{profile['cache']}cache-{'churn' if profile['churn'] else 'clean'}"
                 fixtures = {name: root / (case + name) for name in binaries}
                 for name, directory in fixtures.items():
@@ -153,6 +161,8 @@ def main():
                     offset = (trial - 1) % len(scenarios)
                     for scenario in scenarios[offset:] + scenarios[:offset]:
                         label = scenario["workload"] + f"-t{scenario.get('threads',1)}-span{scenario.get('span',0)}"
+                        if args.scenario and label != args.scenario:
+                            continue
                         config = dict(profile, **scenario, seed=7919 + trial * 104729)
                         if profile["value"] == 4096 and scenario["workload"] == "scan":
                             config["queries"] = 96 if scenario["span"] == 32 else 48

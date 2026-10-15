@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   compare:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -80,8 +80,21 @@ jobs:
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
       - name: Compare bounded durable writes and flush pressure
+        if: ${{ !contains(github.event.head_commit.message, '[followup-perf]') }}
         timeout-minutes: 8
         run: python3 benchmarks/rocksdb-compare/writes.py write-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Recheck small-value batch writes
+        if: contains(github.event.head_commit.message, '[followup-perf]')
+        timeout-minutes: 5
+        run: python3 benchmarks/rocksdb-compare/writes.py write-results --case batch256-16b --trials 12
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Recheck large-value range scans
+        if: contains(github.event.head_commit.message, '[followup-perf]')
+        timeout-minutes: 5
+        run: python3 benchmarks/rocksdb-compare/workloads.py read-results --baseline --reads-only --profile 5 --scenario scan-t1-span512 --trials 12
         env:
           KV_BENCH_DIR: ${{ runner.temp }}
       - uses: actions/upload-artifact@v4
