@@ -76,6 +76,7 @@ def main():
         {"keys": 20000, "value": 1024, "block": 16384, "cache": 8388608, "churn": False},
         {"keys": 20000, "value": 128, "block": 16384, "cache": 0, "churn": False},
         {"keys": 20000, "value": 128, "block": 16384, "cache": 8388608, "churn": True},
+        {"keys": 4096, "value": 4096, "block": 16384, "cache": 8388608, "churn": True},
     ]
     query_count = 64 if args.smoke else 100000
     scenarios = [
@@ -153,6 +154,8 @@ def main():
                     for scenario in scenarios[offset:] + scenarios[:offset]:
                         label = scenario["workload"] + f"-t{scenario.get('threads',1)}-span{scenario.get('span',0)}"
                         config = dict(profile, **scenario, seed=7919 + trial * 104729)
+                        if profile["value"] == 4096 and scenario["workload"] == "scan":
+                            config["queries"] = 96 if scenario["span"] == 32 else 48
                         offset_backend = (trial - 1) % len(binaries)
                         order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
                         for order, name in enumerate(order_names, 1):

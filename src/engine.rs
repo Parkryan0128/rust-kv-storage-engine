@@ -909,8 +909,8 @@ impl Core {
         )
     }
     fn compact_all(&self) -> Result<()> {
-        let tables = self.state.read().tables.clone();
-        self.compact_tables(tables.as_ref().clone())
+        let tables = self.state.read().tables.as_ref().clone();
+        self.compact_tables(tables)
     }
     fn compact_tables(&self, tables: Vec<Arc<Table>>) -> Result<()> {
         if tables.is_empty() {
@@ -922,6 +922,8 @@ impl Core {
         while pending.len() > compaction::MAX_INPUTS {
             let inputs = pending.drain(..compaction::MAX_INPUTS).collect();
             pending.push_back(self.compact_group(inputs)?);
+            #[cfg(test)]
+            crate::test_hooks::pause("compaction_between_groups");
         }
         self.compact_group(pending.into())?;
         Ok(())
@@ -937,13 +939,13 @@ impl Core {
         let selected: HashSet<_> = tables.iter().map(|t| t.id).collect();
         let drop_tombstones = selected.len() == self.state.read().tables.len();
         let input_bytes = tables.iter().map(|t| t.file_bytes).sum();
-        let merged = Arc::new(Table::write(
+        let merged = Arc::new(Table::write_with(
             &sst_path(dir, id),
             id,
-            Merge::new(&tables, drop_tombstones)?,
             estimate,
             self.options.block_size,
             self.options.bloom_filter_bits_per_key,
+            |writer| Merge::new(&tables, drop_tombstones)?.write_into(writer),
         )?);
         let mut manifest = self.state.read().manifest.clone();
         manifest.tables.retain(|id| !selected.contains(id));
@@ -1002,6 +1004,62 @@ mod scan_tests;
 mod audit_tests {
     use super::*;
     use std::{sync::mpsc::sync_channel, time::Duration};
+
+    #[test]
+    fn manual_compaction_releases_inputs_between_groups_unless_a_scan_pins_them() {
+        for pin_with_scan in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Engine::open_with_options(
+                dir.path(),
+                Options {
+                    compaction_file_threshold: 1000,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            for i in 0..8u8 {
+                db.put([i], [i]).unwrap();
+                db.flush().unwrap();
+            }
+            let inputs: Vec<_> = db
+                .inner
+                .core
+                .state
+                .read()
+                .tables
+                .iter()
+                .take(compaction::MAX_INPUTS)
+                .map(Arc::downgrade)
+                .collect();
+            let scan = pin_with_scan.then(|| db.scan(..).unwrap());
+            let worker_db = db.clone();
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (resume_tx, resume_rx) = sync_channel(1);
+            let worker = thread::spawn(move || {
+                crate::test_hooks::arm("compaction_between_groups", entered_tx, resume_rx);
+                worker_db.compact()
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let retained = inputs.iter().all(|t| t.upgrade().is_some());
+            drop(scan);
+            let released = inputs.iter().all(|t| t.upgrade().is_none());
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap().unwrap();
+            assert_eq!(retained, pin_with_scan);
+            assert!(
+                released,
+                "obsolete input handles survived the first merge round"
+            );
+            assert_eq!(
+                db.scan(..)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap()
+                    .len(),
+                8
+            );
+        }
+    }
 
     #[test]
     fn cache_purge_does_not_hold_the_state_write_lock() {

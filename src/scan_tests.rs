@@ -2,6 +2,45 @@ use super::*;
 use std::{io, sync::mpsc::sync_channel, time::Duration};
 
 #[test]
+fn disk_scan_materializes_only_live_winners() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open_with_options(
+        dir.path(),
+        Options {
+            compaction_file_threshold: 1000,
+            block_size: 4096,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for generation in 0..3u8 {
+        let mut batch = WriteBatch::new();
+        for key in 0..8u8 {
+            if generation == 2 && key % 2 == 0 {
+                batch.delete([key]);
+            } else {
+                batch.put([key], vec![generation; 8192]);
+            }
+        }
+        db.write_batch(batch).unwrap();
+        db.flush().unwrap();
+    }
+    let mut scan = db.scan(..).unwrap();
+    crate::codec::take_materialized_values();
+    let first = scan.next().unwrap().unwrap();
+    assert_eq!(first, (vec![1], Bytes::from(vec![2; 8192])));
+    assert_eq!(crate::codec::take_materialized_values(), 1);
+    let rest = scan.collect::<Result<Vec<_>>>().unwrap();
+    assert_eq!(
+        rest.iter().map(|(k, _)| k[0]).collect::<Vec<_>>(),
+        [3, 5, 7]
+    );
+    assert!(rest.iter().all(|(_, v)| v.as_ref() == vec![2; 8192]));
+    assert_eq!(crate::codec::take_materialized_values(), 3);
+    assert_eq!(db.stats().cache_bytes, 0);
+}
+
+#[test]
 fn frozen_snapshot_merge_releases_locks_and_survives_concurrent_publication() {
     let dir = tempfile::tempdir().unwrap();
     let db = Engine::open(dir.path()).unwrap();

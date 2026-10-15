@@ -5,7 +5,7 @@ on:
       baseline:
         description: Baseline commit supporting WriteBatch (same harness is copied into it)
         required: true
-        default: c372ebae0be17a62096e746d43a418021975e868
+        default: 9b50fb6f330d5c78b8c8e8f205578686624da7db
         type: string
       compaction:
         description: Also compare compaction on identical engine fixtures and matched RocksDB history
@@ -34,8 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          # The cleanup marker measures ba9d436's changes against its parent.
-          ref: ${{ inputs.baseline || (contains(github.event.head_commit.message, '[cleanup-perf]') && 'c372ebae0be17a62096e746d43a418021975e868') || github.event.before }}
+          # Pin the pre-streaming engine for the complete paired comparison.
+          ref: ${{ inputs.baseline || (contains(github.event.head_commit.message, '[cleanup-perf]') && '9b50fb6f330d5c78b8c8e8f205578686624da7db') || github.event.before }}
           path: baseline
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev

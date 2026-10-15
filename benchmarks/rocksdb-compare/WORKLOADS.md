@@ -119,7 +119,7 @@ RocksDB layouts/policies and shared-host storage waits limit generalization.
 
 `[cleanup-perf]` on a main commit runs the focused write and compaction suites,
 then `workloads.py --baseline --reads-only` in the same job. The marker pins the
-baseline to `c372eba`, immediately before the `ba9d436` cleanup. Manual dispatch
+baseline to `9b50fb6`, immediately before the streaming SST/scan changes. Manual dispatch
 can select another compatible baseline and enable `reads` and/or `compaction`.
 The engine source is not changed by running this comparison.
 
@@ -132,3 +132,8 @@ All read fixtures are flushed: these scans check the disk iterator path, not
 writer interference while constructing active/frozen memory snapshots. Table
 preview performance is also outside this suite. No such speedup may be inferred
 from these results.
+
+The streaming comparison adds a bounded 4096-key, 4096-byte-value overwrite
+fixture to exercise scan version selection without copying losing values. It
+uses 96 short scans or 48 long scans per pass, with the same six paired trials
+and baseline/current fixture copies. Other read profiles are unchanged.

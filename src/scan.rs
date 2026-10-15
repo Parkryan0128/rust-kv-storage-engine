@@ -60,7 +60,10 @@ impl KeyRange {
 }
 
 enum Source {
-    Memory(std::collections::btree_map::IntoIter<Vec<u8>, Record>),
+    Memory {
+        iter: std::collections::btree_map::IntoIter<Vec<u8>, Record>,
+        head: Option<Record>,
+    },
     Table(TableScan),
 }
 
@@ -73,15 +76,14 @@ enum Source {
 /// The iterator retains the database lock, selected in-memory keys/values and
 /// old SST handles until dropped or exhausted. Compaction may unlink those SSTs,
 /// but their disk space cannot be reclaimed while a scan still holds them.
-/// SST buffering is one encoded block plus one candidate record per source;
+/// SST buffering is one encoded block plus one candidate key per source;
 /// scans bypass the point-read cache. Collecting the iterator allocates the full
 /// result in the caller. Later writes and batches do not change this snapshot.
 #[must_use = "scans read SST data only when iterated"]
 pub struct Scan {
     engine: Option<Engine>,
     sources: Vec<Source>,
-    heads: Vec<Option<Record>>,
-    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
+    heap: BinaryHeap<Reverse<(Vec<u8>, usize, u64)>>,
     pending: Vec<usize>,
     initialized: bool,
 }
@@ -96,7 +98,10 @@ impl Scan {
         let range = Arc::new(range);
         let mut sources = Vec::with_capacity(tables.len() + 1);
         if !memory.is_empty() {
-            sources.push(Source::Memory(memory.into_iter()));
+            sources.push(Source::Memory {
+                iter: memory.into_iter(),
+                head: None,
+            });
         }
         sources.extend(
             tables
@@ -105,7 +110,6 @@ impl Scan {
         );
         Self {
             engine: Some(engine),
-            heads: vec![None; sources.len()],
             sources,
             heap: BinaryHeap::new(),
             pending: Vec::new(),
@@ -117,7 +121,6 @@ impl Scan {
         Self {
             engine: None,
             sources: Vec::new(),
-            heads: Vec::new(),
             heap: BinaryHeap::new(),
             pending: Vec::new(),
             initialized: true,
@@ -125,15 +128,22 @@ impl Scan {
     }
 
     fn advance(&mut self, index: usize) -> Result<()> {
-        let item = match &mut self.sources[index] {
-            Source::Memory(iter) => iter.next(),
-            Source::Table(iter) => {
-                iter.next_record(self.engine.as_ref().unwrap().scan_counters())?
+        match &mut self.sources[index] {
+            Source::Memory { iter, head } => {
+                if let Some((key, record)) = iter.next() {
+                    self.heap.push(Reverse((key, index, record.seq)));
+                    *head = Some(record);
+                } else {
+                    *head = None;
+                }
             }
-        };
-        if let Some((key, record)) = item {
-            self.heap.push(Reverse((key, index)));
-            self.heads[index] = Some(record);
+            Source::Table(iter) => {
+                iter.advance(self.engine.as_ref().unwrap().scan_counters())?;
+                if let Some(record) = iter.current()? {
+                    self.heap
+                        .push(Reverse((record.key.to_vec(), index, record.seq)));
+                }
+            }
         }
         Ok(())
     }
@@ -151,26 +161,35 @@ impl Scan {
             while let Some(index) = self.pending.pop() {
                 self.advance(index)?;
             }
-            let Some(Reverse((key, index))) = self.heap.pop() else {
+            let Some(Reverse((key, index, mut seq))) = self.heap.pop() else {
                 return Ok(None);
             };
-            let mut newest = self.heads[index].take().unwrap();
+            let mut winner = index;
             self.pending.push(index);
             while self
                 .heap
                 .peek()
-                .is_some_and(|Reverse((other, _))| other == &key)
+                .is_some_and(|Reverse((other, _, _))| other == &key)
             {
-                let Reverse((_, index)) = self.heap.pop().unwrap();
-                let record = self.heads[index].take().unwrap();
-                if record.seq > newest.seq {
-                    newest = record;
+                let Reverse((_, index, candidate_seq)) = self.heap.pop().unwrap();
+                if candidate_seq > seq {
+                    winner = index;
+                    seq = candidate_seq;
                 }
                 self.pending.push(index);
             }
             // Each source has strictly increasing keys, so all versions of this
             // key are already in the heap; no source needs advancing to find more.
-            if let Some(value) = newest.value {
+            let value = match &mut self.sources[winner] {
+                Source::Memory { head, .. } => head.take().unwrap().value,
+                Source::Table(iter) => iter.current()?.unwrap().to_owned().value,
+            };
+            for &index in &self.pending {
+                if let Source::Memory { head, .. } = &mut self.sources[index] {
+                    *head = None;
+                }
+            }
+            if let Some(value) = value {
                 return Ok(Some((key, value)));
             }
         }
@@ -178,7 +197,6 @@ impl Scan {
 
     fn finish(&mut self) {
         self.sources = Vec::new();
-        self.heads = Vec::new();
         self.heap = BinaryHeap::new();
         self.pending = Vec::new();
         self.engine = None;

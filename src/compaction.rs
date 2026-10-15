@@ -1,6 +1,7 @@
+#[cfg(test)]
+use crate::memtable::Record;
 use crate::{
-    memtable::Record,
-    sstable::{Table, TableCursor},
+    sstable::{Table, TableCursor, TableWriter},
     Result,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -50,6 +51,7 @@ fn pick_ids(files: &[(u64, u64)], threshold: usize, style: CompactionStyle) -> V
 pub(crate) struct Merge {
     cursors: Vec<TableCursor>,
     pending: Vec<usize>,
+    #[cfg(test)]
     finished: bool,
     drop_tombstones: bool,
 }
@@ -62,12 +64,13 @@ impl Merge {
                 .map(TableCursor::new)
                 .collect::<Result<_>>()?,
             pending: Vec::with_capacity(tables.len()),
+            #[cfg(test)]
             finished: false,
             drop_tombstones,
         })
     }
 
-    fn next_record(&mut self) -> Result<Option<(Vec<u8>, Record)>> {
+    fn next_index(&mut self) -> Result<Option<usize>> {
         loop {
             while let Some(i) = self.pending.pop() {
                 self.cursors[i].advance()?;
@@ -75,17 +78,20 @@ impl Merge {
             // Fan-in is at most four in the engine. Comparing borrowed heads
             // avoids heap keys and materializing values for superseded versions.
             let mut newest: Option<crate::codec::RecordRef<'_>> = None;
+            let mut winner = 0;
             for (i, cursor) in self.cursors.iter().enumerate() {
                 if let Some(record) = cursor.current()? {
                     if newest.as_ref().is_none_or(|old| record.key < old.key) {
                         self.pending.clear();
                         self.pending.push(i);
                         newest = Some(record);
+                        winner = i;
                     } else if let Some(old) = &mut newest {
                         if record.key == old.key {
                             self.pending.push(i);
                             if record.seq > old.seq {
                                 *old = record;
+                                winner = i;
                             }
                         }
                     }
@@ -96,22 +102,33 @@ impl Merge {
             };
             // Partial merges must keep deletions that hide records in other SSTs.
             // Advance these cursors only on the next call: the winner still
-            // borrows its block until its sole owned copy has been produced.
+            // borrows its block until it has been serialized.
             if newest.value.is_some() || !self.drop_tombstones {
-                return Ok(Some((newest.key.to_vec(), newest.to_owned())));
+                return Ok(Some(winner));
             }
         }
     }
+    pub fn write_into(mut self, writer: &mut TableWriter) -> Result<()> {
+        while let Some(index) = self.next_index()? {
+            let record = self.cursors[index].current()?.unwrap();
+            writer.push(record.key, record.seq, record.value)?;
+        }
+        Ok(())
+    }
 }
 
+#[cfg(test)]
 impl Iterator for Merge {
     type Item = Result<(Vec<u8>, Record)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
         }
-        match self.next_record() {
-            Ok(Some(record)) => Some(Ok(record)),
+        match self.next_index() {
+            Ok(Some(index)) => Some(self.cursors[index].current().map(|record| {
+                let record = record.unwrap();
+                (record.key.to_vec(), record.to_owned())
+            })),
             result => {
                 self.finished = true;
                 self.cursors.clear();
@@ -121,6 +138,7 @@ impl Iterator for Merge {
         }
     }
 }
+#[cfg(test)]
 impl std::iter::FusedIterator for Merge {}
 
 #[cfg(test)]
@@ -197,6 +215,21 @@ mod tests {
                     .map(|(k, r)| (k.clone(), r.clone()))
                     .collect();
                 assert_eq!(actual, expected);
+                let owned = dir.path().join("owned-output.sst");
+                let streamed = dir.path().join("streamed-output.sst");
+                Table::write(&owned, 10, actual.into_iter().map(Ok), 1000, 64, 10).unwrap();
+                crate::codec::take_materialized_values();
+                Table::write_with(&streamed, 11, 1000, 64, 10, |writer| {
+                    Merge::new(&inputs, drop_deletions)?.write_into(writer)
+                })
+                .unwrap();
+                assert_eq!(crate::codec::take_materialized_values(), 0);
+                assert_eq!(
+                    std::fs::read(&owned).unwrap(),
+                    std::fs::read(&streamed).unwrap()
+                );
+                std::fs::remove_file(owned).unwrap();
+                std::fs::remove_file(streamed).unwrap();
             }
         }
         let mut empty = Merge::new(&[], true).unwrap();
@@ -237,7 +270,9 @@ mod tests {
         assert!(merge.next().is_none());
         let output = dir.path().join("merged.sst");
         assert!(matches!(
-            Table::write(&output, 3, Merge::new(&tables, true).unwrap(), 6, 64, 10),
+            Table::write_with(&output, 3, 6, 64, 10, |writer| {
+                Merge::new(&tables, true)?.write_into(writer)
+            }),
             Err(crate::EngineError::Corruption(_))
         ));
         assert!(!output.exists());

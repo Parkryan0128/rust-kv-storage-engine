@@ -59,8 +59,20 @@ pub(crate) struct RecordRef<'a> {
     pub seq: u64,
     pub value: Option<&'a [u8]>,
 }
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZED_VALUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn take_materialized_values() -> usize {
+    MATERIALIZED_VALUES.with(|count| count.replace(0))
+}
 impl RecordRef<'_> {
     pub fn to_owned(&self) -> Record {
+        #[cfg(test)]
+        if self.value.is_some() {
+            MATERIALIZED_VALUES.with(|count| count.set(count.get() + 1));
+        }
         Record {
             seq: self.seq,
             value: self.value.map(Bytes::copy_from_slice),

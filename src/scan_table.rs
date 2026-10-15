@@ -34,7 +34,17 @@ impl Table {
 }
 
 impl TableScan {
-    pub fn next_record(&mut self, counters: &Counters) -> Result<Option<(Vec<u8>, Record)>> {
+    pub fn current(&self) -> Result<Option<RecordRef<'_>>> {
+        self.block
+            .as_ref()
+            .map(|b| b.record_at(self.record))
+            .transpose()
+    }
+
+    pub fn advance(&mut self, counters: &Counters) -> Result<()> {
+        if self.block.is_some() {
+            self.record += 1;
+        }
         while !self.done {
             if let Some(block) = &self.block {
                 if self.record < block.record_count() {
@@ -42,10 +52,9 @@ impl TableScan {
                     if !self.range.allows_end(record.key) {
                         self.done = true;
                         self.block = None;
-                        return Ok(None);
+                        return Ok(());
                     }
-                    self.record += 1;
-                    return Ok(Some((record.key.to_vec(), record.to_owned())));
+                    return Ok(());
                 }
             }
             let Some(entry) = self.table.index.get(self.next_block) else {
@@ -83,6 +92,6 @@ impl TableScan {
         }
         self.done = true;
         self.block = None;
-        Ok(None)
+        Ok(())
     }
 }

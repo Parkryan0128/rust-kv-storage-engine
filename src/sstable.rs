@@ -34,6 +34,9 @@ pub(crate) use scan_table::TableScan;
 #[path = "compaction_cursor.rs"]
 mod compaction_cursor;
 pub(crate) use compaction_cursor::TableCursor;
+#[path = "table_writer.rs"]
+mod table_writer;
+pub(crate) use table_writer::TableWriter;
 #[cfg(test)]
 #[path = "read_profile.rs"]
 mod read_profile;
@@ -68,81 +71,26 @@ impl Table {
         block_size: usize,
         bloom_bits: usize,
     ) -> Result<Self> {
-        let tmp = path.with_extension("tmp");
-        let mut f = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(MAGIC)?;
-        let mut index = vec![];
-        let mut bloom = Bloom::new(estimate, bloom_bits);
-        let mut block = vec![];
-        let mut offsets = vec![];
-        let mut first = vec![];
-        let mut previous: Option<K> = None;
-        let mut count = 0;
-        let mut max_seq = 0;
-        for item in records {
-            let (key, r) = item?;
-            let key_bytes = key.as_ref();
-            let r = r.borrow();
-            if previous.as_ref().is_some_and(|p| p.as_ref() >= key_bytes) {
-                return Err(corrupt("unsorted SST input"));
+        Self::write_with(path, id, estimate, block_size, bloom_bits, |writer| {
+            for item in records {
+                let (key, record) = item?;
+                let record = record.borrow();
+                writer.push(key.as_ref(), record.seq, record.value.as_deref())?;
             }
-            if !block.is_empty()
-                && block.len() + r.encoded_len(key_bytes) + (offsets.len() + 1) * 4 + 4 > block_size
-            {
-                write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
-            }
-            if block.is_empty() {
-                first = key_bytes.to_vec();
-            }
-            bloom.insert(key_bytes);
-            offsets.push(block.len() as u32);
-            encode_record(key_bytes, r, &mut block);
-            max_seq = max_seq.max(r.seq);
-            count += 1;
-            previous = Some(key);
-        }
-        if !block.is_empty() {
-            write_indexed_block(&mut f, &mut block, &mut offsets, &first, &mut index)?;
-        }
-        if bloom.needs_rebuild(count, bloom_bits) {
-            // Compaction can discard nearly all inputs. Rebuild from the
-            // written output without retaining all keys or merging twice.
-            bloom = Bloom::new(count, bloom_bits);
-            for i in &index {
-                resize_frame(&mut block, i.len as usize);
-                fault::hit("bloom_rebuild_read")?;
-                f.read_exact_at(&mut block, i.offset)?;
-                let mut c = Cursor {
-                    b: indexed_records(frame_payload(&block)?)?,
-                };
-                while !c.b.is_empty() {
-                    bloom.insert(decode_record_ref(&mut c)?.key);
-                }
-            }
-        }
-        let meta_offset = f.stream_position()?;
-        let meta_len = write_metadata(&mut f, count, max_seq, &bloom, &index)?;
-        let mut footer = vec![];
-        footer.extend(MAGIC);
-        put_u64(&mut footer, meta_offset);
-        put_u64(&mut footer, meta_len);
-        let checksum = crc32fast::hash(&footer);
-        put_u32(&mut footer, checksum);
-        f.write_all(&footer)?;
-        fault::hit("sst_before_sync")?;
-        f.sync_all()?;
-        fault::hit("sst_after_sync")?;
-        fs::rename(&tmp, path)?;
-        sync_dir(path.parent().unwrap())?;
-        fault::hit("sst_after_rename")?;
-        // Opening rebuilds these structures; do not retain a second full index.
-        drop(index);
-        drop(bloom);
-        Self::open(path, id)
+            Ok(())
+        })
+    }
+    pub(crate) fn write_with(
+        path: &Path,
+        id: u64,
+        estimate: u64,
+        block_size: usize,
+        bloom_bits: usize,
+        fill: impl FnOnce(&mut TableWriter) -> Result<()>,
+    ) -> Result<Self> {
+        let mut writer = TableWriter::new(path, estimate, block_size, bloom_bits)?;
+        fill(&mut writer)?;
+        writer.finish(path, id, bloom_bits)
     }
     pub fn open(path: &Path, id: u64) -> Result<Self> {
         let file = File::open(path)?;
@@ -410,6 +358,7 @@ fn read_index(
     });
     Ok(())
 }
+#[cfg(test)]
 fn write_block(f: &mut File, b: &mut Vec<u8>, first: &[u8], index: &mut Vec<Index>) -> Result<()> {
     let offset = f.stream_position()?;
     let len = write_frame(f, b)? as u32;
@@ -420,21 +369,6 @@ fn write_block(f: &mut File, b: &mut Vec<u8>, first: &[u8], index: &mut Vec<Inde
         validated: AtomicU64::new(0),
     });
     b.clear();
-    Ok(())
-}
-fn write_indexed_block(
-    f: &mut File,
-    b: &mut Vec<u8>,
-    offsets: &mut Vec<u32>,
-    first: &[u8],
-    index: &mut Vec<Index>,
-) -> Result<()> {
-    for &offset in offsets.iter() {
-        put_u32(b, offset);
-    }
-    put_u32(b, offsets.len() as u32);
-    write_block(f, b, first, index)?;
-    offsets.clear();
     Ok(())
 }
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
