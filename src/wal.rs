@@ -1,3 +1,4 @@
+use crate::wal_preallocation::Preallocation;
 use crate::{
     codec::*,
     error::corrupt,
@@ -24,6 +25,7 @@ pub(crate) struct Wal {
     pub bytes: u64,
     pub id: u64,
     buffer: Vec<u8>,
+    preallocation: Preallocation,
 }
 impl Wal {
     pub fn create(path: &Path, id: u64) -> Result<Self> {
@@ -39,6 +41,7 @@ impl Wal {
             bytes: 8,
             id,
             buffer: Vec::new(),
+            preallocation: Preallocation::new(8),
         })
     }
     pub fn recover(
@@ -59,6 +62,7 @@ impl Wal {
                     bytes: 8,
                     id,
                     buffer: Vec::new(),
+                    preallocation: Preallocation::new(8),
                 },
                 MemTable::default(),
             ));
@@ -86,6 +90,7 @@ impl Wal {
                 bytes: valid,
                 id,
                 buffer: Vec::new(),
+                preallocation: Preallocation::new(valid),
             },
             table,
         ))
@@ -126,6 +131,13 @@ impl Wal {
             let header = write_timed!(WalChecksum, frame_header(&self.buffer[HEADER..]))?;
             self.buffer[..HEADER].copy_from_slice(&header);
             fault::hit("wal_before_append")?;
+            write_timed!(
+                WalAllocate,
+                self.preallocation.reserve(
+                    &self.file,
+                    self.bytes.saturating_add(self.buffer.len() as u64),
+                )
+            );
             // Header and payload share one allocation and one write_all call.
             // write_all still retries interrupted/short writes before syncing.
             write_timed!(WalWrite, self.file.write_all(&self.buffer))?;

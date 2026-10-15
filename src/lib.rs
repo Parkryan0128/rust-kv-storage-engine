@@ -38,6 +38,7 @@ mod sstable;
 #[cfg(test)]
 mod test_hooks;
 mod wal;
+mod wal_preallocation;
 #[cfg(feature = "write-profiling")]
 #[doc(hidden)]
 pub mod write_profile;

@@ -25,7 +25,7 @@ def main():
         "commit": capture("git", "rev-parse", "HEAD"),
         "baseline": capture("git", "-C", "baseline", "rev-parse", "HEAD"),
         "platform": platform.platform(), "cpu": capture("lscpu"),
-        "rust": capture("rustc", "--version"), "trials": 3,
+        "rust": capture("rustc", "--version"), "trials": 3, "batch32_trials": 12,
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
         "semantics": "Identical harness for baseline/current; WAL enabled, sync per commit for all backends; no compression. Batch construction included. Validate all keys before and after reopen.",
         "limits": "Shared CI host; bounded workloads, not long-duration steady state or cold-device results. Wall time includes OS scheduling and sync tails. No per-fsync timing. Resource snapshots occur outside timing; pressure-case worker may continue between snapshots.",
@@ -44,11 +44,15 @@ def main():
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("WRITE_ENV " + json.dumps(environment), flush=True)
         with (args.output / "results.jsonl").open("w") as output:
-            for trial in range(3):
+            for trial in range(12):
                 # Each backend occupies every order position; rotate cases too.
-                for case, settings in cases[trial:] + cases[:trial]:
+                case_order = trial % len(cases)
+                backend_order = trial % len(names)
+                for case, settings in cases[case_order:] + cases[:case_order]:
+                    if trial >= 3 and case != "batch32-128b":
+                        continue
                     config = dict(settings, fixed=False)
-                    for order, name in enumerate(names[trial:] + names[:trial], 1):
+                    for order, name in enumerate(names[backend_order:] + names[:backend_order], 1):
                         label = f"{case}-{trial+1}-{name}"
                         print("WRITE_CASE " + label, flush=True)
                         done = subprocess.run([str(binaries[name]), "write", str(root / label), json.dumps(config)], text=True, capture_output=True, timeout=90)

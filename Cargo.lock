@@ -538,6 +538,7 @@ dependencies = [
  "crossbeam-channel",
  "fs2",
  "parking_lot",
+ "rustix",
  "serde_json",
  "tempfile",
  "tiny_http",

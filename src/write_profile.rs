@@ -3,12 +3,13 @@
 //! after a batch on the same thread; failed batches contain partial timings.
 use std::{cell::Cell, time::Instant};
 
-pub const PHASES: [&str; 9] = [
+pub const PHASES: [&str; 10] = [
     "validate",
     "writer_lock",
     "prepare",
     "wal_encode",
     "wal_checksum",
+    "wal_allocate",
     "wal_write",
     "wal_sync",
     "state_lock",
@@ -21,18 +22,19 @@ pub(crate) enum Phase {
     Prepare,
     WalEncode,
     WalChecksum,
+    WalAllocate,
     WalWrite,
     WalSync,
     StateLock,
     Apply,
 }
-thread_local! { static TIMES: Cell<[u64; 9]> = const { Cell::new([0; 9]) }; }
+thread_local! { static TIMES: Cell<[u64; 10]> = const { Cell::new([0; 10]) }; }
 pub(crate) fn reset() {
-    TIMES.with(|t| t.set([0; 9]));
+    TIMES.with(|t| t.set([0; 10]));
 }
 /// Consume nanoseconds spent in each phase of the most recent batch.
-pub fn take() -> [u64; 9] {
-    TIMES.with(|t| t.replace([0; 9]))
+pub fn take() -> [u64; 10] {
+    TIMES.with(|t| t.replace([0; 10]))
 }
 pub(crate) struct Timer {
     phase: Phase,

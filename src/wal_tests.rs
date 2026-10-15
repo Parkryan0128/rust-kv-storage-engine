@@ -218,3 +218,36 @@ fn contiguous_frames_keep_legacy_bytes_and_bound_retained_memory() {
     wal.append(b"after", &single(b"ok", 5)).unwrap();
     assert!(wal.buffer.capacity() <= MAX_RETAINED_BUFFER);
 }
+
+#[test]
+fn reservation_boundaries_recover_without_zero_padding_or_lost_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("1.wal");
+    let mut wal = Wal::create(&path, 1).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), MAGIC);
+    let large = vec![37; 270 * 1024];
+    let mut batch = WriteBatch::new();
+    batch.put("large", &large).put("small", "before");
+    wal.append_batch(&batch, 1, batch.encoded_len().unwrap())
+        .unwrap();
+    assert_eq!(wal.file.metadata().unwrap().len(), wal.bytes);
+    let original = std::fs::read(&path).unwrap();
+    drop(wal);
+    let mut seq = 0;
+    // Strict replay must see EOF directly after the last frame, not a zero tail.
+    let (mut wal, table) = Wal::recover(&path, 1, false, &mut seq).unwrap();
+    assert_eq!(seq, 2);
+    assert_eq!(
+        table.get(b"large").unwrap().value.as_deref(),
+        Some(large.as_slice())
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    wal.append(b"small", &single(b"after", 3)).unwrap();
+    assert_eq!(wal.file.metadata().unwrap().len(), wal.bytes);
+    drop(wal);
+    let (_, table) = Wal::recover(&path, 1, false, &mut 0).unwrap();
+    assert_eq!(
+        table.get(b"small").unwrap().value.as_deref(),
+        Some(&b"after"[..])
+    );
+}

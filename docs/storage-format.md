@@ -14,6 +14,16 @@ The in-memory write buffer is called a **memtable**. A **tombstone** is a record
 
 Each write is logged and synced with `sync_all()` before updating memory.
 
+On Linux, WAL writes reserve physical disk space in 256 KiB chunks using
+`fallocate(KEEP_SIZE)`. This reduces repeated allocation during appends while
+preserving the exact file length, bytes and recovery format. Reservation is lazy,
+so an empty WAL reserves no extra chunk. Unused reserved space is less than
+256 KiB per WAL (apart from filesystem allocation granularity), and disappears
+when the obsolete WAL is deleted after flush. This is disk space, not RAM.
+If reservation fails or is unsupported, that WAL falls back to ordinary appends;
+actual write and sync failures still fail the write. Other platforms use ordinary
+appends. Every acknowledged commit still waits for `sync_all()`.
+
 `Engine::write_batch(WriteBatch)` validates all operations, writes one WAL frame,
 syncs once, then applies the entire batch under the state write lock. The writer
 barrier prevents other writes or rotation from splitting the batch. Each
