@@ -138,8 +138,10 @@ impl Scan {
                 }
             }
             Source::Table(iter) => {
-                if let Some((key, seq)) =
-                    iter.advance(self.engine.as_ref().unwrap().scan_counters())?
+                if let Some((key, seq)) = iter
+                    .advance(self.engine.as_ref().unwrap().scan_counters(), |record| {
+                        (record.key.to_vec(), record.seq)
+                    })?
                 {
                     self.heap.push(Reverse((key, index, seq)));
                 }
@@ -149,6 +151,24 @@ impl Scan {
     }
 
     fn read_next(&mut self) -> Result<Option<(Vec<u8>, Bytes)>> {
+        // With one source there are no competing versions. Consume its borrowed
+        // record directly, without heap bookkeeping or decoding the winner again.
+        if let [source] = self.sources.as_mut_slice() {
+            loop {
+                let item = match source {
+                    Source::Memory { iter, .. } => iter.next().map(|(key, r)| (key, r.value)),
+                    Source::Table(iter) => iter
+                        .advance(self.engine.as_ref().unwrap().scan_counters(), |r| {
+                            (r.key.to_vec(), r.to_owned().value)
+                        })?,
+                };
+                match item {
+                    Some((key, Some(value))) => return Ok(Some((key, value))),
+                    Some((_, None)) => continue,
+                    None => return Ok(None),
+                }
+            }
+        }
         if !self.initialized {
             for index in 0..self.sources.len() {
                 self.advance(index)?;

@@ -41,7 +41,11 @@ impl TableScan {
             .transpose()
     }
 
-    pub fn advance(&mut self, counters: &Counters) -> Result<Option<(Vec<u8>, u64)>> {
+    pub fn advance<T>(
+        &mut self,
+        counters: &Counters,
+        consume: impl FnOnce(RecordRef<'_>) -> T,
+    ) -> Result<Option<T>> {
         if self.block.is_some() {
             self.record += 1;
         }
@@ -54,7 +58,7 @@ impl TableScan {
                         self.block = None;
                         return Ok(None);
                     }
-                    return Ok(Some((record.key.to_vec(), record.seq)));
+                    return Ok(Some(consume(record)));
                 }
             }
             let Some(entry) = self.table.index.get(self.next_block) else {

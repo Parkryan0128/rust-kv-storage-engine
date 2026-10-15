@@ -2,6 +2,30 @@ use super::*;
 use std::{io, sync::mpsc::sync_channel, time::Duration};
 
 #[test]
+fn single_source_scan_keeps_bounds_deletions_and_snapshot() {
+    for disk in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(dir.path()).unwrap();
+        let mut batch = WriteBatch::new();
+        batch
+            .put("a", "first")
+            .put("b", "deleted")
+           …65 tokens truncated…slice()).unwrap();
+        db.put(b"c", b"later").unwrap();
+        assert_eq!(
+            scan.next().unwrap().unwrap(),
+            (b"a".to_vec(), Bytes::from_static(b"first"))
+        );
+        assert_eq!(
+            scan.next().unwrap().unwrap(),
+            (b"c".to_vec(), Bytes::from_static(b"last"))
+        );
+        assert!(scan.next().is_none());
+        assert!(scan.next().is_none());
+    }
+}
+
+#[test]
 fn disk_scan_materializes_only_live_winners() {
     let dir = tempfile::tempdir().unwrap();
     let db = Engine::open_with_options(
