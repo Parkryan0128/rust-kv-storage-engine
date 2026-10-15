@@ -470,14 +470,20 @@ mod tests {
 
     #[test]
     fn uncertain_legacy_index_charge_does_not_force_early_eviction() {
-        let mut cache = Cache::new(600);
-        cache.insert((1, 0), block(15));
+        let existing = block(15);
+        let minimum = 200 + std::mem::size_of::<ReadBlock>() + ENTRY_OVERHEAD + 4;
+        let mut cache = Cache::new(existing.allocated_bytes() + ENTRY_OVERHEAD + minimum);
+        cache.insert((1, 0), existing);
         let before = cache.bytes();
         // A single-record 200-byte frame fits in the remaining space, even
         // though the conservative dense-record upper bound would not.
         assert!(cache.take_reusable(200, false).is_none());
         assert_eq!(cache.bytes(), before);
         assert!(cache.get((1, 0)).is_some());
+        // One byte less really does require eviction. Derive the boundary from
+        // charged sizes so added bookkeeping cannot silently change the case.
+        cache.capacity -= 1;
+        assert!(cache.take_reusable(200, false).is_some());
     }
 
     #[test]
