@@ -221,7 +221,7 @@ fn block_queries(table: &Table, keys: &[[u8; 8]], trial: usize) -> Result<()> {
             "READ_DIAGNOSTIC {}",
             json!({
                 "experiment":"forced_block_miss","trial":trial,
-                "mode":if borrowed {"borrowed_record_control"} else {"production_materialized_block"},
+                "mode":if borrowed {"borrowed_record_control"} else {"historical_materialized_block_control"},
                 "operations":keys.len(),"seconds":start.elapsed().as_secs_f64()
             })
         );

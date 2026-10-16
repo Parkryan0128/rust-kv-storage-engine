@@ -228,3 +228,59 @@ fn scans_check_health_even_when_the_range_is_empty() {
         [(b"a".to_vec(), Bytes::from_static(b"before"))]
     );
 }
+
+#[test]
+fn frozen_scan_pages_are_lazy_bounded_and_release_pinned_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(dir.path()).unwrap();
+    let maintenance = db.inner.core.maintenance.lock();
+    let mut batch = WriteBatch::new();
+    for n in 0..257u32 {
+        batch.put(n.to_be_bytes(), n.to_be_bytes());
+    }
+    db.write_batch(batch).unwrap();
+    db.inner
+        .core
+        .freeze(&mut db.inner.core.writer.lock())
+        .unwrap();
+    let frozen = Arc::downgrade(db.inner.core.state.read().immutable.front().unwrap());
+    let mut scan = db.scan(..).unwrap();
+    assert_eq!(scan.buffered_frozen_records(), 0);
+    assert!(db.inner.core.state.try_write().is_some());
+    for n in 0..257u32 {
+        assert_eq!(
+            scan.next().unwrap().unwrap(),
+            (
+                n.to_be_bytes().to_vec(),
+                Bytes::copy_from_slice(&n.to_be_bytes())
+            )
+        );
+        assert!(scan.buffered_frozen_records() <= 63);
+        if n == 0 {
+            db.put(&0u32.to_be_bytes(), b"later").unwrap();
+        }
+    }
+    drop(maintenance);
+    db.flush().unwrap();
+    assert!(frozen.upgrade().is_some());
+    assert!(scan.next().is_none());
+    assert!(frozen.upgrade().is_none());
+}
+
+#[test]
+fn default_cache_admits_repeated_two_megabyte_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(dir.path()).unwrap();
+    let value = vec![23; 2 * 1024 * 1024];
+    db.put(b"large", &value).unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(b"large").unwrap().as_deref(), Some(value.as_slice()));
+    let first = db.stats();
+    for _ in 0..4 {
+        assert_eq!(db.get(b"large").unwrap().as_deref(), Some(value.as_slice()));
+    }
+    let after = db.stats();
+    assert_eq!(after.block_reads, first.block_reads);
+    assert_eq!(after.cache_hits, first.cache_hits + 4);
+    assert!(after.cache_bytes <= Options::default().block_cache_capacity);
+}

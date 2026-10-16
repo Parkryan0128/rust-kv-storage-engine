@@ -6,7 +6,7 @@ use std::{
     fs,
     hint::black_box,
     path::Path,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, OnceLock},
     thread,
     time::Instant,
 };
@@ -29,6 +29,7 @@ struct Config {
     threads: usize,
     span: u64,
     workload: String,
+    throughput: bool,
 }
 impl Config {
     fn parse(v: &Value) -> Self {
@@ -47,9 +48,10 @@ impl Config {
             batch: n("batch", 32) as usize,
             threads: n("threads", 1) as usize,
             span: n("span", 32),
+            throughput: v["throughput"].as_bool().unwrap_or(false),
             workload: v["workload"].as_str().unwrap_or("uniform").to_owned(),
         };
-        assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 1024 * 1024);
+        assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 4 * 1024 * 1024);
         assert!(
             c.batch > 0
                 && c.batch <= 1024
@@ -123,7 +125,7 @@ fn metrics(path: &Path) -> Result<Value> {
         })
     };
     Ok(
-        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:"),"write_syscalls":number("syscw:"),"voluntary_switches":kb("voluntary_ctxt_switches:"),"involuntary_switches":kb("nonvoluntary_ctxt_switches:")}),
+        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:"),"write_syscalls":number("syscw:"),"read_syscalls":number("syscr:"),"voluntary_switches":kb("voluntary_ctxt_switches:"),"involuntary_switches":kb("nonvoluntary_ctxt_switches:")}),
     )
 }
 fn distribution(samples: &mut [u64]) -> Value {
@@ -176,7 +178,9 @@ fn prepare(path: &Path, c: &Config) -> Result<()> {
 }
 fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
     let mut rng = c.seed.wrapping_add(worker as u64 * 104729);
-    let stride = c.queries.div_ceil(4000).max(1);
+    // At most 4,000 API timers across ALL workers, independent of thread count.
+    let quota = 4000 / c.threads + usize::from(worker < 4000 % c.threads);
+    let stride = c.queries.div_ceil(quota).max(1);
     let mut samples = Vec::with_capacity(c.queries.div_ceil(stride));
     let mut expected_value = vec![42; c.value];
     for n in 0..c.queries {
@@ -188,7 +192,7 @@ fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
         };
         let missing = c.workload == "miss";
         let k = (i * 2 + u64::from(missing)).to_be_bytes();
-        let start = n.is_multiple_of(stride).then(Instant::now);
+        let start = (!c.throughput && n.is_multiple_of(stride)).then(Instant::now);
         let got = db.get(&k)?;
         if let Some(start) = start {
             samples.push(start.elapsed().as_nanos() as u64);
@@ -205,6 +209,40 @@ fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
         drop(black_box(got));
     }
     Ok(samples)
+}
+
+// Ready workers precede the start timestamp. Elapsed time ends at the last
+// worker completion; thread creation, joins and per-query timers are excluded.
+fn throughput_reads(db: &Arc<Backend>, c: &Config) -> Result<f64> {
+    let ready = Arc::new(Barrier::new(c.threads + 1));
+    let start = Arc::new(Barrier::new(c.threads + 1));
+    let clock = Arc::new(OnceLock::new());
+    let mut workers = Vec::new();
+    for worker in 0..c.threads {
+        let (db, c, ready, start, clock) = (
+            db.clone(),
+            c.clone(),
+            ready.clone(),
+            start.clone(),
+            clock.clone(),
+        );
+        workers.push(thread::spawn(move || -> Result<_> {
+            ready.wait();
+            start.wait();
+            let result = point_reads(&db, &c, worker);
+            let end = Instant::now();
+            assert!(result?.is_empty());
+            Ok(end.duration_since(*clock.get().unwrap()).as_secs_f64())
+        }));
+    }
+    ready.wait();
+    clock.set(Instant::now()).unwrap();
+    start.wait();
+    let mut seconds = 0.0f64;
+    for worker in workers {
+        seconds = seconds.max(worker.join().expect("reader panicked")?);
+    }
+    Ok(seconds)
 }
 
 fn prepare_merge(path: &Path, c: &Config) -> Result<()> {
@@ -298,6 +336,7 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         let before = metrics(path)?;
         let stats_before = db.stats()?;
         let start = Instant::now();
+        let mut throughput_seconds = None;
         let mut first_rows = Vec::new();
         let mut row_count = 0;
         let mut samples = if c.workload == "scan" {
@@ -323,6 +362,9 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
                 samples.push(start.elapsed().as_nanos() as u64);
             }
             samples
+        } else if c.throughput {
+            throughput_seconds = Some(throughput_reads(&db, c)?);
+            Vec::new()
         } else if c.threads == 1 {
             point_reads(&db, c, 0)?
         } else {
@@ -343,7 +385,7 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
             }
             samples
         };
-        let seconds = start.elapsed().as_secs_f64();
+        let seconds = throughput_seconds.unwrap_or_else(|| start.elapsed().as_secs_f64());
         let operations = c.queries * if c.workload == "scan" { 1 } else { c.threads };
         report(
             stage,
@@ -408,6 +450,135 @@ fn writes(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn populate_memory(db: &Backend, c: &Config) -> Result<()> {
+    let mut entries = Vec::new();
+    for i in 0..c.keys {
+        entries.push((key(i).to_vec(), Some(value(i, 0, c.value))));
+        if entries.len() == c.batch {
+            db.batch(&entries)?;
+            entries.clear();
+        }
+    }
+    if !entries.is_empty() {
+        db.batch(&entries)?;
+    }
+    Ok(())
+}
+fn prepare_wal(path: &Path, c: &Config) -> Result<()> {
+    use std::io::Write;
+    assert!(!path.exists());
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    println!(
+        "WORKLOAD_PREPARED {}",
+        json!({"stats":db.stats()?,"metrics":metrics(path)?})
+    );
+    println!("WORKLOAD_VERIFIED");
+    std::io::stdout().flush()?;
+    // Model process exit after acknowledged sync commits, without shutdown flush.
+    std::process::exit(0);
+}
+fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let before = metrics(path)?;
+    let start = Instant::now();
+    let db = Backend::open(path, c)?;
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "recover",
+        raw,
+        json!({"seconds":seconds,"operations":c.keys,
+        "ops_per_second":c.keys as f64/seconds,"before":before,
+        "after":metrics(path)?,"stats":db.stats()?}),
+    );
+    for i in 0..c.keys {
+        assert_eq!(
+            db.get(&key(i))?.as_deref(),
+            Some(value(i, 0, c.value).as_slice())
+        );
+    }
+    db.put(b"after-recovery", b"appended")?;
+    drop(db);
+    let db = Backend::open(path, c)?;
+    assert_eq!(
+        db.get(b"after-recovery")?.as_deref(),
+        Some(&b"appended"[..])
+    );
+    Ok(())
+}
+fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(!path.exists() && !c.churn && c.threads == 1);
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let mut creation = Vec::new();
+    let mut first_rows = Vec::new();
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let one = Instant::now();
+        let mut iter = db.scan(&key(0), &key(c.keys))?;
+        creation.push(one.elapsed().as_nanos() as u64);
+        let first = iter.next().transpose()?.expect("first row");
+        first_rows.push(one.elapsed().as_nanos() as u64);
+        assert_eq!(first.0, key(0));
+        assert_eq!(first.1.as_ref(), value(0, 0, c.value));
+        for i in 1..c.span {
+            let (k, v) = iter.next().transpose()?.expect("memory row");
+            assert_eq!(k, key(i));
+            assert_eq!(v.as_ref(), value(i, 0, c.value));
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "memory-scan",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"creation_latency":distribution(&mut creation),
+        "first_row_latency":distribution(&mut first_rows),"before":before,
+        "after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+fn mixed_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(!path.exists() && c.value == 2 * 1024 * 1024);
+    let db = Backend::open(path, c)?;
+    let large = value(c.keys, 0, c.value);
+    db.put(&key(c.keys), &large)?;
+    let small = Config {
+        value: 128,
+        ..c.clone()
+    };
+    populate_memory(&db, &small)?;
+    db.flush()?;
+    // Both size classes are warmed before the paired repeat measurement.
+    for stage in ["first", "repeat"] {
+        let before = metrics(path)?;
+        let stats_before = db.stats()?;
+        let mut rng = c.seed;
+        let start = Instant::now();
+        for n in 0..c.queries {
+            if n % 16 == 0 {
+                assert_eq!(db.get(&key(c.keys))?.as_deref(), Some(large.as_slice()));
+            } else {
+                let i = random(&mut rng) % c.keys;
+                assert_eq!(
+                    db.get(&key(i))?.as_deref(),
+                    Some(value(i, 0, 128).as_slice())
+                );
+            }
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        report(
+            stage,
+            raw,
+            json!({"seconds":seconds,"operations":c.queries,
+            "ops_per_second":c.queries as f64/seconds,"before":before,"after":metrics(path)?,
+            "stats_before":stats_before,"stats_after":db.stats()?}),
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4, "MODE DIRECTORY CONFIG_JSON");
@@ -418,6 +589,10 @@ fn main() -> Result<()> {
         "prepare-merge" => prepare_merge(path, &c)?,
         "compact-merge" => compact_merge(path, &c, &raw)?,
         "prepare" => prepare(path, &c)?,
+        "prepare-wal" => prepare_wal(path, &c)?,
+        "recover" => recover(path, &c, &raw)?,
+        "memory-scan" => memory_scan(path, &c, &raw)?,
+        "mixed-large" => mixed_large(path, &c, &raw)?,
         "read" => reads(path, &c, &raw)?,
         "write" => writes(path, &c, &raw)?,
         "compact" => {

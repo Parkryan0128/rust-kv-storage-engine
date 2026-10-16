@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 const MAGIC: &[u8; 8] = b"RKVWAL01";
@@ -75,9 +75,24 @@ impl Wal {
         }
         let mut table = MemTable::default();
         let mut valid = 8;
-        while let Some(b) = read_frame(&mut file, allow_tail)? {
-            replay(&b, &mut table, last_seq)?;
-            valid = file.stream_position()?;
+        let mut buffer = Vec::new();
+        {
+            let mut reader = BufReader::with_capacity(MAX_RETAINED_BUFFER, &mut file);
+            while read_frame_into(&mut reader, allow_tail, &mut buffer)? {
+                replay(&buffer, &mut table, last_seq)?;
+                // Commit the logical offset only after CRC and replay validation.
+                // BufReader may have already read past this frame into a torn tail.
+                valid += (HEADER + buffer.len()) as u64;
+                if buffer.capacity() > MAX_RETAINED_BUFFER {
+                    buffer = Vec::new();
+                }
+            }
+        }
+        // Discard read-ahead before truncation and seek to the verified end.
+        if buffer.capacity() > MAX_RETAINED_BUFFER {
+            buffer = Vec::new();
+        } else {
+            buffer.clear();
         }
         if file.metadata()?.len() != valid {
             file.set_len(valid)?;
@@ -89,7 +104,7 @@ impl Wal {
                 file,
                 bytes: valid,
                 id,
-                buffer: Vec::new(),
+                buffer,
                 preallocation: Preallocation::new(valid),
             },
             table,

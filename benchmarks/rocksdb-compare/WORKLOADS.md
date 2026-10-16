@@ -175,3 +175,24 @@ The streaming comparison adds a bounded 4096-key, 4096-byte-value overwrite
 fixture to exercise scan version selection without copying losing values. It
 uses 96 short scans or 48 long scans per pass, with the same six paired trials
 and baseline/current fixture copies. Other read profiles are unchanged.
+
+## Remaining optimization checks
+
+[paired-perf] [remaining-perf] [baseline:<SHA>] runs the existing suite and
+remaining.py (six rotating paired trials). Added cases cover 2 MiB values,
+mixed small/large values, WAL-only reopen, and early-stop active scans. Both
+engine versions use byte-identical baseline fixtures; RocksDB uses matched writes.
+Preparation exits after durable WAL commits without destructors. Reopen timing
+excludes validation and the append/reopen correctness check. Warm file cache is
+explicit; these are not cold-device or power-loss measurements.
+
+Point latency collection now uses a shared budget of at most 4,000 samples across
+all workers. The existing end-to-end mode remains. The additional throughput mode
+uses ready workers and no per-query timers; timed work still includes RNG,
+validation, allocations and owned-value destruction. Do not merge its rates with
+the older timed-query results. Internal frozen scans hold maintenance paused in
+both versions and report creation/first-row time; they have no RocksDB comparison.
+These internal profiles run each backend in a group, not interleaved trials.
+Frozen scans may pin whole retired buffers until exhaustion/drop even though
+only 64 candidate records per buffer are copied at a time. Active snapshots
+still copy every matching key; no zero-copy claim is made.

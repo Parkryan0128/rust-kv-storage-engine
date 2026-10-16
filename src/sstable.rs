@@ -273,7 +273,12 @@ impl Table {
         let i = &self.index[n];
         let cache_key = CacheKey::from((self.id, n));
         let (cached, reusable, budget) = {
-            let mut cache = cache.lock(cache_key);
+            let mut cache = cache.lock_for_frame(
+                cache_key,
+                i.len as usize,
+                self.indexed,
+                self.cacheable.load(Ordering::Acquire),
+            );
             let cached = cache.get(cache_key);
             let reusable = if cached.is_none() && self.cacheable.load(Ordering::Acquire) {
                 cache.take_reusable(i.len as usize, self.indexed)
@@ -294,7 +299,12 @@ impl Table {
             let b = Arc::new(block);
             #[cfg(test)]
             crate::test_hooks::pause("cache_before_admission");
-            let mut cache = cache.lock(cache_key);
+            let mut cache = cache.lock_for_frame(
+                cache_key,
+                i.len as usize,
+                self.indexed,
+                self.cacheable.load(Ordering::Acquire),
+            );
             if self.cacheable.load(Ordering::Acquire) {
                 cache.insert(cache_key, b.clone());
             }

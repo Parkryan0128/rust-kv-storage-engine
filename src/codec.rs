@@ -137,13 +137,23 @@ pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<u64> {
 }
 // A torn tail is recoverable; a complete frame with a bad CRC is not.
 pub(crate) fn read_frame(r: &mut impl Read, allow_tail: bool) -> Result<Option<Vec<u8>>> {
+    let mut buffer = Vec::new();
+    Ok(read_frame_into(r, allow_tail, &mut buffer)?.then_some(buffer))
+}
+// Reuse only the caller-owned payload buffer; CRC/torn-tail rules match read_frame.
+pub(crate) fn read_frame_into(
+    r: &mut impl Read,
+    allow_tail: bool,
+    b: &mut Vec<u8>,
+) -> Result<bool> {
+    b.clear();
     let mut head = [0u8; HEADER];
     let mut n = 0;
     while n < head.len() {
         match r.read(&mut head[n..]) {
             Ok(0) => {
                 return if n == 0 || allow_tail {
-                    Ok(None)
+                    Ok(false)
                 } else {
                     Err(corrupt("truncated frame header"))
                 }
@@ -160,20 +170,21 @@ pub(crate) fn read_frame(r: &mut impl Read, allow_tail: bool) -> Result<Option<V
     if len > MAX_FRAME {
         return Err(corrupt("frame length exceeds limit"));
     }
-    let mut b = vec![0; len];
-    if let Err(e) = r.read_exact(&mut b) {
+    b.reserve_exact(len);
+    b.resize(len, 0);
+    if let Err(e) = r.read_exact(b) {
         if allow_tail && e.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Ok(None);
+            return Ok(false);
         }
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             return Err(corrupt("truncated frame payload"));
         }
         return Err(e.into());
     }
-    if crc32fast::hash(&b) != u32::from_le_bytes(head[8..12].try_into().unwrap()) {
+    if crc32fast::hash(b) != u32::from_le_bytes(head[8..12].try_into().unwrap()) {
         return Err(corrupt("frame payload checksum"));
     }
-    Ok(Some(b))
+    Ok(true)
 }
 
 #[cfg(test)]

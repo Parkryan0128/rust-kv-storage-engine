@@ -26,7 +26,7 @@ jobs:
   compare:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
@@ -79,6 +79,34 @@ jobs:
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Compare remaining recovery, cache, and active-scan workloads
+        if: contains(github.event.head_commit.message, '[remaining-perf]')
+        timeout-minutes: 8
+        run: python3 benchmarks/rocksdb-compare/remaining.py remaining-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Compare bounded frozen snapshots and production cache-hit path
+        if: contains(github.event.head_commit.message, '[remaining-perf]')
+        timeout-minutes: 8
+        run: |
+          mkdir -p internal-profile-results
+          cp src/memory_scan_profile.rs baseline/src/memory_scan_profile.rs
+          cp src/read_profile.rs baseline/src/read_profile.rs
+          printf '\n#[cfg(test)]\n#[path = "memory_scan_profile.rs"]\nmod memory_scan_profile;\n' >> baseline/src/engine.rs
+          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml --no-run
+          set -o pipefail
+          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml remaining_memory_scan_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/baseline.log
+          cargo test --locked --release --lib remaining_memory_scan_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/engine.log
+          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml current_cache_hit_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/cache-baseline.log
+          cargo test --locked --release --lib current_cache_hit_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/cache-engine.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: remaining-optimization-comparison
+          path: |
+            remaining-results/
+            internal-profile-results/
+          if-no-files-found: ignore
       - name: Compare bounded durable writes and flush pressure
         if: ${{ !contains(github.event.head_commit.message, '[followup-perf]') }}
         timeout-minutes: 8

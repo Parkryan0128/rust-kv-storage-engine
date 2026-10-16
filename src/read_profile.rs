@@ -90,3 +90,62 @@ fn profile_random_read_stages() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "bounded production cache-hit profile; run explicitly in release mode"]
+fn current_cache_hit_profile() -> Result<()> {
+    use bytes::Bytes;
+    let dir = tempfile::tempdir()?;
+    let keys = 20_000u64;
+    let table = Table::write(
+        &dir.path().join("cache.sst"),
+        1,
+        (0..keys).map(|k| {
+            Ok((
+                k.to_be_bytes(),
+                Record {
+                    seq: k + 1,
+                    value: Some(Bytes::from(vec![42; 128])),
+                },
+            ))
+        }),
+        keys,
+        16384,
+        10,
+    )?;
+    let cache = BlockCache::with_block_size(8 * 1024 * 1024, 16384);
+    let counters = Counters::default();
+    for k in 0..keys {
+        table.get(&k.to_be_bytes(), &cache, &counters)?;
+    }
+    for trial in 1..=6 {
+        let before_reads = counters.reads.load(Ordering::Relaxed);
+        let before_hits = cache.stats().1;
+        let mut rng = 7919u64;
+        let operations = 200_000;
+        let start = Instant::now();
+        for _ in 0..operations {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            black_box(
+                table
+                    .get(&(rng % keys).to_be_bytes(), &cache, &counters)?
+                    .unwrap()
+                    .value
+                    .unwrap(),
+            );
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        assert_eq!(counters.reads.load(Ordering::Relaxed), before_reads);
+        assert_eq!(cache.stats().1 - before_hits, operations);
+        println!(
+            "CACHE_HIT_PROFILE {}",
+            serde_json::json!({"trial":trial,
+            "operations":operations,"seconds":seconds,"ops_per_second":operations as f64/seconds,
+            "block_reads":0,"cache_hits":operations,"cache_bytes":cache.stats().0,
+            "notes":"Production Table::get: Bloom/index routing, shard/map/LRU/hit counter and owned value copy. Excludes Engine state lock; no per-query timer."})
+        );
+    }
+    Ok(())
+}

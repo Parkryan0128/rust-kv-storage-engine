@@ -58,6 +58,8 @@ struct Shard(Mutex<Cache>);
 pub(crate) struct BlockCache {
     shards: Vec<Shard>,
     capacity: usize,
+    overflow: Mutex<Cache>,
+    regular_capacity: usize,
 }
 impl BlockCache {
     #[cfg(test)]
@@ -81,6 +83,8 @@ impl BlockCache {
                 })
                 .collect(),
             capacity,
+            overflow: Mutex::new(Cache::new(0)),
+            regular_capacity: capacity / count,
         }
     }
     fn shard_index(&self, key: impl Into<CacheKey>) -> usize {
@@ -89,14 +93,57 @@ impl BlockCache {
     pub fn lock(&self, key: impl Into<CacheKey>) -> MutexGuard<'_, Cache> {
         self.shards[self.shard_index(key)].0.lock()
     }
+    // Ordinary blocks retain the independent shard path. Oversized frames use
+    // one shared LRU, borrowing space only when needed. Lock order is always
+    // overflow -> shards; a shard holder must never acquire overflow.
+    pub fn lock_for_frame(
+        &self,
+        key: CacheKey,
+        frame_len: usize,
+        indexed: bool,
+        allow_reserve: bool,
+    ) -> MutexGuard<'_, Cache> {
+        let charge = frame_len
+            .saturating_add(std::mem::size_of::<ReadBlock>())
+            .saturating_add(ENTRY_OVERHEAD)
+            .saturating_add(if indexed {
+                0
+            } else {
+                (frame_len.saturating_sub(crate::codec::HEADER) / 17)
+                    .max(1)
+                    .saturating_mul(std::mem::size_of::<u32>())
+            });
+        if self.shards.len() == 1 || charge <= self.regular_capacity {
+            return self.lock(key);
+        }
+        let mut overflow = self.overflow.lock();
+        if allow_reserve && charge <= self.capacity && charge > overflow.capacity {
+            let reserve = charge.saturating_mul(2).min(self.capacity);
+            self.resize_shards(self.capacity - reserve);
+            overflow.resize(reserve);
+        }
+        overflow
+    }
+    fn resize_shards(&self, budget: usize) {
+        let count = self.shards.len();
+        for (n, shard) in self.shards.iter().enumerate() {
+            shard
+                .0
+                .lock()
+                .resize(budget / count + usize::from(n < budget % count));
+        }
+    }
     pub fn is_disabled(&self) -> bool {
         self.capacity == 0
     }
     pub fn stats(&self) -> (usize, u64) {
-        self.shards.iter().fold((0, 0u64), |(bytes, hits), shard| {
-            let cache = shard.0.lock();
-            (bytes + cache.bytes(), hits.wrapping_add(cache.hits))
-        })
+        let overflow = self.overflow.lock();
+        self.shards
+            .iter()
+            .fold((overflow.bytes(), overflow.hits), |(bytes, hits), shard| {
+                let cache = shard.0.lock();
+                (bytes + cache.bytes(), hits.wrapping_add(cache.hits))
+            })
     }
     #[cfg(test)]
     pub fn bytes(&self) -> usize {
@@ -105,6 +152,12 @@ impl BlockCache {
     // Mark tables retired before calling this. An admission already in progress
     // finishes before its shard is purged; later admissions see the retirement.
     pub fn remove_tables(&self, retired: &HashSet<u64>) {
+        let mut overflow = self.overflow.lock();
+        overflow.remove_tables(retired);
+        if overflow.bytes() == 0 {
+            overflow.resize(0);
+            self.resize_shards(self.capacity);
+        }
         for shard in &self.shards {
             shard.0.lock().remove_tables(retired);
         }
@@ -149,6 +202,12 @@ impl Cache {
             head: NONE,
             tail: NONE,
         }
+    }
+    fn resize(&mut self, capacity: usize) {
+        while self.bytes > capacity {
+            self.remove(self.tail);
+        }
+        self.capacity = capacity;
     }
     fn unlink(&mut self, index: usize) {
         let e = self.slots[index].as_ref().unwrap();
@@ -385,6 +444,79 @@ mod tests {
         assert!(cache.bytes() <= capacity);
         assert!(cache.bytes() > 0);
         cache.remove_tables(&HashSet::from([1]));
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn oversized_pool_borrows_one_budget_and_releases_retired_capacity() {
+        let capacity = 8 * 1024 * 1024;
+        let cache = BlockCache::with_block_size(capacity, 16384);
+        let large = block(2 * 1024 * 1024);
+        let key = CacheKey::from((9, 0));
+        let frame_len = large.frame_capacity();
+        cache
+            .lock_for_frame(key, frame_len, false, true)
+            .insert(key, large.clone());
+        let pinned = cache
+            .lock_for_frame(key, frame_len, false, true)
+            .get(key)
+            .unwrap();
+        assert!(Arc::ptr_eq(&large, &pinned));
+        for n in 0..512 {
+            cache.lock((1, n)).insert((1, n), block(16384));
+        }
+        assert!(cache.bytes() <= capacity);
+        assert!(cache
+            .lock_for_frame(key, frame_len, false, true)
+            .get(key)
+            .is_some());
+        let used = cache.bytes();
+        // An impossible frame never consumes a reservation or evicts hot blocks.
+        assert!(cache
+            .lock_for_frame(CacheKey::from((10, 0)), capacity * 2, true, true)
+            .take_reusable(capacity * 2, true)
+            .is_none());
+        assert_eq!(cache.bytes(), used);
+        cache.remove_tables(&HashSet::from([9]));
+        assert_eq!(cache.overflow.lock().capacity, 0);
+        assert_eq!(
+            cache
+                .shards
+                .iter()
+                .map(|s| s.0.lock().capacity)
+                .sum::<usize>(),
+            capacity
+        );
+        assert_eq!(
+            pinned.get(b"k").unwrap().value.unwrap().len(),
+            2 * 1024 * 1024
+        );
+        assert!(cache.bytes() <= capacity);
+    }
+
+    #[test]
+    fn concurrent_oversized_and_skewed_small_admissions_stay_bounded() {
+        let cache = BlockCache::with_block_size(8 * 1024 * 1024, 16384);
+        std::thread::scope(|scope| {
+            for thread in 0..4u64 {
+                let cache = &cache;
+                scope.spawn(move || {
+                    let block = block(if thread % 2 == 0 {
+                        2 * 1024 * 1024
+                    } else {
+                        4096
+                    });
+                    for n in 0..80 {
+                        let key = CacheKey::from((thread, n));
+                        cache
+                            .lock_for_frame(key, block.frame_capacity(), false, true)
+                            .insert(key, block.clone());
+                        assert!(cache.bytes() <= 8 * 1024 * 1024);
+                    }
+                });
+            }
+        });
+        cache.remove_tables(&HashSet::from([0, 1, 2, 3]));
         assert_eq!(cache.bytes(), 0);
     }
 

@@ -24,6 +24,12 @@ If reservation fails or is unsupported, that WAL falls back to ordinary appends;
 actual write and sync failures still fail the write. Other platforms use ordinary
 appends. Every acknowledged commit still waits for `sync_all()`.
 
+WAL recovery uses 64 KiB buffered sequential input and reuses a payload buffer.
+Payload storage above 64 KiB is released after replay. Only a fully validated
+frame advances the logical recovery offset; buffered read-ahead is discarded
+before repairing a newest torn tail and positioning the next append.
+Complete checksum errors and torn older WALs remain fatal.
+
 `Engine::write_batch(WriteBatch)` validates all operations, writes one WAL frame,
 syncs once, then applies the entire batch under the state write lock. The writer
 barrier prevents other writes or rotation from splitting the batch. Each
@@ -65,9 +71,14 @@ collisions still compare the full table/block identity. Cumulative hit counts
 live under each shard's existing lock and are summed by `stats()`. Retained
 hashes are included in the per-entry bookkeeping allowance. Small caches and
 large configured block targets use fewer shards. The
-default 8 MiB cache has eight 1 MiB shards. Capacity is not borrowed across shards:
-a skewed workload can use the budget less effectively, and a block larger than
-its shard's budget bypasses admission even if it could fit in the total cache.
+default 8 MiB cache starts with eight 1 MiB shards. Ordinary blocks retain those
+independent LRUs; skew can still reduce effective capacity. A frame exceeding
+the original shard budget uses a shared overflow LRU. On demand it borrows up to
+two frame charges (capped at the total budget), shrinking and evicting ordinary
+shards before growing overflow. Thus configured entry charges remain bounded.
+This trades some small-block capacity and large-read synchronization for caching
+oversized values. Retirement returns borrowed space when overflow becomes empty.
+Pinned reader blocks can outlive eviction and are outside resident-cache charges.
 A disabled cache bypasses cache locks and admission entirely.
 When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
@@ -89,10 +100,11 @@ separately from memtable memory charges.
 
 ## Range snapshots
 
-`Engine::scan()` copies matching active memtable keys and shares immutable value
+`Engine::scan()` copies matching active memtable keys into a sorted vector and shares immutable value
 bytes while holding the state read lock. It captures frozen-buffer handles and
 the SST list under that same lock, so it observes one consistent state, including
-all or none of a batch. Frozen buffers are merged after releasing the lock;
+all or none of a batch. Frozen buffers are traversed lazily in pages of at most
+64 records, amortizing tree seeks without self-referential iterators;
 their captured handles remain valid across concurrent flushes and compactions.
 After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
@@ -107,7 +119,7 @@ Errors are iterator items and terminate the scan; earlier rows may already have
 been returned. Exhausted or failed iterators always return `None` thereafter.
 
 Copying a large active-buffer snapshot can still delay writers. The complete
-memory snapshot allocates copied keys plus map entries, while values share
+active snapshot allocates copied keys plus vector entries, while values share
 immutable bytes. Disk buffering grows with the number of SSTs and their block
 sizes; it is not a fixed process-memory limit.
 The iterator holds an engine handle and its open SSTs until drop, error or

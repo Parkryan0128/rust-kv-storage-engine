@@ -251,3 +251,64 @@ fn reservation_boundaries_recover_without_zero_padding_or_lost_appends() {
         Some(&b"after"[..])
     );
 }
+
+#[test]
+fn buffered_recovery_crosses_headers_and_payloads_and_drops_large_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("1.wal");
+    let mut bytes = MAGIC.to_vec();
+    let mut payload = Vec::new();
+    // The next header straddles the 64 KiB reader boundary (which starts after magic).
+    let large = Record {
+        seq: 1,
+        value: Some(Bytes::from(vec![7; MAX_RETAINED_BUFFER - 5 - HEADER - 18])),
+    };
+    encode_record(b"a", &large, &mut payload);
+    write_frame(&mut bytes, &payload).unwrap();
+    let prefix = bytes.len();
+    write_frame(&mut bytes, &super::tests::payload()).unwrap();
+    let complete = bytes.len();
+    for cut in [
+        prefix,
+        prefix + 1,
+        prefix + 4,
+        prefix + HEADER - 1,
+        prefix + HEADER,
+        complete - 1,
+        complete,
+    ] {
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        let mut seq = 0;
+        let (mut wal, table) = Wal::recover(&path, 1, true, &mut seq).unwrap();
+        assert_eq!(seq, if cut == complete { 3 } else { 1 });
+        assert_eq!(
+            wal.bytes as usize,
+            if cut == complete { complete } else { prefix }
+        );
+        assert!(wal.buffer.capacity() <= MAX_RETAINED_BUFFER);
+        assert_eq!(table.get(b"b").is_some(), cut == complete);
+        wal.append(b"after", &single(b"ok", seq + 1)).unwrap();
+        drop(wal);
+        let (_, table) = Wal::recover(&path, 1, false, &mut 0).unwrap();
+        assert!(table.get(b"after").is_some());
+        if cut > prefix && cut < complete {
+            std::fs::write(&path, &bytes[..cut]).unwrap();
+            assert!(matches!(
+                Wal::recover(&path, 1, false, &mut 0),
+                Err(EngineError::Corruption(_))
+            ));
+        }
+    }
+    let mut wal = Wal::create(&dir.path().join("large.wal"), 2).unwrap();
+    wal.append(
+        b"x",
+        &Record {
+            seq: 1,
+            value: Some(Bytes::from(vec![8; MAX_RETAINED_BUFFER * 3])),
+        },
+    )
+    .unwrap();
+    drop(wal);
+    let (wal, _) = Wal::recover(&dir.path().join("large.wal"), 2, false, &mut 0).unwrap();
+    assert_eq!(wal.buffer.capacity(), 0);
+}

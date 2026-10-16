@@ -18,7 +18,7 @@ use fs2::FileExt;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     ops::RangeBounds,
     path::{Path, PathBuf},
@@ -107,9 +107,9 @@ pub struct Stats {
     /// Largest number of input SSTs in a single merge since open (at most sixteen).
     pub max_compaction_inputs: u64,
 }
-struct Frozen {
+pub(crate) struct Frozen {
     id: u64,
-    mem: MemTable,
+    pub(crate) mem: MemTable,
 }
 struct State {
     mem: MemTable,
@@ -420,8 +420,8 @@ impl Engine {
     /// `InvalidConfig`; equal bounds are empty unless both ends are included.
     ///
     /// Creation copies matching active keys and shares their immutable value
-    /// bytes under the state lock. Frozen buffers are captured there and merged
-    /// after releasing it. SST data is read lazily without that lock
+    /// bytes into a sorted vector under the state lock. Frozen buffers are pinned
+    /// there and traversed lazily in bounded pages. SST data is read lazily
     /// and without polluting the point-read cache. Handle each iterator item's
     /// `Result`: a disk error ends the scan, potentially after earlier results.
     /// Drop or exhaust the scan to release pinned files and the database lock.
@@ -444,31 +444,20 @@ impl Engine {
         if range.is_empty() {
             return Ok(Scan::empty());
         }
-        let mut memory: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
-        for (key, record) in s.mem.data.range::<[u8], _>(range.bounds()) {
-            memory.insert(key.clone(), record.clone());
-        }
+        let memory = s
+            .mem
+            .data
+            .range::<[u8], _>(range.bounds())
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
         let frozen: Vec<_> = s.immutable.iter().cloned().collect();
         let tables = s.tables.clone();
         drop(s);
-        // Frozen buffers never change. Pin the same snapshot as active memory
-        // and SSTs, but do their potentially large merge without blocking writes.
         #[cfg(test)]
         crate::test_hooks::pause("scan_before_frozen_merge");
-        for frozen in frozen {
-            for (key, record) in frozen.mem.data.range::<[u8], _>(range.bounds()) {
-                memory
-                    .entry(key.clone())
-                    .and_modify(|old| {
-                        if record.seq > old.seq {
-                            *old = record.clone();
-                        }
-                    })
-                    .or_insert_with(|| record.clone());
-            }
-        }
-        Ok(Scan::new(self.clone(), memory, &tables, range))
+        Ok(Scan::new(self.clone(), memory, frozen, &tables, range))
     }
+
     pub(crate) fn scan_counters(&self) -> &Counters {
         &self.inner.core.counters
     }
@@ -1099,3 +1088,7 @@ mod audit_tests {
         worker.join().unwrap().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "memory_scan_profile.rs"]
+mod memory_scan_profile;
