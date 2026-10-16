@@ -11,7 +11,7 @@ It writes changes to a log before updating memory, flushes sorted tables to disk
 The engine:
 
 1. Appends each write or deletion to the write-ahead log and syncs it.
-2. Updates the active `BTreeMap` memtable.
+2. Updates the ordered, copy-on-write paged memtable.
 3. Rotates to a new memtable before the next write once the memory or WAL limit is reached.
 4. Flushes frozen memtables to sorted SSTables in a background thread.
 5. Checks memory first on reads, then uses Bloom filters, block indexes, and the LRU cache to find records in SSTables.
@@ -101,10 +101,12 @@ versions are merged and deleted keys are omitted. SST blocks are read lazily,
 bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
 ends the iterator after reporting the error, possibly after some successful rows.
 
-Snapshot creation copies matching active-buffer keys and shares their value bytes
-under the state lock; larger active ranges can delay writers during this step.
-Frozen buffers and SST handles are captured in the same snapshot; frozen-buffer
-merging runs after releasing the lock.
+Snapshot creation shares overlapping active/frozen memory pages and captures SST
+handles under the state lock. It clones page handles, not every matching key.
+Keys are copied when consumed; completed memory pages and sources are released.
+Later writes copy only shared pages, so retaining a snapshot can increase write
+latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
+except that one larger key occupies its own page.
 Iteration buffers one block and candidate record per SST, rather than all disk
 results. `.take(n)` limits consumption; `.collect()` allocates the full result.
 Drop or exhaust scans promptly: they retain the database lock and old SST handles,

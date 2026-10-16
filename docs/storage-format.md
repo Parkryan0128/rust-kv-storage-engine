@@ -73,11 +73,17 @@ hashes are included in the per-entry bookkeeping allowance. Small caches and
 large configured block targets use fewer shards. The
 default 8 MiB cache starts with eight 1 MiB shards. Ordinary blocks retain those
 independent LRUs; skew can still reduce effective capacity. A frame exceeding
-the original shard budget uses a shared overflow LRU. On demand it borrows up to
-two frame charges (capped at the total budget), shrinking and evicting ordinary
-shards before growing overflow. Thus configured entry charges remain bounded.
-This trades some small-block capacity and large-read synchronization for caching
-oversized values. Retirement returns borrowed space when overflow becomes empty.
+the original shard budget uses a shared overflow LRU. Space is reserved only
+after successful reading and validation, using actual allocated entry charges.
+At least one quarter of the total budget remains available to ordinary shards;
+a large entry exceeding the remaining budget bypasses caching. No speculative
+reservation is left behind by failed reads. Ordinary cache hits use precomputed
+routing limits and do not perform reservation or retirement checks.
+Every 32 ordinary admissions under reduced capacity, the pressured shard checks
+whether overflow activity has changed since its previous check. If not, one
+least-recently-used oversized entry is evicted and its budget returned. Retirement
+also returns unused space. This trades small-block capacity and large-read
+synchronization for oversized caching while allowing small-only phases to recover.
 Pinned reader blocks can outlive eviction and are outside resident-cache charges.
 A disabled cache bypasses cache locks and admission entirely.
 When a miss requires eviction,
@@ -100,12 +106,14 @@ separately from memtable memory charges.
 
 ## Range snapshots
 
-`Engine::scan()` copies matching active memtable keys into a sorted vector and shares immutable value
-bytes while holding the state read lock. It captures frozen-buffer handles and
-the SST list under that same lock, so it observes one consistent state, including
-all or none of a batch. Frozen buffers are traversed lazily in pages of at most
-64 records, amortizing tree seeks without self-referential iterators;
-their captured handles remain valid across concurrent flushes and compactions.
+`Engine::scan()` clones handles to overlapping active and frozen memory pages
+while holding the state read lock. It captures the SST list under the same lock,
+so it observes one consistent state, including all or none of a batch. The ordered
+memtable contains copy-on-write pages, each limited to 256 records and 64 KiB of
+key bytes, except a single larger key. Snapshot creation copies page handles;
+iteration copies only the consumed key and shares immutable value bytes.
+Pages remain valid across writes, flushes and compactions and are released as
+the cursor finishes them. Nonoverlapping memory pages are not retained.
 After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
 
@@ -118,12 +126,12 @@ They bypass the point-read cache; disk reads still increment `stats().block_read
 Errors are iterator items and terminate the scan; earlier rows may already have
 been returned. Exhausted or failed iterators always return `None` thereafter.
 
-Copying a large active-buffer snapshot can still delay writers. The complete
-active snapshot allocates copied keys plus vector entries, while values share
-immutable bytes. Disk buffering grows with the number of SSTs and their block
-sizes; it is not a fixed process-memory limit.
-The iterator holds an engine handle and its open SSTs until drop, error or
-exhaustion. Compaction can unlink old files, but those handles delay reclaiming
+Snapshot creation still takes time and space proportional to the number of
+overlapping pages. A write to a shared page clones that page's keys and value
+handles; it does not clone the entire memtable. Retained snapshots can increase
+write latency and keep old values alive. Disk buffering grows with SST count and
+block sizes; it is not a fixed process-memory limit. Completed sources release
+their SST handles early. The engine handle remains until drop, error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming
 their space; `sst_bytes` counts current live tables, not unlinked pinned files.
 Drop long-lived or partially consumed scans before reopening the database.
 
