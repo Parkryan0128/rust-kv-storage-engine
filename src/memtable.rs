@@ -34,6 +34,7 @@ impl MemTable {
             self.bytes -= old.memory_size(key);
         }
     }
+    #[inline]
     pub fn get(&self, key: &[u8]) -> Option<Record> {
         self.data.get(key).cloned()
     }

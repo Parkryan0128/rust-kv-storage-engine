@@ -109,7 +109,9 @@ separately from memtable memory charges.
 `Engine::scan()` clones handles to overlapping active and frozen memory pages
 while holding the state read lock. It captures the SST list under the same lock,
 so it observes one consistent state, including all or none of a batch. The ordered
-memtable contains copy-on-write pages, each limited to 256 records and 64 KiB of
+memtable uses compact monotone key-prefix indexes with full-byte comparison
+for equal prefixes, and an append path for increasing keys. It contains
+copy-on-write pages, each limited to 256 records and 64 KiB of
 key bytes, except a single larger key. Snapshot creation copies page handles;
 iteration copies only the consumed key and shares immutable value bytes.
 Pages remain valid across writes, flushes and compactions and are released as
@@ -127,8 +129,8 @@ Errors are iterator items and terminate the scan; earlier rows may already have
 been returned. Exhausted or failed iterators always return `None` thereafter.
 
 Snapshot creation still takes time and space proportional to the number of
-overlapping pages. A write to a shared page clones that page's keys and value
-handles; it does not clone the entire memtable. Retained snapshots can increase
+overlapping pages. A write to a shared page clones its key/value handles and prefix index;
+it shares their immutable bytes and does not clone the entire memtable. Retained snapshots can increase
 write latency and keep old values alive. Disk buffering grows with SST count and
 block sizes; it is not a fixed process-memory limit. Completed sources release
 their SST handles early. The engine handle remains until drop, error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming

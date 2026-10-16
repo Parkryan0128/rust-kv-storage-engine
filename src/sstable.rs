@@ -272,17 +272,18 @@ impl Table {
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
         let cache_key = CacheKey::from((self.id, n));
-        let regular = cache.is_regular(i.len as usize, self.indexed);
         let (cached, reusable, budget) = {
-            let mut cache = cache.lock_for_frame(cache_key, i.len as usize, self.indexed);
-            let cached = cache.get(cache_key);
-            let reusable = if cached.is_none() && regular && self.cacheable.load(Ordering::Acquire)
+            let mut shard = cache.lock_for_frame(cache_key, i.len as usize, self.indexed);
+            let cached = shard.get(cache_key);
+            let reusable = if cached.is_none()
+                && cache.is_regular(i.len as usize, self.indexed)
+                && self.cacheable.load(Ordering::Acquire)
             {
-                cache.take_reusable(i.len as usize, self.indexed)
+                shard.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
             };
-            (cached, reusable, cache.block_budget())
+            (cached, reusable, shard.block_budget())
         };
         let block = if let Some(b) = cached {
             b
