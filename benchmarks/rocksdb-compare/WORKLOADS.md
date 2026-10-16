@@ -192,7 +192,18 @@ uses ready workers and no per-query timers; timed work still includes RNG,
 validation, allocations and owned-value destruction. Do not merge its rates with
 the older timed-query results. Internal frozen scans hold maintenance paused in
 both versions and report creation/first-row time; they have no RocksDB comparison.
-These internal profiles run each backend in a group, not interleaved trials.
-Frozen scans may pin whole retired buffers until exhaustion/drop even though
-only 64 candidate records per buffer are copied at a time. Active snapshots
-still copy every matching key; no zero-copy claim is made.
+Internal profiles alternate baseline/current execution in six paired trials.
+Memory snapshots share only overlapping copy-on-write pages (up to 256 records
+and 64 KiB of keys per page, except a single larger key). Scans copy a key only
+when it is consumed and release completed pages; they still clone page handles
+at creation, and a write to a shared page copies that page. This is not zero-cost
+snapshotting or a guarantee of unchanged write performance.
+
+Additional cases cover 2/4 MiB values followed by small-only phases with 20k,
+40k, and 80k small keys, mixed cache pressure, 100k-key early scans, full memory
+traversal, and batch writes while a snapshot is retained. Internal volatile
+write profiles isolate copy-on-write costs from fsync, separately from durable
+RocksDB comparisons. Cache hits/block reads are logical reads, not physical I/O.
+The engine keeps at least a quarter of its cache budget for ordinary blocks;
+large entries exceeding the remaining budget bypass caching. Idle oversized
+entries can be reclaimed under sustained ordinary miss pressure.

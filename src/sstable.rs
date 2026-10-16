@@ -272,15 +272,12 @@ impl Table {
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
         let cache_key = CacheKey::from((self.id, n));
+        let regular = cache.is_regular(i.len as usize, self.indexed);
         let (cached, reusable, budget) = {
-            let mut cache = cache.lock_for_frame(
-                cache_key,
-                i.len as usize,
-                self.indexed,
-                self.cacheable.load(Ordering::Acquire),
-            );
+            let mut cache = cache.lock_for_frame(cache_key, i.len as usize, self.indexed);
             let cached = cache.get(cache_key);
-            let reusable = if cached.is_none() && self.cacheable.load(Ordering::Acquire) {
+            let reusable = if cached.is_none() && regular && self.cacheable.load(Ordering::Acquire)
+            {
                 cache.take_reusable(i.len as usize, self.indexed)
             } else {
                 None
@@ -299,15 +296,13 @@ impl Table {
             let b = Arc::new(block);
             #[cfg(test)]
             crate::test_hooks::pause("cache_before_admission");
-            let mut cache = cache.lock_for_frame(
+            cache.insert(
                 cache_key,
                 i.len as usize,
                 self.indexed,
-                self.cacheable.load(Ordering::Acquire),
+                b.clone(),
+                &self.cacheable,
             );
-            if self.cacheable.load(Ordering::Acquire) {
-                cache.insert(cache_key, b.clone());
-            }
             b
         };
         block.lookup(key)
@@ -718,46 +713,107 @@ mod tests {
     }
 
     #[test]
-    fn retirement_between_disk_read_and_admission_cannot_refill_cache() {
-        use std::{sync::mpsc::sync_channel, thread, time::Duration};
+    fn failed_large_block_read_preserves_warm_small_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.sst");
-        let table = Arc::new(
+        let make = |name: &str, id, size| {
             Table::write(
-                &path,
-                1,
+                &dir.path().join(name),
+                id,
                 std::iter::once(Ok((
                     b"key".to_vec(),
                     Record {
                         seq: 1,
-                        value: Some(Bytes::from_static(b"value")),
+                        value: Some(Bytes::from(vec![42; size])),
                     },
                 ))),
                 1,
-                64,
+                16384,
                 10,
             )
-            .unwrap(),
-        );
-        let cache = Arc::new(BlockCache::new(8 * 1024 * 1024));
-        let (entered_tx, entered_rx) = sync_channel(1);
-        let (resume_tx, resume_rx) = sync_channel(1);
-        let reader_table = table.clone();
-        let reader_cache = cache.clone();
-        let reader = thread::spawn(move || {
-            crate::test_hooks::arm("cache_before_admission", entered_tx, resume_rx);
-            reader_table.get(b"key", &reader_cache, &Counters::default())
-        });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        table.retire();
-        cache.remove_tables(&std::collections::HashSet::from([1]));
-        fs::remove_file(path).unwrap();
-        resume_tx.send(()).unwrap();
+            .unwrap()
+        };
+        let small = make("small.sst", 1, 128);
+        let large = make("large.sst", 2, 4 * 1024 * 1024);
+        let cache = BlockCache::with_block_size(8 * 1024 * 1024, 16384);
+        let counters = Counters::default();
+        small.get(b"key", &cache, &counters).unwrap();
+        let before = cache.stats();
+        let mut damaged = OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("large.sst"))
+            .unwrap();
+        damaged
+            .seek(SeekFrom::Start(large.index[0].offset + HEADER as u64))
+            .unwrap();
+        damaged.write_all(&[255]).unwrap();
+        damaged.sync_all().unwrap();
+        assert!(large.get(b"key", &cache, &counters).is_err());
+        assert_eq!(cache.stats(), before);
+        let reads = counters.reads.load(Ordering::Relaxed);
         assert_eq!(
-            reader.join().unwrap().unwrap().unwrap().value.unwrap(),
-            "value"
+            small
+                .get(b"key", &cache, &counters)
+                .unwrap()
+                .unwrap()
+                .value
+                .unwrap()
+                .len(),
+            128
         );
-        assert_eq!(cache.bytes(), 0);
+        assert_eq!(counters.reads.load(Ordering::Relaxed), reads);
+        assert_eq!(cache.stats().1, before.1 + 1);
+    }
+
+    #[test]
+    fn retirement_between_disk_read_and_admission_cannot_refill_cache() {
+        use std::{sync::mpsc::sync_channel, thread, time::Duration};
+        for value_len in [64, 4 * 1024 * 1024] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("old.sst");
+            let table = Arc::new(
+                Table::write(
+                    &path,
+                    1,
+                    std::iter::once(Ok((
+                        b"key".to_vec(),
+                        Record {
+                            seq: 1,
+                            value: Some(Bytes::from(vec![42; value_len])),
+                        },
+                    ))),
+                    1,
+                    64,
+                    10,
+                )
+                .unwrap(),
+            );
+            let cache = Arc::new(BlockCache::new(8 * 1024 * 1024));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (resume_tx, resume_rx) = sync_channel(1);
+            let reader_table = table.clone();
+            let reader_cache = cache.clone();
+            let reader = thread::spawn(move || {
+                crate::test_hooks::arm("cache_before_admission", entered_tx, resume_rx);
+                reader_table.get(b"key", &reader_cache, &Counters::default())
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            table.retire();
+            cache.remove_tables(&std::collections::HashSet::from([1]));
+            fs::remove_file(path).unwrap();
+            resume_tx.send(()).unwrap();
+            assert_eq!(
+                reader
+                    .join()
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .unwrap()
+                    .len(),
+                value_len
+            );
+            assert_eq!(cache.bytes(), 0);
+        }
     }
 
     #[test]

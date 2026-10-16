@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use std::collections::{btree_map::Entry, BTreeMap};
+#[path = "mem_index.rs"]
+mod mem_index;
+pub(crate) use mem_index::{MemIndex, MemScan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Record {
@@ -16,20 +18,15 @@ impl Record {
 }
 #[derive(Default)]
 pub(crate) struct MemTable {
-    pub data: BTreeMap<Vec<u8>, Record>,
+    pub data: MemIndex,
     pub bytes: usize,
 }
 impl MemTable {
     pub fn insert(&mut self, key: Vec<u8>, record: Record) {
         self.bytes += record.memory_size(&key);
-        match self.data.entry(key) {
-            Entry::Occupied(mut entry) => {
-                self.bytes -= entry.get().memory_size(entry.key());
-                entry.insert(record);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(record);
-            }
+        let key_len = key.len();
+        if let Some(old) = self.data.insert(key, record) {
+            self.bytes -= 48 + key_len + old.value.as_ref().map_or(0, Bytes::len);
         }
     }
     pub fn remove(&mut self, key: &[u8]) {

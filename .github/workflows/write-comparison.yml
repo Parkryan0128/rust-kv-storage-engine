@@ -26,7 +26,7 @@ jobs:
   compare:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]')
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
@@ -85,20 +85,17 @@ jobs:
         run: python3 benchmarks/rocksdb-compare/remaining.py remaining-results
         env:
           KV_BENCH_DIR: ${{ runner.temp }}
-      - name: Compare bounded frozen snapshots and production cache-hit path
+      - name: Compare interleaved memory snapshots, writes, and cache hits
         if: contains(github.event.head_commit.message, '[remaining-perf]')
         timeout-minutes: 8
         run: |
           mkdir -p internal-profile-results
           cp src/memory_scan_profile.rs baseline/src/memory_scan_profile.rs
           cp src/read_profile.rs baseline/src/read_profile.rs
-          printf '\n#[cfg(test)]\n#[path = "memory_scan_profile.rs"]\nmod memory_scan_profile;\n' >> baseline/src/engine.rs
-          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml --no-run
-          set -o pipefail
-          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml remaining_memory_scan_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/baseline.log
-          cargo test --locked --release --lib remaining_memory_scan_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/engine.log
-          cargo test --locked --release --lib --manifest-path baseline/Cargo.toml current_cache_hit_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/cache-baseline.log
-          cargo test --locked --release --lib current_cache_hit_profile -- --ignored --nocapture --test-threads=1 | tee internal-profile-results/cache-engine.log
+          if ! grep -q 'mod memory_scan_profile;' baseline/src/engine.rs; then
+            printf '\n#[cfg(test)]\n#[path = "memory_scan_profile.rs"]\nmod memory_scan_profile;\n' >> baseline/src/engine.rs
+          fi
+          python3 benchmarks/rocksdb-compare/internal.py internal-profile-results
       - uses: actions/upload-artifact@v4
         if: always()
         with:

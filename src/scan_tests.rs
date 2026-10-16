@@ -245,7 +245,6 @@ fn frozen_scan_pages_are_lazy_bounded_and_release_pinned_memory() {
         .unwrap();
     let frozen = Arc::downgrade(db.inner.core.state.read().immutable.front().unwrap());
     let mut scan = db.scan(..).unwrap();
-    assert_eq!(scan.buffered_frozen_records(), 0);
     assert!(db.inner.core.state.try_write().is_some());
     for n in 0..257u32 {
         assert_eq!(
@@ -255,14 +254,14 @@ fn frozen_scan_pages_are_lazy_bounded_and_release_pinned_memory() {
                 Bytes::copy_from_slice(&n.to_be_bytes())
             )
         );
-        assert!(scan.buffered_frozen_records() <= 63);
         if n == 0 {
             db.put(&0u32.to_be_bytes(), b"later").unwrap();
         }
     }
     drop(maintenance);
     db.flush().unwrap();
-    assert!(frozen.upgrade().is_some());
+    // The snapshot owns pages, not the retired frozen container.
+    assert!(frozen.upgrade().is_none());
     assert!(scan.next().is_none());
     assert!(frozen.upgrade().is_none());
 }
@@ -283,4 +282,43 @@ fn default_cache_admits_repeated_two_megabyte_values() {
     assert_eq!(after.block_reads, first.block_reads);
     assert_eq!(after.cache_hits, first.cache_hits + 4);
     assert!(after.cache_bytes <= Options::default().block_cache_capacity);
+}
+
+#[test]
+fn page_snapshots_survive_splits_removals_batches_and_large_keys() {
+    let db = Engine::new();
+    let mut batch = WriteBatch::new();
+    for n in 0..1024u64 {
+        batch.put(n.to_be_bytes(), n.to_be_bytes());
+    }
+    db.write_batch(batch).unwrap();
+    let snapshot = db.scan(..).unwrap();
+    let narrow = db
+        .scan(250u64.to_be_bytes().as_slice()..=270u64.to_be_bytes().as_slice())
+        .unwrap();
+    let mut batch = WriteBatch::new();
+    for n in 0..2048u64 {
+        if n % 2 == 0 {
+            batch.delete(n.to_be_bytes());
+        } else {
+            batch.put(n.to_be_bytes(), b"later");
+        }
+    }
+    db.write_batch(batch).unwrap();
+    for (n, row) in snapshot.enumerate() {
+        let (key, value) = row.unwrap();
+        assert_eq!(key, (n as u64).to_be_bytes());
+        assert_eq!(value.as_ref(), (n as u64).to_be_bytes());
+    }
+    assert_eq!(narrow.count(), 21);
+    assert_eq!(db.scan(..).unwrap().count(), 1024);
+    let key = vec![255; 1024 * 1024];
+    db.put(&key, b"large-key").unwrap();
+    let mut snapshot = db.scan(key.as_slice()..).unwrap();
+    db.delete(&key).unwrap();
+    assert_eq!(
+        snapshot.next().unwrap().unwrap(),
+        (key, Bytes::from_static(b"large-key"))
+    );
+    assert!(snapshot.next().is_none());
 }

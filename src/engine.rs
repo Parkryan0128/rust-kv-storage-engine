@@ -419,9 +419,9 @@ impl Engine {
     /// `..`, or a pair of `std::ops::Bound` values. Reversed bounds return
     /// `InvalidConfig`; equal bounds are empty unless both ends are included.
     ///
-    /// Creation copies matching active keys and shares their immutable value
-    /// bytes into a sorted vector under the state lock. Frozen buffers are pinned
-    /// there and traversed lazily in bounded pages. SST data is read lazily
+    /// Creation shares overlapping active and frozen memory pages under the
+    /// state lock; it does not copy their keys. Later writes copy only shared
+    /// pages. Consumed pages are released incrementally. SST data is read lazily
     /// and without polluting the point-read cache. Handle each iterator item's
     /// `Result`: a disk error ends the scan, potentially after earlier results.
     /// Drop or exhaust the scan to release pinned files and the database lock.
@@ -438,7 +438,7 @@ impl Engine {
     /// # Ok::<(), rust_kv_storage_engine::EngineError>(())
     /// ```
     pub fn scan<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> Result<Scan> {
-        let range = KeyRange::new(range)?;
+        let range = Arc::new(KeyRange::new(range)?);
         let s = self.inner.core.state.read();
         check(&s)?;
         if range.is_empty() {
@@ -447,15 +447,19 @@ impl Engine {
         let memory = s
             .mem
             .data
-            .range::<[u8], _>(range.bounds())
-            .map(|(key, record)| (key.clone(), record.clone()))
+            .snapshot(range.clone())
+            .into_iter()
+            .chain(
+                s.immutable
+                    .iter()
+                    .filter_map(|f| f.mem.data.snapshot(range.clone())),
+            )
             .collect();
-        let frozen: Vec<_> = s.immutable.iter().cloned().collect();
         let tables = s.tables.clone();
         drop(s);
         #[cfg(test)]
         crate::test_hooks::pause("scan_before_frozen_merge");
-        Ok(Scan::new(self.clone(), memory, frozen, &tables, range))
+        Ok(Scan::new(self.clone(), memory, &tables, range))
     }
 
     pub(crate) fn scan_counters(&self) -> &Counters {

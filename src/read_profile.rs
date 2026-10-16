@@ -118,7 +118,11 @@ fn current_cache_hit_profile() -> Result<()> {
     for k in 0..keys {
         table.get(&k.to_be_bytes(), &cache, &counters)?;
     }
-    for trial in 1..=6 {
+    let trials: Vec<u64> = std::env::var("KV_PROFILE_TRIAL")
+        .ok()
+        .map(|n| vec![n.parse().unwrap()])
+        .unwrap_or_else(|| (1..=6).collect());
+    for trial in trials {
         let before_reads = counters.reads.load(Ordering::Relaxed);
         let before_hits = cache.stats().1;
         let mut rng = 7919u64;

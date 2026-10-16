@@ -540,7 +540,7 @@ fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 fn mixed_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
-    assert!(!path.exists() && c.value == 2 * 1024 * 1024);
+    assert!(!path.exists() && c.value >= 2 * 1024 * 1024);
     let db = Backend::open(path, c)?;
     let large = value(c.keys, 0, c.value);
     db.put(&key(c.keys), &large)?;
@@ -579,6 +579,101 @@ fn mixed_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 
+fn cache_phase(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(!path.exists());
+    let db = Backend::open(path, c)?;
+    let large = value(c.keys, 0, c.value);
+    db.put(&key(c.keys), &large)?;
+    populate_memory(
+        &db,
+        &Config {
+            value: 128,
+            ..c.clone()
+        },
+    )?;
+    db.flush()?;
+    for _ in 0..2 {
+        for i in 0..c.keys {
+            assert_eq!(
+                db.get(&key(i))?.as_deref(),
+                Some(value(i, 0, 128).as_slice())
+            );
+        }
+    }
+    // One large lookup after warming small records. Subsequent phases contain
+    // only small reads, exposing reservations stranded by a workload change.
+    assert_eq!(db.get(&key(c.keys))?.as_deref(), Some(large.as_slice()));
+    for stage in ["first", "repeat"] {
+        let before = metrics(path)?;
+        let stats_before = db.stats()?;
+        let mut rng = c.seed;
+        let mut latencies = Vec::new();
+        let start = Instant::now();
+        for n in 0..c.queries {
+            let i = random(&mut rng) % c.keys;
+            let one = n
+                .is_multiple_of((c.queries / 4000).max(1))
+                .then(Instant::now);
+            assert_eq!(
+                db.get(&key(i))?.as_deref(),
+                Some(value(i, 0, 128).as_slice())
+            );
+            if let Some(one) = one {
+                latencies.push(one.elapsed().as_nanos() as u64);
+            }
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        report(
+            stage,
+            raw,
+            json!({"seconds":seconds,"operations":c.queries,
+            "ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),
+            "before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    let mut generations = vec![0u8; c.keys as usize];
+    let mut writes = Vec::new();
+    let before = metrics(path)?;
+    let start = Instant::now();
+    for round in 0..c.queries {
+        let expected = generations[..10].to_vec();
+        let mut snapshot = db.scan(&key(0), &key(c.keys))?;
+        let entries: Vec<_> = (0..c.batch)
+            .map(|j| {
+                let i = ((round * c.batch + j) as u64 * 7919) % c.keys;
+                generations[i as usize] = (round % 251 + 1) as u8;
+                (
+                    key(i).to_vec(),
+                    Some(value(i, (round % 251 + 1) as u8, c.value)),
+                )
+            })
+            .collect();
+        let one = Instant::now();
+        db.batch(&entries)?;
+        writes.push(one.elapsed().as_nanos() as u64);
+        for (i, generation) in expected.into_iter().enumerate() {
+            let row = snapshot.next().transpose()?.unwrap();
+            assert_eq!(row.0, key(i as u64));
+            assert_eq!(row.1.as_ref(), value(i as u64, generation, c.value));
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "snapshot-write",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"batch_latency":distribution(&mut writes),
+        "before":before,"after":metrics(path)?,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4, "MODE DIRECTORY CONFIG_JSON");
@@ -593,6 +688,8 @@ fn main() -> Result<()> {
         "recover" => recover(path, &c, &raw)?,
         "memory-scan" => memory_scan(path, &c, &raw)?,
         "mixed-large" => mixed_large(path, &c, &raw)?,
+        "cache-phase" => cache_phase(path, &c, &raw)?,
+        "snapshot-write" => snapshot_write(path, &c, &raw)?,
         "read" => reads(path, &c, &raw)?,
         "write" => writes(path, &c, &raw)?,
         "compact" => {

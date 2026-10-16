@@ -3,7 +3,10 @@ use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{HashMap, HashSet},
     hash::{BuildHasherDefault, Hash, Hasher},
-    sync::{atomic::AtomicU64, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 type Key = (u64, usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +63,7 @@ pub(crate) struct BlockCache {
     capacity: usize,
     overflow: Mutex<Cache>,
     regular_capacity: usize,
+    frame_limits: [usize; 2],
 }
 impl BlockCache {
     #[cfg(test)]
@@ -74,6 +78,22 @@ impl BlockCache {
         while count < MAX_SHARDS && capacity / (count * 2) >= minimum {
             count *= 2;
         }
+        let regular_capacity = capacity / count;
+        let mut frame_limits = [usize::MAX; 2];
+        if count > 1 {
+            for (indexed, limit) in frame_limits.iter_mut().enumerate() {
+                let (mut lo, mut hi) = (0, regular_capacity);
+                while lo < hi {
+                    let mid = lo + (hi - lo).div_ceil(2);
+                    if frame_charge(mid, indexed != 0) <= regular_capacity {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                *limit = lo;
+            }
+        }
         Self {
             shards: (0..count)
                 .map(|n| {
@@ -84,7 +104,8 @@ impl BlockCache {
                 .collect(),
             capacity,
             overflow: Mutex::new(Cache::new(0)),
-            regular_capacity: capacity / count,
+            regular_capacity,
+            frame_limits,
         }
     }
     fn shard_index(&self, key: impl Into<CacheKey>) -> usize {
@@ -93,36 +114,95 @@ impl BlockCache {
     pub fn lock(&self, key: impl Into<CacheKey>) -> MutexGuard<'_, Cache> {
         self.shards[self.shard_index(key)].0.lock()
     }
-    // Ordinary blocks retain the independent shard path. Oversized frames use
-    // one shared LRU, borrowing space only when needed. Lock order is always
-    // overflow -> shards; a shard holder must never acquire overflow.
+    // Hit lookup never reserves space or reads the table retirement flag.
+    // All cross-pool mutations obey overflow -> shards lock order.
+    #[inline]
+    pub fn is_regular(&self, frame_len: usize, indexed: bool) -> bool {
+        frame_len <= self.frame_limits[usize::from(indexed)]
+    }
     pub fn lock_for_frame(
         &self,
         key: CacheKey,
         frame_len: usize,
         indexed: bool,
-        allow_reserve: bool,
     ) -> MutexGuard<'_, Cache> {
-        let charge = frame_len
-            .saturating_add(std::mem::size_of::<ReadBlock>())
-            .saturating_add(ENTRY_OVERHEAD)
-            .saturating_add(if indexed {
-                0
-            } else {
-                (frame_len.saturating_sub(crate::codec::HEADER) / 17)
-                    .max(1)
-                    .saturating_mul(std::mem::size_of::<u32>())
-            });
-        if self.shards.len() == 1 || charge <= self.regular_capacity {
-            return self.lock(key);
+        if self.is_regular(frame_len, indexed) {
+            self.lock(key)
+        } else {
+            self.overflow.lock()
         }
+    }
+    pub fn insert(
+        &self,
+        key: CacheKey,
+        frame_len: usize,
+        indexed: bool,
+        block: Arc<ReadBlock>,
+        cacheable: &AtomicBool,
+    ) {
+        if !self.is_regular(frame_len, indexed) {
+            self.insert_oversized(key, block, cacheable);
+            return;
+        }
+        let mut shard = self.lock(key);
+        if !cacheable.load(Ordering::Acquire) {
+            return;
+        }
+        // Pressure is counted only on misses/admissions, not the hit fast path.
+        if shard.capacity < self.regular_capacity {
+            shard.pressure += 1;
+            if shard.pressure >= 32 {
+                shard.pressure = 0;
+                drop(shard);
+                self.reclaim_idle_overflow(key);
+                shard = self.lock(key);
+                if !cacheable.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        }
+        shard.insert(key, block);
+    }
+    #[cold]
+    fn insert_oversized(&self, key: CacheKey, block: Arc<ReadBlock>, cacheable: &AtomicBool) {
         let mut overflow = self.overflow.lock();
-        if allow_reserve && charge <= self.capacity && charge > overflow.capacity {
-            let reserve = charge.saturating_mul(2).min(self.capacity);
-            self.resize_shards(self.capacity - reserve);
-            overflow.resize(reserve);
+        if !cacheable.load(Ordering::Acquire) || overflow.entries.contains_key(&key) {
+            return;
         }
-        overflow
+        let charge = block.allocated_bytes().saturating_add(ENTRY_OVERHEAD);
+        // Leave at least a quarter of the total budget to ordinary blocks.
+        let maximum = self.capacity - self.capacity / 4;
+        if charge > maximum {
+            return;
+        }
+        let needed = overflow.bytes().saturating_add(charge).min(maximum);
+        if needed > overflow.capacity {
+            self.resize_shards(self.capacity - needed);
+            overflow.resize(needed);
+        }
+        overflow.insert(key, block);
+        self.release_unused(&mut overflow);
+    }
+    #[cold]
+    fn reclaim_idle_overflow(&self, key: CacheKey) {
+        let mut overflow = self.overflow.lock();
+        let activity = overflow.hits.wrapping_add(overflow.admissions);
+        let mut shard = self.lock(key);
+        let idle = shard.observed_overflow == activity;
+        shard.observed_overflow = activity;
+        drop(shard);
+        if idle && overflow.tail != NONE {
+            let tail = overflow.tail;
+            overflow.remove(tail);
+        }
+        self.release_unused(&mut overflow);
+    }
+    fn release_unused(&self, overflow: &mut Cache) {
+        let used = overflow.bytes();
+        if used < overflow.capacity {
+            overflow.resize(used);
+            self.resize_shards(self.capacity - used);
+        }
     }
     fn resize_shards(&self, budget: usize) {
         let count = self.shards.len();
@@ -154,15 +234,25 @@ impl BlockCache {
     pub fn remove_tables(&self, retired: &HashSet<u64>) {
         let mut overflow = self.overflow.lock();
         overflow.remove_tables(retired);
-        if overflow.bytes() == 0 {
-            overflow.resize(0);
-            self.resize_shards(self.capacity);
-        }
+        self.release_unused(&mut overflow);
         for shard in &self.shards {
             shard.0.lock().remove_tables(retired);
         }
     }
 }
+fn frame_charge(frame_len: usize, indexed: bool) -> usize {
+    frame_len
+        .saturating_add(std::mem::size_of::<ReadBlock>())
+        .saturating_add(ENTRY_OVERHEAD)
+        .saturating_add(if indexed {
+            0
+        } else {
+            (frame_len.saturating_sub(crate::codec::HEADER) / 17)
+                .max(1)
+                .saturating_mul(std::mem::size_of::<u32>())
+        })
+}
+
 struct Entry {
     key: CacheKey,
     block: Arc<ReadBlock>,
@@ -185,6 +275,9 @@ pub(crate) struct Cache {
     bytes: usize,
     entries: HashMap<CacheKey, usize, BuildHasherDefault<KeyHasher>>,
     hits: u64,
+    admissions: u64,
+    pressure: u32,
+    observed_overflow: u64,
     slots: Vec<Option<Entry>>,
     free: Vec<usize>,
     head: usize,
@@ -197,6 +290,9 @@ impl Cache {
             bytes: 0,
             entries: HashMap::default(),
             hits: 0,
+            admissions: 0,
+            pressure: 0,
+            observed_overflow: 0,
             slots: Vec::new(),
             free: Vec::new(),
             head: NONE,
@@ -279,6 +375,7 @@ impl Cache {
         self.link_front(index);
         self.entries.insert(key, index);
         self.bytes += size;
+        self.admissions = self.admissions.wrapping_add(1);
     }
     // Recycle a victim only when even the minimum incoming charge needs space.
     // Arc::try_unwrap protects concurrent readers. Frames that cannot fit do
@@ -336,6 +433,131 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn four_megabyte_admission_preserves_small_cache_and_idle_budget_returns() {
+        let capacity = 8 * 1024 * 1024;
+        let cache = BlockCache::with_block_size(capacity, 16384);
+        let live = AtomicBool::new(true);
+        let small = block(32 * 1024);
+        let mut counts = [0; MAX_SHARDS];
+        let mut keys = Vec::new();
+        for n in 0..10_000 {
+            let key = CacheKey::from((1, n));
+            let shard = cache.shard_index(key);
+            if counts[shard] < 24 {
+                counts[shard] += 1;
+                keys.push(key);
+                cache.insert(key, small.frame_capacity(), false, small.clone(), &live);
+            }
+            if keys.len() == 24 * MAX_SHARDS {
+                break;
+            }
+        }
+        assert_eq!(keys.len(), 192);
+        let large = block(4 * 1024 * 1024);
+        let large_key = CacheKey::from((2, 0));
+        // Lookup (including a later I/O/decode failure) cannot reserve anything.
+        assert!(cache
+            .lock_for_frame(large_key, large.frame_capacity(), false)
+            .get(large_key)
+            .is_none());
+        assert_eq!(cache.overflow.lock().capacity, 0);
+        cache.insert(
+            large_key,
+            large.frame_capacity(),
+            false,
+            large.clone(),
+            &live,
+        );
+        assert_eq!(
+            cache.overflow.lock().capacity,
+            large.allocated_bytes() + ENTRY_OVERHEAD
+        );
+        assert!(cache.shards.iter().all(|s| s.0.lock().capacity > 0));
+        assert!(cache.bytes() <= capacity);
+        for _ in 0..8 {
+            for &key in &keys {
+                let miss = cache.lock(key).get(key).is_none();
+                if miss {
+                    cache.insert(key, small.frame_capacity(), false, small.clone(), &live);
+                }
+            }
+        }
+        assert_eq!(cache.overflow.lock().capacity, 0);
+        assert_eq!(
+            cache
+                .shards
+                .iter()
+                .map(|s| s.0.lock().capacity)
+                .sum::<usize>(),
+            capacity
+        );
+        assert!(keys.iter().all(|&key| cache.lock(key).get(key).is_some()));
+    }
+
+    #[test]
+    fn frequently_used_oversized_entries_survive_small_miss_pressure() {
+        let cache = BlockCache::with_block_size(8 * 1024 * 1024, 16384);
+        let live = AtomicBool::new(true);
+        let large = block(2 * 1024 * 1024);
+        let key = CacheKey::from((1, 0));
+        cache.insert(key, large.frame_capacity(), false, large.clone(), &live);
+        let small = block(16384);
+        for n in 0..2048 {
+            if n % 16 == 0 {
+                assert!(cache
+                    .lock_for_frame(key, large.frame_capacity(), false)
+                    .get(key)
+                    .is_some());
+            }
+            cache.insert(
+                CacheKey::from((2, n)),
+                small.frame_capacity(),
+                false,
+                small.clone(),
+                &live,
+            );
+        }
+        assert!(cache
+            .lock_for_frame(key, large.frame_capacity(), false)
+            .get(key)
+            .is_some());
+        let before = cache.bytes();
+        cache.insert(
+            CacheKey::from((3, 0)),
+            large.frame_capacity(),
+            false,
+            large,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(cache.bytes(), before);
+        assert!(cache.bytes() <= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn precomputed_frame_limits_match_charge_classification() {
+        for capacity in [0, 256, 512 * 1024, 8 * 1024 * 1024] {
+            let cache = BlockCache::with_block_size(capacity, 16384);
+            for indexed in [false, true] {
+                let limit = cache.frame_limits[usize::from(indexed)];
+                for length in [
+                    0,
+                    12,
+                    16384,
+                    limit.saturating_sub(1),
+                    limit,
+                    limit.saturating_add(1),
+                ] {
+                    assert_eq!(
+                        cache.is_regular(length, indexed),
+                        cache.shards.len() == 1
+                            || frame_charge(length, indexed) <= cache.regular_capacity
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn prehashed_collisions_keep_full_identity_and_retirement() {
@@ -454,11 +676,9 @@ mod tests {
         let large = block(2 * 1024 * 1024);
         let key = CacheKey::from((9, 0));
         let frame_len = large.frame_capacity();
-        cache
-            .lock_for_frame(key, frame_len, false, true)
-            .insert(key, large.clone());
+        cache.insert(key, frame_len, false, large.clone(), &AtomicBool::new(true));
         let pinned = cache
-            .lock_for_frame(key, frame_len, false, true)
+            .lock_for_frame(key, frame_len, false)
             .get(key)
             .unwrap();
         assert!(Arc::ptr_eq(&large, &pinned));
@@ -467,13 +687,13 @@ mod tests {
         }
         assert!(cache.bytes() <= capacity);
         assert!(cache
-            .lock_for_frame(key, frame_len, false, true)
+            .lock_for_frame(key, frame_len, false)
             .get(key)
             .is_some());
         let used = cache.bytes();
         // An impossible frame never consumes a reservation or evicts hot blocks.
         assert!(cache
-            .lock_for_frame(CacheKey::from((10, 0)), capacity * 2, true, true)
+            .lock_for_frame(CacheKey::from((10, 0)), capacity * 2, true)
             .take_reusable(capacity * 2, true)
             .is_none());
         assert_eq!(cache.bytes(), used);
@@ -508,9 +728,13 @@ mod tests {
                     });
                     for n in 0..80 {
                         let key = CacheKey::from((thread, n));
-                        cache
-                            .lock_for_frame(key, block.frame_capacity(), false, true)
-                            .insert(key, block.clone());
+                        cache.insert(
+                            key,
+                            block.frame_capacity(),
+                            false,
+                            block.clone(),
+                            &AtomicBool::new(true),
+                        );
                         assert!(cache.bytes() <= 8 * 1024 * 1024);
                     }
                 });

@@ -29,6 +29,16 @@ def main():
         ("memory-early10", "memory-scan", dict(common, queries=100), None),
         ("mixed-small-large", "mixed-large", dict(common, keys=4096, value=2097152, queries=4096), None),
     ]
+    cases.extend([
+        (f"phase-{keys}-{size // 1048576}m", "cache-phase", dict(common, keys=keys, value=size, queries=50000), None)
+        for keys in [20000, 40000, 80000] for size in [2097152, 4194304]
+    ])
+    cases.extend([
+        ("mixed-pressure-4m", "mixed-large", dict(common, keys=40000, value=4194304, queries=4096), None),
+        ("memory-early10-100k", "memory-scan", dict(common, keys=100000, queries=100), None),
+        ("memory-full20k", "memory-scan", dict(common, span=20000, queries=10), None),
+        ("snapshot-write32", "snapshot-write", dict(common, batch=32, queries=200), None),
+    ])
     records = []
     with tempfile.TemporaryDirectory(prefix="kv-remaining-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
@@ -57,7 +67,7 @@ def main():
                     row.update(backend=name, case=label, scenario=mode, trial=trial, order=order)
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
-                "recover": ["recover"], "memory-scan": ["memory-scan"], "mixed-large": ["first", "repeat"]}
+                "recover": ["recover"], "memory-scan": ["memory-scan"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
             assert [r["stage"] for r in rows] == expected[mode]
             return rows
         fixtures = {}
