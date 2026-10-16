@@ -101,11 +101,13 @@ versions are merged and deleted keys are omitted. SST blocks are read lazily,
 bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
 ends the iterator after reporting the error, possibly after some successful rows.
 
-Snapshot creation shares overlapping active/frozen memory pages and captures SST
-handles under the state lock. It clones page handles, not every matching key.
-Keys are copied when consumed; completed memory pages and sources are released.
-Later writes copy only shared pages, so retaining a snapshot can increase write
-latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
+Snapshot creation shares overlapping groups of active/frozen memory pages and
+captures SST handles under the state lock. One group contains at most 64 pages;
+creation clones group handles instead of touching every page or matching key.
+Keys are copied when consumed; completed groups and sources are released. A
+boundary group can retain pages outside the requested range. Later writes copy
+only shared group metadata and changed pages, so retaining a snapshot can increase
+write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
 except that one larger key occupies its own page.
 Iteration buffers one block and candidate record per SST, rather than all disk
 results. `.take(n)` limits consumption; `.collect()` allocates the full result.

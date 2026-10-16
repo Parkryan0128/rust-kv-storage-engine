@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--trials", type=int, choices=range(1, 31), default=6)
+    parser.add_argument("--scan-focus", action="store_true", help="Scan scaling plus memory lookup, writes and recovery guards")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -39,6 +40,18 @@ def main():
         ("memory-full20k", "memory-scan", dict(common, span=20000, queries=10), None),
         ("snapshot-write32", "snapshot-write", dict(common, batch=32, queries=200), None),
     ])
+    if args.scan_focus:
+        cases = [case for case in cases if case[0] in {"memory-early10", "memory-early10-100k", "memory-full20k", "snapshot-write32", "wal-single", "wal-batch256"}]
+        cases = [(label, mode, dict(config, queries=5000) if label.startswith("memory-early") else config, preparation)
+                 for label, mode, config, preparation in cases]
+        cases.extend([
+            ("memory-early10-2k", "memory-scan", dict(common, keys=2000, queries=5000), None),
+            ("memory-early10-200k", "memory-scan", dict(common, keys=200000, queries=5000, memtable=134217728), None),
+            ("memory-middle10-100k", "memory-scan", dict(common, keys=100000, queries=5000, vary_start=True), None),
+            ("memory-narrow10-100k", "memory-scan", dict(common, keys=100000, queries=5000, vary_start=True, narrow=True), None),
+            ("memory-get20k", "memory-get", dict(common, queries=200000), None),
+            ("memory-get100k", "memory-get", dict(common, keys=100000, queries=200000), None),
+        ])
     records = []
     with tempfile.TemporaryDirectory(prefix="kv-remaining-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
@@ -67,7 +80,7 @@ def main():
                     row.update(backend=name, case=label, scenario=mode, trial=trial, order=order)
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
-                "recover": ["recover"], "memory-scan": ["memory-scan"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
+                "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
             assert [r["stage"] for r in rows] == expected[mode]
             return rows
         fixtures = {}

@@ -64,7 +64,7 @@ enum Source {
 /// value; deleted keys are omitted. Disk I/O is lazy and errors appear as items.
 /// After the first error or exhaustion, all subsequent calls return `None`.
 ///
-/// The iterator retains the database lock, overlapping immutable memory pages and
+/// The iterator retains the database lock, overlapping immutable memory page groups and
 /// selected SST handles. Consumed sources release their handles early. Compaction may unlink those SSTs,
 /// but their disk space cannot be reclaimed while a scan still holds them.
 /// SST buffering is one encoded block plus one candidate key per source;

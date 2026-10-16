@@ -106,16 +106,20 @@ separately from memtable memory charges.
 
 ## Range snapshots
 
-`Engine::scan()` clones handles to overlapping active and frozen memory pages
+`Engine::scan()` clones handles to overlapping active and frozen memory page groups
 while holding the state read lock. It captures the SST list under the same lock,
 so it observes one consistent state, including all or none of a batch. The ordered
 memtable uses compact monotone key-prefix indexes with full-byte comparison
 for equal prefixes, and an append path for increasing keys. It contains
 copy-on-write pages, each limited to 256 records and 64 KiB of
-key bytes, except a single larger key. Snapshot creation copies page handles;
-iteration copies only the consumed key and shares immutable value bytes.
-Pages remain valid across writes, flushes and compactions and are released as
-the cursor finishes them. Nonoverlapping memory pages are not retained.
+key bytes, except a single larger key. At most 64 pages share a copy-on-write
+directory group; a full group splits near its midpoint. Snapshot creation copies
+group handles, without touching each page reference counter. Iteration copies
+only the consumed key and shares immutable value bytes. Groups remain valid
+across writes, flushes and compactions and are released as the cursor finishes
+them. Nonoverlapping groups are not retained; boundary groups can retain pages
+outside the requested range. Deletions remove empty pages/groups but do not
+rebalance sparse groups.
 After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
 
@@ -129,8 +133,11 @@ Errors are iterator items and terminate the scan; earlier rows may already have
 been returned. Exhausted or failed iterators always return `None` thereafter.
 
 Snapshot creation still takes time and space proportional to the number of
-overlapping pages. A write to a shared page clones its key/value handles and prefix index;
-it shares their immutable bytes and does not clone the entire memtable. Retained snapshots can increase
+overlapping groups, not individual pages or keys. Group sizes are bounded, so
+this is a smaller linear cost rather than a constant-time snapshot. A write to a
+shared group copies at most 64 page handles and their prefix index, then a changed
+shared page copies its key/value handles and prefix index. Immutable bytes remain
+shared; no write clones the entire memtable. Retained snapshots can increase
 write latency and keep old values alive. Disk buffering grows with SST count and
 block sizes; it is not a fixed process-memory limit. Completed sources release
 their SST handles early. The engine handle remains until drop, error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming

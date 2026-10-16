@@ -511,22 +511,35 @@ fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     populate_memory(&db, c)?;
     let before = metrics(path)?;
     let stats_before = db.stats()?;
-    let mut creation = Vec::new();
-    let mut first_rows = Vec::new();
+    let mut creation = Vec::with_capacity(c.queries);
+    let mut first_rows = Vec::with_capacity(c.queries);
+    let mut drops = Vec::with_capacity(c.queries);
+    let mut rng = c.seed;
+    let vary_start = raw["vary_start"].as_bool().unwrap_or(false);
+    let narrow = raw["narrow"].as_bool().unwrap_or(false);
     let start = Instant::now();
     for _ in 0..c.queries {
+        let lower = if vary_start {
+            random(&mut rng) % (c.keys - c.span + 1)
+        } else {
+            0
+        };
+        let upper = if narrow { lower + c.span } else { c.keys };
         let one = Instant::now();
-        let mut iter = db.scan(&key(0), &key(c.keys))?;
+        let mut iter = db.scan(&key(lower), &key(upper))?;
         creation.push(one.elapsed().as_nanos() as u64);
         let first = iter.next().transpose()?.expect("first row");
         first_rows.push(one.elapsed().as_nanos() as u64);
-        assert_eq!(first.0, key(0));
-        assert_eq!(first.1.as_ref(), value(0, 0, c.value));
-        for i in 1..c.span {
+        assert_eq!(first.0, key(lower));
+        assert_eq!(first.1.as_ref(), value(lower, 0, c.value));
+        for i in lower + 1..lower + c.span {
             let (k, v) = iter.next().transpose()?.expect("memory row");
             assert_eq!(k, key(i));
             assert_eq!(v.as_ref(), value(i, 0, c.value));
         }
+        let end = Instant::now();
+        drop(iter);
+        drops.push(end.elapsed().as_nanos() as u64);
     }
     let seconds = start.elapsed().as_secs_f64();
     report(
@@ -534,8 +547,30 @@ fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         raw,
         json!({"seconds":seconds,"operations":c.queries,
         "ops_per_second":c.queries as f64/seconds,"creation_latency":distribution(&mut creation),
-        "first_row_latency":distribution(&mut first_rows),"before":before,
-        "after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+        "first_row_latency":distribution(&mut first_rows),"drop_latency":distribution(&mut drops),
+        "before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+fn memory_get(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(!path.exists() && !c.churn && c.threads == 1);
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    let before = metrics(path)?;
+    let mut rng = c.seed;
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let k = random(&mut rng) % c.keys;
+        let actual = db.get(&key(k))?.expect("memory value");
+        assert_eq!(actual.as_ref(), value(k, 0, c.value));
+        black_box(actual);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "memory-get",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"before":before,"after":metrics(path)?,"stats":db.stats()?}),
     );
     Ok(())
 }
@@ -687,6 +722,7 @@ fn main() -> Result<()> {
         "prepare-wal" => prepare_wal(path, &c)?,
         "recover" => recover(path, &c, &raw)?,
         "memory-scan" => memory_scan(path, &c, &raw)?,
+        "memory-get" => memory_get(path, &c, &raw)?,
         "mixed-large" => mixed_large(path, &c, &raw)?,
         "cache-phase" => cache_phase(path, &c, &raw)?,
         "snapshot-write" => snapshot_write(path, &c, &raw)?,

@@ -207,3 +207,16 @@ RocksDB comparisons. Cache hits/block reads are logical reads, not physical I/O.
 The engine keeps at least a quarter of its cache budget for ordinary blocks;
 large entries exceeding the remaining budget bypass caching. Idle oversized
 entries can be reclaimed under sustained ordinary miss pressure.
+
+### Focused memory scan scaling
+
+Use `remaining.py OUTPUT --scan-focus` (or the `[scan-perf]` commit marker) to
+compare the same harness against baseline, current, and RocksDB in six rotating
+trials. Early-stop scans consume ten rows from 2k, 20k, 100k, and 200k key
+memtables; 5,000 queries per case reduce timer noise. Random lower bounds, narrow
+ranges, full scans, active-memory point reads, WAL recovery, and writes with a
+retained snapshot guard against moving cost elsewhere. Creation, first-row, and
+iterator-drop latency are reported separately; total throughput includes validation
+and all three phases. The 200k case uses a 128 MiB memtable on all backends to
+avoid accidentally measuring disk scans. Internal profiles also isolate snapshot
+copy-on-write cost. These measurements do not establish constant-time scaling.
