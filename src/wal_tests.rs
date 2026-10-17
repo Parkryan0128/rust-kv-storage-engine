@@ -27,6 +27,64 @@ fn payload() -> Vec<u8> {
 }
 
 #[test]
+fn recovery_coalesces_single_frames_without_reordering_batches_or_torn_tails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("coalesced.wal");
+    let mut file = MAGIC.to_vec();
+    let mut model = std::collections::BTreeMap::new();
+    let mut seq = 0u64;
+    for i in 0..700u64 {
+        let mut body = Vec::new();
+        let batch = i == 255 || i == 513;
+        if batch {
+            put_u64(&mut body, 0);
+            put_u32(&mut body, BATCH_VERSION);
+            put_u32(&mut body, 3);
+        }
+        for j in 0..if batch { 3 } else { 1 } {
+            seq += 1;
+            let key = if batch {
+                vec![0; 8]
+            } else {
+                (i % 299).to_be_bytes().to_vec()
+            };
+            let record = Record {
+                seq,
+                value: (j != 1).then(|| {
+                    Bytes::from(vec![
+                        i as u8;
+                        if i == 256 {
+                            MAX_RETAINED_BUFFER + 1
+                        } else {
+                            32
+                        }
+                    ])
+                }),
+            };
+            encode_record(&key, &record, &mut body);
+            model.insert(key, record);
+        }
+        write_frame(&mut file, &body).unwrap();
+    }
+    let valid = file.len();
+    file.extend([0; 5]); // torn header after pending single records
+    std::fs::write(&path, &file).unwrap();
+    let mut sequence = 0;
+    let (wal, table) = Wal::recover(&path, 1, true, &mut sequence).unwrap();
+    assert_eq!(sequence, seq);
+    assert_eq!(wal.bytes, valid as u64);
+    assert_eq!(std::fs::metadata(path).unwrap().len(), valid as u64);
+    assert_eq!(
+        table
+            .data
+            .iter()
+            .map(|(k, r)| (k.to_vec(), r.clone()))
+            .collect::<Vec<_>>(),
+        model.into_iter().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn malformed_batch_payloads_never_apply_a_prefix() {
     let good = payload();
     let second = BATCH_HEADER + 19;

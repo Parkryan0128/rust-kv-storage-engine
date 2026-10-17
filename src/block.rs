@@ -183,6 +183,7 @@ impl ReadBlock {
 
     // Decode only the comparison key after block validation. Keep bounds checks
     // here too: a stale validation fingerprint must never permit a slice panic.
+    #[inline]
     pub fn key_at(&self, index: usize) -> Result<&[u8]> {
         let bytes = self.record_bytes(index)?;
         let length = bytes.get(9..13).ok_or_else(|| corrupt("SST key header"))?;
@@ -193,12 +194,14 @@ impl ReadBlock {
         bytes.get(17..end).ok_or_else(|| corrupt("SST key bounds"))
     }
 
+    #[inline]
     pub fn record_at(&self, index: usize) -> Result<RecordRef<'_>> {
         decode_record_ref(&mut Cursor {
             b: self.record_bytes(index)?,
         })
     }
 
+    #[inline]
     fn record_bytes(&self, index: usize) -> Result<&[u8]> {
         if index >= self.record_count() {
             return Err(corrupt("SST record index"));

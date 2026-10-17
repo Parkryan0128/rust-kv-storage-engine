@@ -61,6 +61,7 @@ impl std::ops::Deref for Page {
     }
 }
 impl Page {
+    #[inline]
     fn record(&self, row: usize) -> &Record {
         if !self.updates.is_empty() {
             if let Ok(i) = self.updates.binary_search_by_key(&row, |(i, _)| *i) {
@@ -299,6 +300,31 @@ impl MemIndex {
             let upper = upper.cloned();
             let group = Arc::make_mut(&mut self.groups[g]);
             let page = Arc::make_mut(&mut group.pages[p]);
+            // Ordered new-key runs need neither a binary search nor repeated
+            // Arc ownership checks for every record in the same page.
+            if page.updates.is_empty() {
+                if let Some(base) = Arc::get_mut(&mut page.base) {
+                    while let Some((key, record)) = entries.peek() {
+                        if (remove_deletes && record.value.is_none())
+                            || key.as_slice() <= base.rows.last().unwrap().0.as_ref()
+                            || upper
+                                .as_ref()
+                                .is_some_and(|end| key.as_slice() >= end.as_ref())
+                            || base.rows.len() == PAGE_RECORDS
+                            || base.key_bytes + key.len() > PAGE_KEY_BYTES
+                        {
+                            break;
+                        }
+                        let (key, record) = entries.next().unwrap();
+                        *bytes += record.memory_size(&key);
+                        base.prefixes.push(prefix(&key));
+                        base.key_bytes += key.len();
+                        base.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+                        base.rows.push((Bytes::from(key), record));
+                        self.len += 1;
+                    }
+                }
+            }
             // A contiguous run stays within this page. Splits, lower-bound
             // changes and physical deletes go back through the general path.
             while let Some((key, record)) = entries.peek() {
@@ -500,6 +526,17 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
+        if !range.allows_end(&current.as_ref().unwrap().rows.last().unwrap().0) {
+            // A range wholly inside one page needs no synthetic group or
+            // directory allocation; the current page is the complete snapshot.
+            return Some(MemScan {
+                groups: VecDeque::new(),
+                current,
+                page: 0,
+                row,
+                range,
+            });
+        }
         let mut groups: VecDeque<_> = self.groups[start..]
             .iter()
             .take_while(|g| range.allows_end(g.first_key()))
@@ -511,13 +548,18 @@ impl MemIndex {
         for i in [0, last] {
             let group = &groups[i];
             let begin = if i == 0 { page } else { 0 };
-            let end = group
-                .pages
-                .partition_point(|p| range.allows_end(&p.rows[0].0));
+            let end = if i != last || range.allows_end(&group.pages.last().unwrap().rows[0].0) {
+                group.pages.len()
+            } else {
+                group
+                    .pages
+                    .partition_point(|p| range.allows_end(&p.rows[0].0))
+            };
             if end - begin <= 4 && (begin != 0 || end != group.pages.len()) {
                 groups[i] = Arc::new(PageGroup {
                     pages: group.pages[begin..end].to_vec(),
-                    prefixes: group.prefixes[begin..end].to_vec(),
+                    // Scan traversal needs page handles only, never routing.
+                    prefixes: Vec::new(),
                 });
                 if i == 0 {
                     page = 0;
@@ -559,6 +601,10 @@ impl Iterator for MemScan {
         let out = (key.to_vec(), record.clone());
         self.row += 1;
         if self.row == page.rows.len() {
+            if self.groups.is_empty() {
+                self.current = None;
+                return Some(out);
+            }
             self.page += 1;
             self.row = 0;
             if self.page == self.groups.front().unwrap().pages.len() {
@@ -582,6 +628,31 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn single_page_range_needs_no_directory_and_preserves_inclusive_end() {
+        let mut map = MemIndex::default();
+        for n in 0..1000u64 {
+            map.insert(n.to_be_bytes().to_vec(), record(n));
+        }
+        let mut scan = map
+            .snapshot(Arc::new(
+                KeyRange::new(11u64.to_be_bytes().as_slice()..=19u64.to_be_bytes().as_slice())
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert!(scan.groups.is_empty());
+        assert!(map.groups.iter().all(|g| Arc::strong_count(g) == 1));
+        for n in 11..=19u64 {
+            map.insert(n.to_be_bytes().to_vec(), record(9999));
+        }
+        for n in 11..=19u64 {
+            assert_eq!(scan.next().unwrap().1, record(n));
+        }
+        assert!(scan.next().is_none());
+        assert!(scan.current.is_none());
+        assert!(scan.next().is_none());
     }
 
     #[test]

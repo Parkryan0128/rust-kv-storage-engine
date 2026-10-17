@@ -76,10 +76,29 @@ impl Wal {
         let mut table = MemTable::default();
         let mut valid = 8;
         let mut buffer = Vec::new();
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0;
         {
             let mut reader = BufReader::with_capacity(MAX_RETAINED_BUFFER, &mut file);
             while read_frame_into(&mut reader, allow_tail, &mut buffer)? {
-                replay(&buffer, &mut table, last_seq)?;
+                if !buffer.starts_with(&[0; 8]) {
+                    let entry = decode_single(&buffer, last_seq)?;
+                    let bytes = entry.1.memory_size(&entry.0);
+                    if pending_bytes + bytes > MAX_RETAINED_BUFFER {
+                        table.apply(pending.drain(..), false);
+                        pending_bytes = 0;
+                    }
+                    pending.push(entry);
+                    pending_bytes += bytes;
+                    if pending.len() == 256 || pending_bytes >= MAX_RETAINED_BUFFER {
+                        table.apply(pending.drain(..), false);
+                        pending_bytes = 0;
+                    }
+                } else {
+                    table.apply(pending.drain(..), false);
+                    pending_bytes = 0;
+                    replay(&buffer, &mut table, last_seq)?;
+                }
                 // Commit the logical offset only after CRC and replay validation.
                 // BufReader may have already read past this frame into a torn tail.
                 valid += (HEADER + buffer.len()) as u64;
@@ -88,6 +107,7 @@ impl Wal {
                 }
             }
         }
+        table.apply(pending, false);
         // Discard read-ahead before truncation and seek to the verified end.
         if buffer.capacity() > MAX_RETAINED_BUFFER {
             buffer = Vec::new();
@@ -172,18 +192,24 @@ impl Wal {
     }
 }
 
-fn replay(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
+fn decode_single(payload: &[u8], last_seq: &mut u64) -> Result<(Vec<u8>, Record)> {
     let mut c = Cursor { b: payload };
+    let entry = decode_record(&mut c)?;
+    c.done()?;
+    if entry.1.seq <= *last_seq {
+        return Err(corrupt("non-increasing WAL sequence"));
+    }
+    *last_seq = entry.1.seq;
+    Ok(entry)
+}
+
+fn replay(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
     if !payload.starts_with(&[0; 8]) {
-        let (key, record) = decode_record(&mut c)?;
-        c.done()?;
-        if record.seq <= *last_seq {
-            return Err(corrupt("non-increasing WAL sequence"));
-        }
-        *last_seq = record.seq;
+        let (key, record) = decode_single(payload, last_seq)?;
         table.insert(key, record);
         return Ok(());
     }
+    let mut c = Cursor { b: payload };
     c.u64()?;
     if c.u32()? != BATCH_VERSION {
         return Err(corrupt("WAL batch version"));
