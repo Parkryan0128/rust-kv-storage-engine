@@ -678,7 +678,14 @@ fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     let start = Instant::now();
     for round in 0..c.queries {
         let expected = generations[..10].to_vec();
-        let mut snapshot = db.scan(&key(0), &key(c.keys))?;
+        let mut snapshot = db.scan(
+            &key(0),
+            &key(if raw["narrow"].as_bool().unwrap_or(false) {
+                10
+            } else {
+                c.keys
+            }),
+        )?;
         let entries: Vec<_> = (0..c.batch)
             .map(|j| {
                 let i = ((round * c.batch + j) as u64 * 7919) % c.keys;
@@ -709,6 +716,164 @@ fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 
+fn shaped_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    let common = raw["common_prefix"].as_bool().unwrap_or(false);
+    // Keep key generation outside the timed lookup loop on every backend.
+    let keys: Vec<Vec<u8>> = (0..c.keys)
+        .map(|i| {
+            let mut k = if common { vec![b'x'; 128] } else { Vec::new() };
+            k.extend_from_slice(&i.to_be_bytes());
+            k.resize(k.len() + (i % 31) as usize, b'z');
+            k
+        })
+        .collect();
+    for begin in (0..c.keys as usize).step_by(c.batch) {
+        let entries: Vec<_> = (begin..(begin + c.batch).min(keys.len()))
+            .map(|i| (keys[i].clone(), Some(value(i as u64, 0, c.value))))
+            .collect();
+        db.batch(&entries)?;
+    }
+    if raw["disk"].as_bool().unwrap_or(false) {
+        db.flush()?;
+    }
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let mut rng = c.seed;
+    let mut latencies = Vec::new();
+    let mut expected = value(0, 0, c.value);
+    let stride = c.queries.div_ceil(4000);
+    let start = Instant::now();
+    for n in 0..c.queries {
+        let i = (random(&mut rng) % c.keys) as usize;
+        let one = n.is_multiple_of(stride).then(Instant::now);
+        let got = db.get(&keys[i])?;
+        if let Some(one) = one {
+            latencies.push(one.elapsed().as_nanos() as u64);
+        }
+        expected[..8].copy_from_slice(&key(i as u64));
+        assert_eq!(got.as_deref(), Some(expected.as_slice()));
+        drop(black_box(got));
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "shaped-keys",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,"ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+
+fn disjoint_range(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    let per = c.keys / c.generations as u64;
+    for g in 0..c.generations as u64 {
+        for begin in (g * per..(g + 1) * per).step_by(c.batch) {
+            let entries: Vec<_> = (begin..(begin + c.batch as u64).min((g + 1) * per))
+                .map(|i| (key(i).to_vec(), Some(value(i, 0, c.value))))
+                .collect();
+            db.batch(&entries)?;
+        }
+        db.flush()?;
+    }
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let mut rng = c.seed;
+    let mut latencies = Vec::new();
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let lo = random(&mut rng) % (per * c.generations as u64 - c.span);
+        let one = Instant::now();
+        let rows = db
+            .scan(&key(lo), &key(lo + c.span))?
+            .collect::<Result<Vec<_>>>()?;
+        latencies.push(one.elapsed().as_nanos() as u64);
+        assert_eq!(rows.len(), c.span as usize);
+        for (j, (k, v)) in rows.into_iter().enumerate() {
+            assert_eq!(k, key(lo + j as u64));
+            assert_eq!(v.as_ref(), value(lo + j as u64, 0, c.value));
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "disjoint-range",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,"ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+
+fn mixed_steady(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    let mut generations = vec![Some(0u8); c.keys as usize];
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    let mut windows = Vec::new();
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let mut rng = c.seed;
+    let start = Instant::now();
+    for round in 0..c.queries {
+        let expected = generations[..10].to_vec();
+        let snapshot = db.scan(&key(0), &key(10))?;
+        let entries: Vec<_> = (0..c.batch)
+            .map(|j| {
+                let i = ((round * c.batch + j) as u64 * 7919) % c.keys;
+                let generation = (!j.is_multiple_of(7)).then_some((round % 251 + 1) as u8);
+                generations[i as usize] = generation;
+                (key(i).to_vec(), generation.map(|g| value(i, g, c.value)))
+            })
+            .collect();
+        let one = Instant::now();
+        db.batch(&entries)?;
+        writes.push(one.elapsed().as_nanos() as u64);
+        for _ in 0..c.batch {
+            let i = random(&mut rng) % c.keys;
+            let one = Instant::now();
+            let got = db.get(&key(i))?;
+            reads.push(one.elapsed().as_nanos() as u64);
+            assert_eq!(
+                got.as_deref(),
+                generations[i as usize]
+                    .map(|g| value(i, g, c.value))
+                    .as_deref()
+            );
+        }
+        let rows = snapshot.collect::<Result<Vec<_>>>()?;
+        let expected: Vec<_> = expected
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, g)| g.map(|g| (key(i as u64).to_vec(), value(i as u64, g, c.value))))
+            .collect();
+        assert_eq!(rows.len(), expected.len());
+        for ((k, v), (ek, ev)) in rows.into_iter().zip(expected) {
+            assert_eq!((k, v.as_ref()), (ek, ev.as_slice()));
+        }
+        if (round + 1).is_multiple_of(500) {
+            let mut samples = writes[round + 1 - 500..].to_vec();
+            windows.push(json!({"round":round+1,"elapsed":start.elapsed().as_secs_f64(),"batch_latency":distribution(&mut samples)}));
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "mixed-steady",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries * c.batch * 2,"ops_per_second":(c.queries*c.batch*2) as f64/seconds,"batch_latency":distribution(&mut writes),"read_latency":distribution(&mut reads),"windows":windows,"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    drop(db);
+    let db = Backend::open(path, c)?;
+    for i in 0..c.keys {
+        assert_eq!(
+            db.get(&key(i))?.as_deref(),
+            generations[i as usize]
+                .map(|g| value(i, g, c.value))
+                .as_deref()
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4, "MODE DIRECTORY CONFIG_JSON");
@@ -726,6 +891,9 @@ fn main() -> Result<()> {
         "mixed-large" => mixed_large(path, &c, &raw)?,
         "cache-phase" => cache_phase(path, &c, &raw)?,
         "snapshot-write" => snapshot_write(path, &c, &raw)?,
+        "shaped-keys" => shaped_keys(path, &c, &raw)?,
+        "disjoint-range" => disjoint_range(path, &c, &raw)?,
+        "mixed-steady" => mixed_steady(path, &c, &raw)?,
         "read" => reads(path, &c, &raw)?,
         "write" => writes(path, &c, &raw)?,
         "compact" => {

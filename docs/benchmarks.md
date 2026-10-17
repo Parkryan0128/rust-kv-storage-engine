@@ -89,3 +89,24 @@ The [raw CSV](compaction-results.csv) also includes throughput and write/flush l
 Values are checked against an independent map before and after reopening. No final full merge is forced. Timing varies on the shared host; sustained disk throughput needs larger tests on physical storage.
 
 [Benchmark code](../examples/compaction_report.rs) · [Storage and compaction details](storage-format.md)
+
+## Additional audit workloads
+
+The remaining-workload suite also checks variable-length keys and 128-byte common
+prefixes in memory and on disk; narrow snapshots held during 32-operation batches;
+and ten-row scans across twelve disjoint SST generations. A bounded mixed run
+performs 2,000 rounds of synced 32-operation batches (puts/deletes), 32 random
+reads and a retained narrow snapshot, with normal automatic compaction and a
+512 KiB memtable target. It reports batch/read p99, 500-round latency windows,
+process RSS, file sizes and available flush/compaction counters; final contents
+are verified again after reopen. This is repeated six times per backend with
+rotating execution order. It is not a sustained production soak or a larger-than-RAM
+benchmark. The source audit also tests sparse volatile-page reclamation and
+snapshot base/delta allocation accounting.
+
+Engine `memtable_bytes` in older comparison rows is a logical rotation charge;
+RocksDB reports its own memtable allocation estimate. These counters are not
+interchangeable. Use process RSS/peak RSS for cross-engine memory comparisons.
+The engine's new `*_memtable_allocated_bytes` API includes reachable page and
+directory capacities but is still an estimate, excluding historical snapshot-only
+pages and allocator overhead. Persistent format and WAL sync semantics are unchanged.

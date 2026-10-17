@@ -155,26 +155,35 @@ fn bloom_skips_reads_and_cache_reuses_blocks_with_capacity_bound() {
     o.compaction_file_threshold = 100;
     let e = Engine::open_with_options(d.path(), o.clone()).unwrap();
     for i in 0..2000u64 {
-        e.put(&i.to_be_bytes(), b"value").unwrap();
+        e.put(&(i * 4).to_be_bytes(), b"value").unwrap();
     }
     e.flush().unwrap();
     drop(e);
     let e = Engine::open_with_options(d.path(), o).unwrap();
-    for i in 10000..15000u64 {
+    // Missing keys inside the table bounds exercise Bloom, not range pruning.
+    for i in (1..7996u64).filter(|i| i % 4 != 0).take(5000) {
         assert_eq!(e.get(&i.to_be_bytes()).unwrap(), None);
     }
     let s = e.stats();
     assert!(s.bloom_negatives > 4800, "{s:?}");
     assert!(s.block_reads < 200, "{s:?}");
-    e.get(&999u64.to_be_bytes()).unwrap();
+    e.get(&3996u64.to_be_bytes()).unwrap();
     let before = e.stats();
     for _ in 0..100 {
-        e.get(&999u64.to_be_bytes()).unwrap();
+        e.get(&3996u64.to_be_bytes()).unwrap();
     }
     let after = e.stats();
     assert_eq!(after.block_reads, before.block_reads);
     assert!(after.cache_hits >= before.cache_hits + 100);
     assert!(after.cache_bytes <= 8192);
+    assert!(e.get(&7996u64.to_be_bytes()).unwrap().is_some());
+    let before = e.stats();
+    for i in 10000..15000u64 {
+        assert!(e.get(&i.to_be_bytes()).unwrap().is_none());
+    }
+    let after = e.stats();
+    assert_eq!(after.block_reads, before.block_reads);
+    assert_eq!(after.bloom_negatives, before.bloom_negatives);
 }
 #[test]
 fn disabled_cache_reads_each_time() {

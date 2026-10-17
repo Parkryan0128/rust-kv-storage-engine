@@ -39,6 +39,14 @@ def main():
         ("memory-early10-100k", "memory-scan", dict(common, keys=100000, queries=100), None),
         ("memory-full20k", "memory-scan", dict(common, span=20000, queries=10), None),
         ("snapshot-write32", "snapshot-write", dict(common, batch=32, queries=200), None),
+        ("snapshot-narrow-write32", "snapshot-write", dict(common, batch=32, queries=200, narrow=True), None),
+        ("disjoint12-range10", "disjoint-range", dict(common, keys=24000, generations=12, queries=2000), None),
+        ("mixed-steady32", "mixed-steady", dict(common, batch=32, queries=2000, fixed=False, memtable=524288), None),
+    ])
+    cases.extend([
+        (f"keys-{'common128' if common_prefix else 'variable'}-{'disk' if disk else 'memory'}",
+         "shaped-keys", dict(common, queries=200000, common_prefix=common_prefix, disk=disk), None)
+        for common_prefix in [False, True] for disk in [False, True]
     ])
     if args.scan_focus:
         cases = [case for case in cases if case[0] in {"memory-early10", "memory-early10-100k", "memory-full20k", "snapshot-write32", "wal-single", "wal-batch256"}]
@@ -81,6 +89,7 @@ def main():
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
                 "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
+            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady"]})
             assert [r["stage"] for r in rows] == expected[mode]
             return rows
         fixtures = {}
