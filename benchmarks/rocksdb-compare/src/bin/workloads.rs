@@ -30,6 +30,7 @@ struct Config {
     span: u64,
     workload: String,
     throughput: bool,
+    wal_pattern: String,
 }
 impl Config {
     fn parse(v: &Value) -> Self {
@@ -50,6 +51,7 @@ impl Config {
             span: n("span", 32),
             throughput: v["throughput"].as_bool().unwrap_or(false),
             workload: v["workload"].as_str().unwrap_or("uniform").to_owned(),
+            wal_pattern: v["wal_pattern"].as_str().unwrap_or("sorted").to_owned(),
         };
         assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 4 * 1024 * 1024);
         assert!(
@@ -61,6 +63,10 @@ impl Config {
         );
         assert!(c.span > 0 && c.span <= c.keys);
         assert!(c.memtable > 0);
+        assert!(matches!(
+            c.wal_pattern.as_str(),
+            "sorted" | "random" | "overwrite"
+        ));
         assert!((1..=16).contains(&c.generations));
         c
     }
@@ -176,13 +182,24 @@ fn prepare(path: &Path, c: &Config) -> Result<()> {
     );
     Ok(())
 }
-fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadPass {
+    Throughput,
+    Latency,
+    Verify,
+}
+
+fn point_reads(db: &Backend, c: &Config, worker: usize, pass: ReadPass) -> Result<Vec<u64>> {
     let mut rng = c.seed.wrapping_add(worker as u64 * 104729);
     // At most 4,000 API timers across ALL workers, independent of thread count.
     let quota = 4000 / c.threads + usize::from(worker < 4000 % c.threads);
     let stride = c.queries.div_ceil(quota).max(1);
     let mut samples = Vec::with_capacity(c.queries.div_ceil(stride));
-    let mut expected_value = vec![42; c.value];
+    let mut expected_value = if pass == ReadPass::Verify {
+        vec![42; c.value]
+    } else {
+        Vec::new()
+    };
     for n in 0..c.queries {
         let choice = random(&mut rng);
         let i = if c.workload == "hot" && choice % 100 < 80 {
@@ -192,19 +209,21 @@ fn point_reads(db: &Backend, c: &Config, worker: usize) -> Result<Vec<u64>> {
         };
         let missing = c.workload == "miss";
         let k = (i * 2 + u64::from(missing)).to_be_bytes();
-        let start = (!c.throughput && n.is_multiple_of(stride)).then(Instant::now);
+        let start = (pass == ReadPass::Latency && n.is_multiple_of(stride)).then(Instant::now);
         let got = db.get(&k)?;
         if let Some(start) = start {
             samples.push(start.elapsed().as_nanos() as u64);
         }
-        let generation = if missing { None } else { expected(i, c) };
-        if let Some(g) = generation {
-            expected_value.fill(42 ^ g);
-            expected_value[..8].copy_from_slice(&k);
-            expected_value[8] = g;
-            assert_eq!(got.as_deref(), Some(expected_value.as_slice()));
-        } else {
-            assert!(got.is_none());
+        if pass == ReadPass::Verify {
+            let generation = if missing { None } else { expected(i, c) };
+            if let Some(g) = generation {
+                expected_value.fill(42 ^ g);
+                expected_value[..8].copy_from_slice(&k);
+                expected_value[8] = g;
+                assert_eq!(got.as_deref(), Some(expected_value.as_slice()));
+            } else {
+                assert!(got.is_none());
+            }
         }
         drop(black_box(got));
     }
@@ -229,7 +248,7 @@ fn throughput_reads(db: &Arc<Backend>, c: &Config) -> Result<f64> {
         workers.push(thread::spawn(move || -> Result<_> {
             ready.wait();
             start.wait();
-            let result = point_reads(&db, &c, worker);
+            let result = point_reads(&db, &c, worker, ReadPass::Throughput);
             let end = Instant::now();
             assert!(result?.is_empty());
             Ok(end.duration_since(*clock.get().unwrap()).as_secs_f64())
@@ -322,6 +341,76 @@ fn compact_merge(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     let db = Backend::open(path, c)?;
     verify_merge(&db, c)
 }
+struct ScanMeasurements {
+    rows: usize,
+    latency: Vec<u64>,
+    first_rows: Vec<u64>,
+}
+fn scan_reads(db: &Backend, c: &Config, pass: ReadPass) -> Result<ScanMeasurements> {
+    let mut out = ScanMeasurements {
+        rows: 0,
+        latency: Vec::new(),
+        first_rows: Vec::new(),
+    };
+    if pass == ReadPass::Latency {
+        out.latency.reserve(c.queries);
+        out.first_rows.reserve(c.queries);
+    }
+    let mut rng = c.seed;
+    for _ in 0..c.queries {
+        let lo = random(&mut rng) % (c.keys - c.span + 1);
+        let hi = lo + c.span;
+        let clock = (pass == ReadPass::Latency).then(Instant::now);
+        let mut iter = db.scan(&key(lo), &key(hi))?;
+        if pass == ReadPass::Verify {
+            for i in lo..hi {
+                if let Some(g) = expected(i, c) {
+                    let (k, v) = iter.next().expect("missing scan row")?;
+                    assert_eq!(k, key(i));
+                    assert_eq!(v.as_ref(), value(i, g, c.value));
+                    out.rows += 1;
+                }
+            }
+            assert!(iter.next().is_none(), "unexpected extra scan row");
+        } else {
+            let first = iter.next().transpose()?;
+            if let Some(clock) = clock {
+                out.first_rows.push(clock.elapsed().as_nanos() as u64);
+            }
+            if let Some(row) = first {
+                drop(black_box(row));
+                out.rows += 1;
+            }
+            for row in iter {
+                drop(black_box(row?));
+                out.rows += 1;
+            }
+            if let Some(clock) = clock {
+                out.latency.push(clock.elapsed().as_nanos() as u64);
+            }
+        }
+    }
+    Ok(out)
+}
+fn sampled_points(db: &Arc<Backend>, c: &Config) -> Result<Vec<u64>> {
+    if c.threads == 1 {
+        return point_reads(db, c, 0, ReadPass::Latency);
+    }
+    let barrier = Arc::new(Barrier::new(c.threads));
+    let mut workers = Vec::new();
+    for worker in 0..c.threads {
+        let (db, c, barrier) = (db.clone(), c.clone(), barrier.clone());
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            point_reads(&db, &c, worker, ReadPass::Latency)
+        }));
+    }
+    let mut samples = Vec::new();
+    for worker in workers {
+        samples.extend(worker.join().expect("reader panicked")?);
+    }
+    Ok(samples)
+}
 fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     let before_open = metrics(path)?;
     let start = Instant::now();
@@ -335,62 +424,42 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     for stage in ["first", "repeat"] {
         let before = metrics(path)?;
         let stats_before = db.stats()?;
-        let start = Instant::now();
-        let mut throughput_seconds = None;
-        let mut first_rows = Vec::new();
-        let mut row_count = 0;
-        let mut samples = if c.workload == "scan" {
-            let mut samples = Vec::with_capacity(c.queries);
-            let mut rng = c.seed;
-            for _ in 0..c.queries {
-                let lo = random(&mut rng) % (c.keys - c.span + 1);
-                let hi = lo + c.span;
-                let start = Instant::now();
-                let mut iter = db.scan(&key(lo), &key(hi))?;
-                let first = iter.next().transpose()?;
-                first_rows.push(start.elapsed().as_nanos() as u64);
-                let mut iter = first.into_iter().map(Ok).chain(iter);
-                for i in lo..hi {
-                    if let Some(g) = expected(i, c) {
-                        let (k, v) = iter.next().expect("missing scan row")?;
-                        assert_eq!(k, key(i));
-                        assert_eq!(v.as_ref(), value(i, g, c.value));
-                        row_count += 1;
-                    }
-                }
-                assert!(iter.next().is_none(), "unexpected extra scan row");
-                samples.push(start.elapsed().as_nanos() as u64);
-            }
-            samples
-        } else if c.throughput {
-            throughput_seconds = Some(throughput_reads(&db, c)?);
-            Vec::new()
-        } else if c.threads == 1 {
-            point_reads(&db, c, 0)?
+        let (seconds, row_count) = if c.workload == "scan" {
+            let start = Instant::now();
+            let measured = scan_reads(&db, c, ReadPass::Throughput)?;
+            (start.elapsed().as_secs_f64(), measured.rows)
         } else {
-            let barrier = Arc::new(Barrier::new(c.threads));
-            let mut workers = Vec::new();
-            for worker in 0..c.threads {
-                let db = db.clone();
-                let c = c.clone();
-                let barrier = barrier.clone();
-                workers.push(thread::spawn(move || {
-                    barrier.wait();
-                    point_reads(&db, &c, worker)
-                }));
-            }
-            let mut samples = Vec::new();
-            for worker in workers {
-                samples.extend(worker.join().expect("reader panicked")?);
-            }
-            samples
+            (throughput_reads(&db, c)?, 0)
         };
-        let seconds = throughput_seconds.unwrap_or_else(|| start.elapsed().as_secs_f64());
+        // Capture throughput resources before latency/validation warm the caches.
+        let after = metrics(path)?;
+        let stats_after = db.stats()?;
+        let (mut samples, mut first_rows) = if c.workload == "scan" {
+            let measured = scan_reads(&db, c, ReadPass::Latency)?;
+            assert_eq!(measured.rows, row_count);
+            (measured.latency, measured.first_rows)
+        } else if c.throughput {
+            (Vec::new(), Vec::new())
+        } else {
+            (sampled_points(&db, c)?, Vec::new())
+        };
+        // Verify the exact same seeded queries outside every timed pass.
+        if c.workload == "scan" {
+            assert_eq!(scan_reads(&db, c, ReadPass::Verify)?.rows, row_count);
+        } else {
+            for worker in 0..c.threads {
+                point_reads(&db, c, worker, ReadPass::Verify)?;
+            }
+        }
         let operations = c.queries * if c.workload == "scan" { 1 } else { c.threads };
         report(
             stage,
             raw,
-            json!({"operations":operations,"rows":row_count,"seconds":seconds,"ops_per_second":operations as f64/seconds,"latency":distribution(&mut samples),"first_row_latency":distribution(&mut first_rows),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+            json!({"operations":operations,"rows":row_count,"seconds":seconds,
+            "ops_per_second":operations as f64/seconds,"latency":distribution(&mut samples),
+            "first_row_latency":distribution(&mut first_rows),"before":before,"after":after,
+            "stats_before":stats_before,"stats_after":stats_after,
+            "measurement":"v2 separate throughput, warm latency, and full verification passes"}),
         );
     }
     Ok(())
@@ -468,7 +537,29 @@ fn prepare_wal(path: &Path, c: &Config) -> Result<()> {
     use std::io::Write;
     assert!(!path.exists());
     let db = Backend::open(path, c)?;
-    populate_memory(&db, c)?;
+    let mut order: Vec<_> = (0..c.keys).collect();
+    if c.wal_pattern == "random" {
+        let mut rng = c.seed;
+        for i in (1..order.len()).rev() {
+            order.swap(i, (random(&mut rng) % (i as u64 + 1)) as usize);
+        }
+    }
+    let mut entries = Vec::new();
+    for i in order {
+        let i = if c.wal_pattern == "overwrite" {
+            i % (c.keys / 10).max(1)
+        } else {
+            i
+        };
+        entries.push((key(i).to_vec(), Some(value(i, 0, c.value))));
+        if entries.len() == c.batch {
+            db.batch(&entries)?;
+            entries.clear();
+        }
+    }
+    if !entries.is_empty() {
+        db.batch(&entries)?;
+    }
     println!(
         "WORKLOAD_PREPARED {}",
         json!({"stats":db.stats()?,"metrics":metrics(path)?})
@@ -490,7 +581,12 @@ fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         "ops_per_second":c.keys as f64/seconds,"before":before,
         "after":metrics(path)?,"stats":db.stats()?}),
     );
-    for i in 0..c.keys {
+    let distinct = if c.wal_pattern == "overwrite" {
+        (c.keys / 10).max(1)
+    } else {
+        c.keys
+    };
+    for i in 0..distinct {
         assert_eq!(
             db.get(&key(i))?.as_deref(),
             Some(value(i, 0, c.value).as_slice())
@@ -505,6 +601,32 @@ fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     );
     Ok(())
 }
+
+fn snapshot_release(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(!path.exists());
+    let db = Backend::open(path, c)?;
+    db.put(&key(0), &vec![7; 3 * 1024 * 1024])?;
+    let mut old = db.scan(&key(0), &key(1))?;
+    db.put(&key(0), b"x")?;
+    assert_eq!(old.next().transpose()?.unwrap().1.len(), 3 * 1024 * 1024);
+    drop(old);
+    let before = metrics(path)?;
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        db.put(&key(0), b"y")?;
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    assert_eq!(db.get(&key(0))?.as_deref(), Some(&b"y"[..]));
+    report(
+        "snapshot-release",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"before":before,"after":metrics(path)?,
+        "stats":db.stats()?}),
+    );
+    Ok(())
+}
+
 fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     assert!(!path.exists() && !c.churn && c.threads == 1);
     let db = Backend::open(path, c)?;
@@ -886,6 +1008,7 @@ fn main() -> Result<()> {
         "prepare" => prepare(path, &c)?,
         "prepare-wal" => prepare_wal(path, &c)?,
         "recover" => recover(path, &c, &raw)?,
+        "snapshot-release" => snapshot_release(path, &c, &raw)?,
         "memory-scan" => memory_scan(path, &c, &raw)?,
         "memory-get" => memory_get(path, &c, &raw)?,
         "mixed-large" => mixed_large(path, &c, &raw)?,

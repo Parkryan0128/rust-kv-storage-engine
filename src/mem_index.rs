@@ -457,11 +457,20 @@ impl MemIndex {
         } else {
             group.prefixes[p] = page.prefixes[0];
             if page.rows.len() < PAGE_RECORDS / 4 && group.pages.len() > 1 {
-                let left = if p + 1 < group.pages.len() { p } else { p - 1 };
-                let right = left + 1;
-                if group.pages[left].rows.len() + group.pages[right].rows.len() <= PAGE_RECORDS / 2
-                    && group.pages[left].key_bytes + group.pages[right].key_bytes <= PAGE_KEY_BYTES
-                {
+                let can_merge = |left: usize| {
+                    let right = left + 1;
+                    right < group.pages.len()
+                        && group.pages[left].rows.len() + group.pages[right].rows.len()
+                            <= PAGE_RECORDS / 2
+                        && group.pages[left].key_bytes + group.pages[right].key_bytes
+                            <= PAGE_KEY_BYTES
+                };
+                let left = p
+                    .checked_sub(1)
+                    .filter(|&left| can_merge(left))
+                    .or_else(|| can_merge(p).then_some(p));
+                if let Some(left) = left {
+                    let right = left + 1;
                     let mut removed = Arc::unwrap_or_clone(group.pages.remove(right));
                     group.prefixes.remove(right);
                     let removed = removed.materialize();
@@ -485,10 +494,18 @@ impl MemIndex {
         } else {
             self.prefixes[g] = group.prefixes[0];
             if group.pages.len() < GROUP_PAGES / 4 && self.groups.len() > 1 {
-                let left = if g + 1 < self.groups.len() { g } else { g - 1 };
-                let right = left + 1;
-                if self.groups[left].pages.len() + self.groups[right].pages.len() <= GROUP_PAGES / 2
-                {
+                let can_merge = |left: usize| {
+                    let right = left + 1;
+                    right < self.groups.len()
+                        && self.groups[left].pages.len() + self.groups[right].pages.len()
+                            <= GROUP_PAGES / 2
+                };
+                let left = g
+                    .checked_sub(1)
+                    .filter(|&left| can_merge(left))
+                    .or_else(|| can_merge(g).then_some(g));
+                if let Some(left) = left {
+                    let right = left + 1;
                     let mut removed = Arc::unwrap_or_clone(self.groups.remove(right));
                     self.prefixes.remove(right);
                     let target = Arc::make_mut(&mut self.groups[left]);

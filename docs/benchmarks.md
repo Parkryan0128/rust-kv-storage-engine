@@ -110,3 +110,10 @@ interchangeable. Use process RSS/peak RSS for cross-engine memory comparisons.
 The engine's new `*_memtable_allocated_bytes` API includes reachable page and
 directory capacities but is still an estimate, excluding historical snapshot-only
 pages and allocator overhead. Persistent format and WAL sync semantics are unchanged.
+
+
+Read measurement v2
+-------------------
+The workload read harness separates throughput, warm latency sampling, and full seeded verification. Throughput consumes and drops owned results without constructing expected values, checking all bytes, or timing each operation. Point workers are ready before timing starts. The same query trace is fully checked outside the timed pass; range row counts must match. First/repeat throughput resource samples are captured before the extra passes. Latency samples come from a separate warm pass. Earlier v1 absolute throughput is not directly comparable: use an identical v2 harness against both revisions. Other diagnostic modes retain their explicitly documented validation and timing costs.
+
+Remaining comparisons also distinguish sorted, shuffled, and repeated-key WAL histories, and check reachable memtable allocation after releasing a large-value snapshot. Allocation counters are engine-specific estimates; compare process RSS separately.

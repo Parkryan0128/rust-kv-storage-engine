@@ -26,6 +26,9 @@ def main():
         ("throughput-t4", "read", dict(common, queries=50000, threads=4, throughput=True), "prepare"),
         ("oversized-2m", "read", dict(common, keys=2, value=2097152, span=1, queries=512), "prepare"),
         ("wal-single", "recover", dict(common, keys=10000, batch=1), "prepare-wal"),
+        ("wal-random", "recover", dict(common, keys=10000, batch=1, wal_pattern="random"), "prepare-wal"),
+        ("wal-overwrite", "recover", dict(common, keys=10000, batch=1, wal_pattern="overwrite"), "prepare-wal"),
+        ("snapshot-release", "snapshot-release", dict(common, keys=2, span=1, queries=16), None),
         ("wal-batch256", "recover", dict(common, batch=256), "prepare-wal"),
         ("memory-early10", "memory-scan", dict(common, queries=100), None),
         ("mixed-small-large", "mixed-large", dict(common, keys=4096, value=2097152, queries=4096), None),
@@ -68,7 +71,7 @@ def main():
             "cpu": capture("lscpu"), "platform": platform.platform(), "trials": args.trials,
             "filesystem": capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS"),
             "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name,p in binaries.items()},
-            "semantics": "Same total cache/owned values/sync WAL. Baseline/current reuse identical SST and WAL bytes. OS file cache warmed. Recovery fixture exits without destructors after durable writes. Memory/mixed setup outside timers; RSS includes setup. Throughput excludes worker startup/join and per-query timers, includes validation/RNG/drop. Frozen internal microbenchmark is separate, not RocksDB-equivalent."}
+            "semantics": "Same total cache/owned values/sync WAL. Baseline/current reuse identical SST and WAL bytes. OS file cache warmed. Recovery fixture exits without destructors after durable writes. Memory/mixed setup outside timers; RSS includes setup. Read-mode throughput excludes worker startup/join, per-query timers and full validation; validation and warm latency are separate seeded passes. Other diagnostic modes retain validation/timers as reported. All include RNG/drop. Frozen internal microbenchmark is separate, not RocksDB-equivalent."}
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("REMAINING_ENV " + json.dumps(environment), flush=True)
         def run(name, mode, directory, config, label, trial, order):
@@ -89,7 +92,7 @@ def main():
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
                 "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
-            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady"]})
+            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release"]})
             assert [r["stage"] for r in rows] == expected[mode]
             return rows
         fixtures = {}
