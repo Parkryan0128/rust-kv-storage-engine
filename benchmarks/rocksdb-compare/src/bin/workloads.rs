@@ -1031,7 +1031,7 @@ fn main() -> Result<()> {
                 &raw,
                 json!({"seconds":seconds,"before":before,"after":metrics(path)?,"stats_before":stats,"stats_after":db.stats()?}),
             );
-            point_reads(&db, &c, 0)?;
+            point_reads(&db, &c, 0, ReadPass::Verify)?;
         }
         _ => return Err("unknown mode".into()),
     }
