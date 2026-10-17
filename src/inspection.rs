@@ -26,6 +26,7 @@ impl RecordPreview {
 #[derive(Debug, Clone)]
 pub struct MemtableInfo {
     pub wal_id: Option<u64>,
+    /// Logical rotation charge; see `Stats::active_memtable_bytes`. Not RSS.
     pub bytes: usize,
     pub records: usize,
     pub preview: Vec<RecordPreview>,

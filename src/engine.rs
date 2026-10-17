@@ -37,7 +37,8 @@ pub trait KvEngine {
 }
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Rotation threshold for memory or WAL bytes.
+    /// Rotation threshold for logical memtable charge or WAL bytes. The charge
+    /// is key/value lengths plus 48 bytes per entry, not an allocated-RAM limit.
     pub memtable_size_limit: usize,
     /// Writers wait for room in this queue when rotating a full active buffer.
     pub max_immutable_memtables: usize,
