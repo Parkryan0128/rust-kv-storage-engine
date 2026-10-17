@@ -305,6 +305,10 @@ impl BlockCursor {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub fn buffer_addresses(&self) -> (*const u8, *const u32) {
+        self.block.buffer_addresses()
+    }
     pub fn into_block(self) -> ReadBlock {
         self.block
     }
