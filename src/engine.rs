@@ -89,8 +89,18 @@ impl Options {
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub sequence: u64,
+    /// Logical rotation charge: key/value lengths plus 48 bytes per entry.
+    /// This preserves the flush policy; it is not allocated memory or RSS.
     pub active_memtable_bytes: usize,
+    /// Sum of logical rotation charges for frozen memtables.
     pub immutable_memtable_bytes: usize,
+    /// Reachable page/directory capacities and payload lengths, including COW
+    /// deltas. Excludes allocator headers, spare Bytes backing capacity and
+    /// historical pages reachable only through scans. Computing this visits pages.
+    pub active_memtable_allocated_bytes: usize,
+    /// Same allocation estimate for frozen memtables; shared snapshot memory
+    /// is counted once per memtable, not once per reader.
+    pub immutable_memtable_allocated_bytes: usize,
     pub immutable_memtables: usize,
     pub sst_files: usize,
     pub sst_records: u64,
@@ -399,13 +409,14 @@ impl Engine {
         let tables = s.tables.clone();
         drop(s);
         let mut newest: Option<Record> = None;
+        let mut hash = None;
         for table in tables.iter() {
             // Tables are published in descending max-sequence order. A hit
             // (including a tombstone) can make every remaining file obsolete.
             if newest.as_ref().is_some_and(|r| r.seq >= table.max_seq) {
                 break;
             }
-            if let Some(r) = table.get(key, &c.cache, &c.counters)? {
+            if let Some(r) = table.get_hashed(key, &mut hash, &c.cache, &c.counters)? {
                 if newest.as_ref().is_none_or(|old| r.seq > old.seq) {
                     newest = Some(r);
                 }
@@ -419,9 +430,11 @@ impl Engine {
     /// `..`, or a pair of `std::ops::Bound` values. Reversed bounds return
     /// `InvalidConfig`; equal bounds are empty unless both ends are included.
     ///
-    /// Creation shares overlapping active and frozen memory pages under the
-    /// state lock; it does not copy their keys. Later writes copy only shared
-    /// pages. Consumed pages are released incrementally. SST data is read lazily
+    /// Creation shares overlapping active and frozen memory page groups under
+    /// the state lock; it does not copy keys. Small boundary slices retain only
+    /// their selected pages. Updates to shared pages use bounded deltas; inserts
+    /// and delta folds copy page contents. Consumed groups are released as the
+    /// scan advances. SST data is read lazily
     /// and without polluting the point-read cache. Handle each iterator item's
     /// `Result`: a disk error ends the scan, potentially after earlier results.
     /// Drop or exhaust the scan to release pinned files and the database lock.
@@ -588,6 +601,12 @@ impl Engine {
             sequence: s.sequence,
             active_memtable_bytes: s.mem.bytes,
             immutable_memtable_bytes: s.immutable.iter().map(|m| m.mem.bytes).sum(),
+            active_memtable_allocated_bytes: s.mem.allocated_bytes(),
+            immutable_memtable_allocated_bytes: s
+                .immutable
+                .iter()
+                .map(|m| m.mem.allocated_bytes())
+                .sum(),
             immutable_memtables: s.immutable.len(),
             sst_files: s.tables.len(),
             sst_records: s.tables.iter().map(|t| t.count).sum(),
@@ -769,28 +788,28 @@ impl Core {
             // Maintenance can fail while WAL I/O runs without the state lock.
             // Keep that failure visible; the synced batch may reappear on reopen.
             check(&s)?;
-            for (i, entry) in batch.entries.into_iter().enumerate() {
-                let record = Record {
-                    seq: start + 1 + i as u64,
-                    value: entry.value,
-                };
-                if self.disk.is_none() && record.value.is_none() {
-                    s.mem.remove(&entry.key);
-                } else {
-                    s.mem.insert(entry.key, record);
-                }
-                if i == 0 {
-                    #[cfg(test)]
-                    crate::test_hooks::pause("batch_after_first_apply");
-                    if let Err(e) = fault::hit("batch_after_first_apply") {
-                        let e = EngineError::from(e);
-                        s.fatal = Some(e.to_string());
-                        drop(s);
-                        self.progress();
-                        return Err(e);
-                    }
-                }
+            let mut entries = batch.entries.into_iter().enumerate().map(|(i, entry)| {
+                (
+                    entry.key,
+                    Record {
+                        seq: start + 1 + i as u64,
+                        value: entry.value,
+                    },
+                )
+            });
+            // Keep the fault boundary after one applied entry, while readers
+            // remain excluded by the same state lock throughout the batch.
+            s.mem.apply(entries.next(), self.disk.is_none());
+            #[cfg(test)]
+            crate::test_hooks::pause("batch_after_first_apply");
+            if let Err(e) = fault::hit("batch_after_first_apply") {
+                let e = EngineError::from(e);
+                s.fatal = Some(e.to_string());
+                drop(s);
+                self.progress();
+                return Err(e);
             }
+            s.mem.apply(entries, self.disk.is_none());
             s.sequence = end;
         });
         Ok(())

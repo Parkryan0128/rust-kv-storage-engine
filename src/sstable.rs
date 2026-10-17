@@ -18,7 +18,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
@@ -58,6 +58,9 @@ pub(crate) struct Table {
     pub compaction_buffer_bytes: usize,
     cacheable: AtomicBool,
     indexed: bool,
+    // Known at publication; old files learn this after their last block is read.
+    // No eager data I/O or storage-format change is needed on open.
+    last_key: OnceLock<Vec<u8>>,
 }
 fn at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; len];
@@ -201,6 +204,7 @@ impl Table {
             compaction_buffer_bytes,
             cacheable: AtomicBool::new(true),
             indexed: magic == MAGIC,
+            last_key: OnceLock::new(),
         })
     }
     #[cfg(test)]
@@ -233,7 +237,7 @@ impl Table {
     fn decode(&self, n: usize, bytes: Vec<u8>, offsets: Vec<u32>) -> Result<ReadBlock> {
         let i = &self.index[n];
         let next = self.index.get(n + 1).map(|next| next.first.as_slice());
-        if self.indexed {
+        let block = if self.indexed {
             let (block, fingerprint) = ReadBlock::decode_indexed(
                 bytes,
                 &i.first,
@@ -242,21 +246,46 @@ impl Table {
                 i.validated.load(Ordering::Relaxed),
             )?;
             i.validated.store(fingerprint, Ordering::Relaxed);
-            Ok(block)
+            block
         } else {
-            ReadBlock::decode_reusing(bytes, offsets, &i.first, next, self.max_seq)
+            ReadBlock::decode_reusing(bytes, offsets, &i.first, next, self.max_seq)?
+        };
+        if n + 1 == self.index.len() && self.last_key.get().is_none() {
+            let last = block.key_at(block.record_count() - 1)?;
+            let _ = self.last_key.set(last.to_vec());
         }
+        Ok(block)
     }
+    #[cfg(test)]
     pub fn get(
         &self,
         key: &[u8],
         cache: &BlockCache,
         counters: &Counters,
     ) -> Result<Option<Record>> {
+        self.get_hashed(key, &mut None, cache, counters)
+    }
+    pub fn get_hashed(
+        &self,
+        key: &[u8],
+        hash: &mut Option<u64>,
+        cache: &BlockCache,
+        counters: &Counters,
+    ) -> Result<Option<Record>> {
         if self.index.first().is_none_or(|i| key < i.first.as_slice()) {
             return Ok(None);
         }
-        if !self.bloom.contains(key) {
+        if self
+            .last_key
+            .get()
+            .is_some_and(|last| key > last.as_slice())
+        {
+            return Ok(None);
+        }
+        if !self
+            .bloom
+            .contains_hash(*hash.get_or_insert_with(|| crate::bloom::hash(key)))
+        {
             counters.bloom_negatives.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }

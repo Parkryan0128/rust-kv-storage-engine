@@ -55,6 +55,15 @@ impl TableWriter {
     }
 
     pub fn push(&mut self, key: &[u8], seq: u64, value: Option<&[u8]>) -> Result<()> {
+        if seq == 0
+            || key
+                .len()
+                .saturating_add(value.map_or(0, <[u8]>::len))
+                .saturating_add(17)
+                > MAX_RECORD
+        {
+            return Err(corrupt("invalid SST input record"));
+        }
         // Check before a possible flush clears the previous block.
         if self
             .last_key
@@ -119,6 +128,10 @@ impl TableWriter {
     }
 
     pub(super) fn finish(mut self, path: &Path, id: u64, bloom_bits: usize) -> Result<Table> {
+        let last_key = OnceLock::new();
+        if let Some(range) = &self.last_key {
+            let _ = last_key.set(self.block[range.clone()].to_vec());
+        }
         self.flush_block()?;
         if self.bloom.needs_rebuild(self.count, bloom_bits) {
             fault::hit("bloom_rebuild")?;
@@ -169,15 +182,72 @@ impl TableWriter {
         fs::rename(path.with_extension("tmp"), path)?;
         sync_dir(path.parent().unwrap())?;
         fault::hit("sst_after_rename")?;
-        // Release the buffers and metadata before reopening the published table.
-        drop(self);
-        Table::open(path, id)
+        // The writer validated ordering/record limits while streaming. Transfer
+        // its metadata after durable publication instead of reading it back.
+        let frame = self.index.iter().map(|i| i.len as usize).max().unwrap_or(0);
+        let file = self.file.into_inner().map_err(|e| e.into_error())?;
+        Ok(Table {
+            id,
+            file,
+            index: self.index,
+            bloom: self.bloom,
+            count: self.count,
+            max_seq: self.max_seq,
+            file_bytes: self.position + meta_len + FOOTER as u64,
+            compaction_buffer_bytes: frame * 2 + std::mem::size_of::<ReadBlock>(),
+            cacheable: AtomicBool::new(true),
+            indexed: true,
+            last_key,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_metadata_matches_reopened_table_and_bounds_are_learned_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.sst");
+        let mut writer = TableWriter::new(&path, 300, 512, 10, false).unwrap();
+        assert!(writer.push(b"invalid", 0, None).is_err());
+        for n in 0..300u64 {
+            writer
+                .push(&n.to_be_bytes(), n + 1, Some(&[42; 32]))
+                .unwrap();
+        }
+        let published = writer.finish(&path, 1, 10).unwrap();
+        let reopened = Table::open(&path, 1).unwrap();
+        assert_eq!(
+            (
+                published.count,
+                published.max_seq,
+                published.file_bytes,
+                published.compaction_buffer_bytes
+            ),
+            (
+                reopened.count,
+                reopened.max_seq,
+                reopened.file_bytes,
+                reopened.compaction_buffer_bytes
+            )
+        );
+        assert_eq!(published.index.len(), reopened.index.len());
+        for (a, b) in published.index.iter().zip(&reopened.index) {
+            assert_eq!((&a.first, a.offset, a.len), (&b.first, b.offset, b.len));
+        }
+        assert!(reopened.last_key.get().is_none());
+        let cache = BlockCache::new(0);
+        let counters = Counters::default();
+        for n in 0..300u64 {
+            assert_eq!(
+                published.get(&n.to_be_bytes(), &cache, &counters).unwrap(),
+                reopened.get(&n.to_be_bytes(), &cache, &counters).unwrap()
+            );
+        }
+        assert_eq!(reopened.last_key.get(), published.last_key.get());
+    }
 
     #[test]
     fn retained_hashes_match_readback_at_cap_and_after_overflow() {

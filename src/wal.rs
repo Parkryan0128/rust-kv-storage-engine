@@ -205,10 +205,12 @@ fn replay(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()
     }
     c.done()?;
     let mut c = Cursor { b: records };
-    for _ in 0..count {
-        let (key, record) = decode_record(&mut c)?;
-        table.insert(key, record);
-    }
+    // The immutable payload was fully decoded and checked above. Replay uses
+    // the same page-local batch path without another owned staging buffer.
+    table.apply(
+        (0..count).map(|_| decode_record(&mut c).expect("validated WAL batch")),
+        false,
+    );
     *last_seq = end_seq;
     Ok(())
 }

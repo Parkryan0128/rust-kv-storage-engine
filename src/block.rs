@@ -148,11 +148,12 @@ impl ReadBlock {
             let (mut left, mut right) = (0, self.record_count());
             while left < right {
                 let middle = left + (right - left) / 2;
-                let record = self.record_at(middle)?;
-                match record.key.cmp(key) {
+                match self.key_at(middle)?.cmp(key) {
                     std::cmp::Ordering::Less => left = middle + 1,
                     std::cmp::Ordering::Greater => right = middle,
-                    std::cmp::Ordering::Equal => return Ok(Some(record.to_owned())),
+                    std::cmp::Ordering::Equal => {
+                        return Ok(Some(self.record_at(middle)?.to_owned()))
+                    }
                 }
             }
             return Ok(None);
@@ -180,7 +181,25 @@ impl ReadBlock {
         }
     }
 
+    // Decode only the comparison key after block validation. Keep bounds checks
+    // here too: a stale validation fingerprint must never permit a slice panic.
+    pub fn key_at(&self, index: usize) -> Result<&[u8]> {
+        let bytes = self.record_bytes(index)?;
+        let length = bytes.get(9..13).ok_or_else(|| corrupt("SST key header"))?;
+        let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+        let end = 17usize
+            .checked_add(length)
+            .ok_or_else(|| corrupt("SST key length"))?;
+        bytes.get(17..end).ok_or_else(|| corrupt("SST key bounds"))
+    }
+
     pub fn record_at(&self, index: usize) -> Result<RecordRef<'_>> {
+        decode_record_ref(&mut Cursor {
+            b: self.record_bytes(index)?,
+        })
+    }
+
+    fn record_bytes(&self, index: usize) -> Result<&[u8]> {
         if index >= self.record_count() {
             return Err(corrupt("SST record index"));
         }
@@ -195,13 +214,9 @@ impl ReadBlock {
         } else {
             self.index_start
         };
-        let mut cursor = Cursor {
-            b: self
-                .bytes
-                .get(offset..end)
-                .ok_or_else(|| corrupt("SST record offset"))?,
-        };
-        decode_record_ref(&mut cursor)
+        self.bytes
+            .get(offset..end)
+            .ok_or_else(|| corrupt("SST record offset"))
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -298,6 +313,40 @@ mod tests {
     }
 
     type TestRecord<'a> = (&'a [u8], u64, Option<&'a [u8]>);
+
+    #[test]
+    fn key_only_probes_match_records_and_reject_invalid_slices() {
+        let records: &[TestRecord<'_>] = &[
+            (b"", 1, None),
+            (b"shared-prefix", 2, Some(b"value")),
+            (b"shared-prefix\0", 3, Some(b"")),
+            (b"shared-prefix-long", 4, None),
+        ];
+        for indexed in [false, true] {
+            let mut block = if indexed {
+                ReadBlock::decode_indexed(indexed_frame(records), b"", None, 4, 0)
+                    .unwrap()
+                    .0
+            } else {
+                ReadBlock::decode(frame(records), b"", None, 4).unwrap()
+            };
+            for (i, &(k, seq, v)) in records.iter().enumerate() {
+                assert_eq!(block.key_at(i).unwrap(), k);
+                let r = block.lookup(k).unwrap().unwrap();
+                assert_eq!((r.seq, r.value.as_deref()), (seq, v));
+            }
+            assert!(block.key_at(records.len()).is_err());
+            // Defensive slices must remain safe even if a previously validated
+            // in-memory frame is inconsistent (no unchecked offset arithmetic).
+            block.bytes[HEADER + 9..HEADER + 13].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(block.key_at(0).is_err());
+            if indexed {
+                block.bytes[block.index_start..block.index_start + 4]
+                    .copy_from_slice(&u32::MAX.to_le_bytes());
+                assert!(block.key_at(0).is_err());
+            }
+        }
+    }
 
     fn frame(records: &[TestRecord<'_>]) -> Vec<u8> {
         let mut payload = Vec::new();

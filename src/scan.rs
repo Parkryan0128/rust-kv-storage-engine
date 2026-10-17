@@ -77,6 +77,7 @@ pub struct Scan {
     heap: BinaryHeap<Reverse<(Vec<u8>, usize, u64)>>,
     pending: Vec<usize>,
     initialized: bool,
+    live_sources: usize,
 }
 
 impl Scan {
@@ -95,10 +96,12 @@ impl Scan {
         sources.extend(
             tables
                 .iter()
+                .filter(|table| table.overlaps(&range))
                 .map(|table| Source::Table(table.scan(range.clone()))),
         );
         Self {
             engine: Some(engine),
+            live_sources: sources.len(),
             sources,
             heap: BinaryHeap::new(),
             pending: Vec::new(),
@@ -113,6 +116,7 @@ impl Scan {
             heap: BinaryHeap::new(),
             pending: Vec::new(),
             initialized: true,
+            live_sources: 0,
         }
     }
 
@@ -124,6 +128,7 @@ impl Scan {
                     *head = Some(record);
                 } else {
                     self.sources[index] = Source::Exhausted;
+                    self.live_sources -= 1;
                 }
             }
             Source::Table(iter) => {
@@ -135,6 +140,7 @@ impl Scan {
                     self.heap.push(Reverse((key, index, seq)));
                 } else {
                     self.sources[index] = Source::Exhausted;
+                    self.live_sources -= 1;
                 }
             }
             Source::Exhausted => {}
@@ -204,6 +210,14 @@ impl Scan {
                 }
             }
             if let Some(value) = value {
+                if self.live_sources == 1 && self.sources.len() > 1 {
+                    // The head being returned is already consumed. The next
+                    // call can advance this sole remaining source directly.
+                    debug_assert!(self.heap.is_empty());
+                    let source = std::mem::replace(&mut self.sources[winner], Source::Exhausted);
+                    self.sources = vec![source];
+                    self.pending.clear();
+                }
                 return Ok(Some((key, value)));
             }
         }
@@ -236,3 +250,74 @@ impl Iterator for Scan {
     }
 }
 impl FusedIterator for Scan {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Options;
+
+    #[test]
+    fn merge_switches_to_single_source_without_skipping_rows_or_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open_with_options(
+            dir.path(),
+            Options {
+                compaction_file_threshold: 1000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        for k in [b"a", b"b", b"c", b"d"] {
+            db.put(k, k).unwrap();
+        }
+        db.delete(b"c").unwrap();
+        db.flush().unwrap();
+        db.put(b"a", b"new").unwrap();
+        let mut scan = db.scan(..).unwrap();
+        assert_eq!(scan.sources.len(), 2);
+        assert_eq!(scan.next().unwrap().unwrap().1.as_ref(), b"new");
+        assert_eq!(scan.next().unwrap().unwrap().0, b"b");
+        assert_eq!(scan.sources.len(), 1);
+        assert_eq!(scan.next().unwrap().unwrap().0, b"d");
+        assert!(scan.next().is_none());
+        assert!(scan.next().is_none());
+    }
+
+    #[test]
+    fn disjoint_tables_are_pruned_and_reopened_bounds_are_learned_without_eager_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            compaction_file_threshold: 1000,
+            block_size: 4096,
+            ..Options::default()
+        };
+        let db = Engine::open_with_options(dir.path(), opts.clone()).unwrap();
+        for g in 0..12u64 {
+            for i in 0..20u64 {
+                db.put(&(g * 100 + i).to_be_bytes(), b"value").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let lo = 1005u64.to_be_bytes();
+        let hi = 1008u64.to_be_bytes();
+        let scan = db.scan(lo.as_slice()..hi.as_slice()).unwrap();
+        assert_eq!(scan.sources.len(), 1);
+        let before = db.stats().block_reads;
+        assert_eq!(scan.count(), 3);
+        assert_eq!(db.stats().block_reads - before, 1);
+        drop(db);
+        let db = Engine::open_with_options(dir.path(), opts).unwrap();
+        assert_eq!(db.stats().block_reads, 0);
+        assert_eq!(
+            db.scan(lo.as_slice()..hi.as_slice())
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            3
+        );
+        let scan = db.scan(lo.as_slice()..hi.as_slice()).unwrap();
+        assert_eq!(scan.sources.len(), 1);
+        assert_eq!(scan.collect::<Result<Vec<_>>>().unwrap().len(), 3);
+    }
+}

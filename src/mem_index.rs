@@ -20,13 +20,13 @@ fn prefix(key: &[u8]) -> u64 {
 }
 
 fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> usize {
-    let lo = prefixes.partition_point(|p| *p < needle);
-    if prefixes.get(lo) != Some(&needle) {
-        return lo.saturating_sub(1);
+    let right = prefixes.partition_point(|p| *p <= needle);
+    let last = right.saturating_sub(1);
+    if right == 0 || prefixes[last] != needle || before(last) {
+        return last;
     }
-    let hi = lo + prefixes[lo..].partition_point(|p| *p == needle);
-    let mut left = lo;
-    let mut right = hi;
+    let mut left = prefixes[..right].partition_point(|p| *p < needle);
+    let mut right = right;
     while left < right {
         let middle = left + (right - left) / 2;
         if before(middle) {
@@ -39,12 +39,89 @@ fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> u
 }
 
 #[derive(Clone, Default)]
-struct Page {
+struct PageData {
     rows: Vec<(Bytes, Record)>,
     prefixes: Vec<u64>,
     key_bytes: usize,
+    value_bytes: usize,
+}
+
+// A snapshot update copies only a bounded delta and one base handle. Keys and
+// unchanged values stay in the immutable base until a structural edit or fold.
+const PAGE_UPDATES: usize = 16;
+#[derive(Clone, Default)]
+struct Page {
+    base: Arc<PageData>,
+    updates: Vec<(usize, Record)>,
+}
+impl std::ops::Deref for Page {
+    type Target = PageData;
+    fn deref(&self) -> &PageData {
+        &self.base
+    }
 }
 impl Page {
+    fn record(&self, row: usize) -> &Record {
+        if !self.updates.is_empty() {
+            if let Ok(i) = self.updates.binary_search_by_key(&row, |(i, _)| *i) {
+                return &self.updates[i].1;
+            }
+        }
+        &self.rows[row].1
+    }
+    fn materialize(&mut self) -> &mut PageData {
+        let base = Arc::make_mut(&mut self.base);
+        for (row, record) in self.updates.drain(..) {
+            base.value_bytes -= base.rows[row].1.value.as_ref().map_or(0, Bytes::len);
+            base.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+            base.rows[row].1 = record;
+        }
+        base
+    }
+    fn replace(&mut self, row: usize, record: Record) -> Record {
+        if self.updates.is_empty() {
+            if let Some(base) = Arc::get_mut(&mut self.base) {
+                base.value_bytes -= base.rows[row].1.value.as_ref().map_or(0, Bytes::len);
+                base.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+                return std::mem::replace(&mut base.rows[row].1, record);
+            }
+        }
+        match self.updates.binary_search_by_key(&row, |(i, _)| *i) {
+            Ok(i) => std::mem::replace(&mut self.updates[i].1, record),
+            Err(i) if self.updates.len() < PAGE_UPDATES => {
+                let old = self.rows[row].1.clone();
+                self.updates.insert(i, (row, record));
+                old
+            }
+            Err(_) => {
+                let base = self.materialize();
+                base.value_bytes -= base.rows[row].1.value.as_ref().map_or(0, Bytes::len);
+                base.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+                std::mem::replace(&mut base.rows[row].1, record)
+            }
+        }
+    }
+    fn insert_at(&mut self, row: usize, key: Vec<u8>, record: Record, prefix: u64) {
+        let base = self.materialize();
+        base.key_bytes += key.len();
+        base.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+        if row == base.rows.len() {
+            base.rows.push((Bytes::from(key), record));
+            base.prefixes.push(prefix);
+        } else {
+            base.rows.insert(row, (Bytes::from(key), record));
+            base.prefixes.insert(row, prefix);
+        }
+    }
+    fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + std::mem::size_of::<PageData>()
+            + 4 * std::mem::size_of::<usize>() // Page and base Arc headers
+            + self.rows.capacity() * std::mem::size_of::<(Bytes, Record)>()
+            + self.prefixes.capacity() * std::mem::size_of::<u64>()
+            + self.key_bytes + self.value_bytes
+            + self.updates.capacity() * std::mem::size_of::<(usize, Record)>()
+            + self.updates.iter().map(|(_, r)| r.value.as_ref().map_or(0, Bytes::len)).sum::<usize>()
+    }
     fn overfull(&self) -> bool {
         self.rows.len() > 1 && (self.rows.len() > PAGE_RECORDS || self.key_bytes > PAGE_KEY_BYTES)
     }
@@ -86,7 +163,7 @@ impl PageGroup {
         record: Record,
         prefix: u64,
         append: bool,
-    ) -> Option<Record> {
+    ) -> (Option<Record>, Option<usize>) {
         if self.pages.is_empty() {
             self.pages.push(Arc::new(Page::default()));
             self.prefixes.push(prefix);
@@ -103,35 +180,36 @@ impl PageGroup {
             page.position(&key, prefix)
         };
         match position {
-            Ok(i) => Some(std::mem::replace(&mut page.rows[i].1, record)),
+            Ok(i) => (Some(page.replace(i, record)), Some(index)),
             Err(i) => {
-                page.key_bytes += key.len();
-                let key = Bytes::from(key);
-                if append {
-                    page.rows.push((key, record));
-                    page.prefixes.push(prefix);
-                } else {
-                    page.rows.insert(i, (key, record));
-                    page.prefixes.insert(i, prefix);
-                }
+                page.insert_at(i, key, record, prefix);
                 self.prefixes[index] = page.prefixes[0];
                 let (mut cursor, mut end) = (index, index + 1);
                 while cursor < end {
                     if self.pages[cursor].overfull() {
-                        let page = Arc::make_mut(&mut self.pages[cursor]);
+                        let page = Arc::make_mut(&mut self.pages[cursor]).materialize();
                         let rows = page.rows.split_off(page.rows.len() / 2);
                         let prefixes = page.prefixes.split_off(page.rows.len());
                         let key_bytes = rows.iter().map(|(k, _)| k.len()).sum();
+                        let value_bytes = rows
+                            .iter()
+                            .map(|(_, r)| r.value.as_ref().map_or(0, Bytes::len))
+                            .sum();
                         page.key_bytes -= key_bytes;
+                        page.value_bytes -= value_bytes;
                         page.rows.shrink_to_fit();
                         page.prefixes.shrink_to_fit();
                         self.prefixes.insert(cursor + 1, prefixes[0]);
                         self.pages.insert(
                             cursor + 1,
                             Arc::new(Page {
-                                rows,
-                                prefixes,
-                                key_bytes,
+                                base: Arc::new(PageData {
+                                    rows,
+                                    prefixes,
+                                    key_bytes,
+                                    value_bytes,
+                                }),
+                                updates: Vec::new(),
                             }),
                         );
                         end += 1;
@@ -139,7 +217,7 @@ impl PageGroup {
                         cursor += 1;
                     }
                 }
-                None
+                (None, (end == index + 1).then_some(index))
             }
         }
     }
@@ -150,6 +228,7 @@ pub(crate) struct MemIndex {
     groups: Vec<Arc<PageGroup>>,
     prefixes: Vec<u64>,
     len: usize,
+    last_insert: Option<(usize, usize)>,
 }
 impl MemIndex {
     fn group_for(&self, key: &[u8], prefix: u64) -> usize {
@@ -163,6 +242,97 @@ impl MemIndex {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    // Includes reachable base/delta payload and container capacities. Allocator
+    // headers, spare capacity inside Bytes and snapshots no longer in this
+    // index are excluded; this is an allocation estimate, not process RSS.
+    pub fn allocated_bytes(&self) -> usize {
+        self.groups.capacity() * std::mem::size_of::<Arc<PageGroup>>()
+            + self.prefixes.capacity() * std::mem::size_of::<u64>()
+            + self
+                .groups
+                .iter()
+                .map(|g| {
+                    std::mem::size_of::<PageGroup>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + g.pages.capacity() * std::mem::size_of::<Arc<Page>>()
+                        + g.prefixes.capacity() * std::mem::size_of::<u64>()
+                        + g.pages.iter().map(|p| p.allocated_bytes()).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+    pub fn apply(
+        &mut self,
+        entries: impl IntoIterator<Item = (Vec<u8>, Record)>,
+        remove_deletes: bool,
+        bytes: &mut usize,
+    ) {
+        let mut entries = entries.into_iter().peekable();
+        while let Some((key, record)) = entries.next() {
+            if remove_deletes && record.value.is_none() {
+                if let Some(old) = self.remove(&key) {
+                    *bytes -= old.memory_size(&key);
+                }
+                continue;
+            }
+            let key_len = key.len();
+            *bytes += record.memory_size(&key);
+            if let Some(old) = self.insert(key, record) {
+                *bytes -= 48 + key_len + old.value.as_ref().map_or(0, Bytes::len);
+            }
+            let Some((g, p)) = self.last_insert else {
+                continue;
+            };
+            let upper = self.groups[g]
+                .pages
+                .get(p + 1)
+                .map(|p| &p.rows[0].0)
+                .or_else(|| self.groups.get(g + 1).map(|g| &g.pages[0].rows[0].0));
+            let first = &self.groups[g].pages[p].rows[0].0;
+            let fits = |key: &[u8], record: &Record| {
+                !(remove_deletes && record.value.is_none())
+                    && key >= first.as_ref()
+                    && upper.is_none_or(|end| key < end.as_ref())
+            };
+            if !entries.peek().is_some_and(|(k, r)| fits(k, r)) {
+                continue;
+            }
+            let upper = upper.cloned();
+            let group = Arc::make_mut(&mut self.groups[g]);
+            let page = Arc::make_mut(&mut group.pages[p]);
+            // A contiguous run stays within this page. Splits, lower-bound
+            // changes and physical deletes go back through the general path.
+            while let Some((key, record)) = entries.peek() {
+                if (remove_deletes && record.value.is_none())
+                    || key.as_slice() < page.rows[0].0.as_ref()
+                    || upper
+                        .as_ref()
+                        .is_some_and(|end| key.as_slice() >= end.as_ref())
+                {
+                    break;
+                }
+                let prefix = prefix(key);
+                let position = page.position(key, prefix);
+                if position.is_err()
+                    && (page.rows.len() == PAGE_RECORDS
+                        || page.key_bytes + key.len() > PAGE_KEY_BYTES)
+                {
+                    break;
+                }
+                let (key, record) = entries.next().unwrap();
+                *bytes += record.memory_size(&key);
+                match position {
+                    Ok(row) => {
+                        let old = page.replace(row, record);
+                        *bytes -= old.memory_size(&key);
+                    }
+                    Err(row) => {
+                        page.insert_at(row, key, record, prefix);
+                        self.len += 1;
+                    }
+                }
+            }
+        }
+    }
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<&Record> {
         if self.len == 0 {
@@ -171,7 +341,7 @@ impl MemIndex {
         let prefix = prefix(key);
         let group = &self.groups[self.group_for(key, prefix)];
         let p = &group.pages[group.page_for(key, prefix)];
-        p.position(key, prefix).ok().map(|i| &p.rows[i].1)
+        p.position(key, prefix).ok().map(|i| p.record(i))
     }
     #[inline]
     pub fn insert(&mut self, key: Vec<u8>, record: Record) -> Option<Record> {
@@ -191,11 +361,13 @@ impl MemIndex {
             self.group_for(&key, prefix)
         };
         let group = Arc::make_mut(&mut self.groups[index]);
-        let previous = group.insert(key, record, prefix, append);
+        let (previous, page) = group.insert(key, record, prefix, append);
+        self.last_insert = page.map(|p| (index, p));
         if previous.is_none() {
             self.len += 1;
             self.prefixes[index] = group.prefixes[0];
             if group.pages.len() > GROUP_PAGES {
+                self.last_insert = None;
                 let middle = group.pages.len() / 2;
                 let pages = group.pages.split_off(middle);
                 let prefixes = group.prefixes.split_off(middle);
@@ -218,30 +390,81 @@ impl MemIndex {
         // Missing deletes must not copy a snapshot's directory or page.
         let row = self.groups[g].pages[p].position(key, prefix).ok()?;
         let group = Arc::make_mut(&mut self.groups[g]);
-        let page = Arc::make_mut(&mut group.pages[p]);
+        let page = Arc::make_mut(&mut group.pages[p]).materialize();
         let (key, record) = page.rows.remove(row);
         page.prefixes.remove(row);
         page.key_bytes -= key.len();
+        page.value_bytes -= record.value.as_ref().map_or(0, Bytes::len);
+        if page.rows.capacity() > page.rows.len().max(4) * 4 {
+            page.rows.shrink_to_fit();
+            page.prefixes.shrink_to_fit();
+        }
         self.len -= 1;
         if page.rows.is_empty() {
             group.pages.remove(p);
             group.prefixes.remove(p);
         } else {
             group.prefixes[p] = page.prefixes[0];
+            if page.rows.len() < PAGE_RECORDS / 4 && group.pages.len() > 1 {
+                let left = if p + 1 < group.pages.len() { p } else { p - 1 };
+                let right = left + 1;
+                if group.pages[left].rows.len() + group.pages[right].rows.len() <= PAGE_RECORDS / 2
+                    && group.pages[left].key_bytes + group.pages[right].key_bytes <= PAGE_KEY_BYTES
+                {
+                    let mut removed = Arc::unwrap_or_clone(group.pages.remove(right));
+                    group.prefixes.remove(right);
+                    let removed = removed.materialize();
+                    let target = Arc::make_mut(&mut group.pages[left]).materialize();
+                    target.rows.append(&mut removed.rows);
+                    target.prefixes.append(&mut removed.prefixes);
+                    target.key_bytes += removed.key_bytes;
+                    target.value_bytes += removed.value_bytes;
+                    target.rows.shrink_to_fit();
+                    target.prefixes.shrink_to_fit();
+                }
+            }
+        }
+        if group.pages.capacity() > group.pages.len().max(4) * 4 {
+            group.pages.shrink_to_fit();
+            group.prefixes.shrink_to_fit();
         }
         if group.pages.is_empty() {
             self.groups.remove(g);
             self.prefixes.remove(g);
         } else {
             self.prefixes[g] = group.prefixes[0];
+            if group.pages.len() < GROUP_PAGES / 4 && self.groups.len() > 1 {
+                let left = if g + 1 < self.groups.len() { g } else { g - 1 };
+                let right = left + 1;
+                if self.groups[left].pages.len() + self.groups[right].pages.len() <= GROUP_PAGES / 2
+                {
+                    let mut removed = Arc::unwrap_or_clone(self.groups.remove(right));
+                    self.prefixes.remove(right);
+                    let target = Arc::make_mut(&mut self.groups[left]);
+                    target.pages.append(&mut removed.pages);
+                    target.prefixes.append(&mut removed.prefixes);
+                    target.pages.shrink_to_fit();
+                    target.prefixes.shrink_to_fit();
+                }
+            }
         }
+        if self.groups.capacity() > self.groups.len().max(1) * 4 || self.len == 0 {
+            self.groups.shrink_to_fit();
+            self.prefixes.shrink_to_fit();
+        }
+        self.last_insert = None;
         Some(record)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &Record)> {
         self.groups
             .iter()
             .flat_map(|g| g.pages.iter())
-            .flat_map(|p| p.rows.iter().map(|(k, r)| (k.as_ref(), r)))
+            .flat_map(|p| {
+                p.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.as_ref(), p.record(i)))
+            })
     }
     pub fn snapshot(&self, range: Arc<KeyRange>) -> Option<MemScan> {
         if self.len == 0 || range.is_empty() {
@@ -277,11 +500,33 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
-        let groups = self.groups[start..]
+        let mut groups: VecDeque<_> = self.groups[start..]
             .iter()
             .take_while(|g| range.allows_end(g.first_key()))
             .cloned()
             .collect();
+        // Trim small boundary slices instead of retaining unrelated pages in
+        // their groups. Broad ranges still clone only one handle per group.
+        let last = groups.len() - 1;
+        for i in [0, last] {
+            let group = &groups[i];
+            let begin = if i == 0 { page } else { 0 };
+            let end = group
+                .pages
+                .partition_point(|p| range.allows_end(&p.rows[0].0));
+            if end - begin <= 4 && (begin != 0 || end != group.pages.len()) {
+                groups[i] = Arc::new(PageGroup {
+                    pages: group.pages[begin..end].to_vec(),
+                    prefixes: group.prefixes[begin..end].to_vec(),
+                });
+                if i == 0 {
+                    page = 0;
+                }
+            }
+            if last == 0 {
+                break;
+            }
+        }
         Some(MemScan {
             groups,
             current,
@@ -304,7 +549,8 @@ impl Iterator for MemScan {
     type Item = (Vec<u8>, Record);
     fn next(&mut self) -> Option<Self::Item> {
         let page = self.current.as_ref()?;
-        let (key, record) = &page.rows[self.row];
+        let key = &page.rows[self.row].0;
+        let record = page.record(self.row);
         if !self.range.allows_end(key) {
             self.current = None;
             self.groups.clear();
@@ -405,7 +651,7 @@ mod tests {
         }
         drop(scan);
         assert!(map.groups.iter().all(|g| Arc::strong_count(g) == 1));
-        // A narrow range retains only its bounded group, not the whole directory.
+        // A narrow range retains only the intersecting pages.
         let range = Arc::new(
             KeyRange::new(600u64.to_be_bytes().as_slice()..700u64.to_be_bytes().as_slice())
                 .unwrap(),
@@ -415,7 +661,9 @@ mod tests {
         let weak = Arc::downgrade(scan.groups.front().unwrap());
         let old_group = scan.groups.front().unwrap().clone();
         let g = map.group_for(&600u64.to_be_bytes(), 600);
-        assert!(Arc::ptr_eq(&map.groups[g], &old_group));
+        assert!(!Arc::ptr_eq(&map.groups[g], &old_group));
+        assert_eq!(old_group.pages.len(), 2);
+        assert_eq!(Arc::strong_count(&map.groups[g]), 1);
         map.insert(600u64.to_be_bytes().to_vec(), record(9999));
         assert!(!Arc::ptr_eq(&map.groups[g], &old_group));
         drop(old_group);
@@ -425,6 +673,137 @@ mod tests {
         }
         assert!(scan.next().is_none());
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn deltas_fold_without_changing_retained_versions_or_payload_accounting() {
+        let mut map = MemIndex::default();
+        for n in 0..100u64 {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: n + 1,
+                    value: Some(Bytes::from(vec![7; 64])),
+                },
+            );
+        }
+        let old = map.snapshot(all()).unwrap();
+        let base = map.groups[0].pages[0].base.clone();
+        for n in 0..PAGE_UPDATES as u64 {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: n + 101,
+                    value: Some(Bytes::from(vec![9; 3])),
+                },
+            );
+            assert!(Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
+        }
+        let middle = map.snapshot(all()).unwrap().collect::<Vec<_>>();
+        map.insert((PAGE_UPDATES as u64).to_be_bytes().to_vec(), record(1000));
+        assert!(!Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
+        assert!(map.groups[0].pages[0].updates.is_empty());
+        assert_eq!(
+            map.groups[0].pages[0].value_bytes,
+            (100 - PAGE_UPDATES - 1) * 64 + PAGE_UPDATES * 3
+        );
+        assert!(old
+            .into_iter()
+            .all(|(_, r)| r.value.unwrap().as_ref() == [7; 64]));
+        for (i, (_, r)) in middle.into_iter().enumerate() {
+            assert_eq!(
+                r.value.unwrap().len(),
+                if i < PAGE_UPDATES { 3 } else { 64 }
+            );
+        }
+    }
+
+    #[test]
+    fn page_local_batches_match_ordered_model_across_splits_duplicates_and_deletes() {
+        for remove_deletes in [false, true] {
+            let mut map = MemIndex::default();
+            let mut model = std::collections::BTreeMap::new();
+            let mut bytes = 0;
+            let mut saved = Vec::new();
+            for batch in 0..80u64 {
+                let entries: Vec<_> = (0..320u64)
+                    .map(|i| {
+                        // Equal prefixes, ascending runs, repeated keys and wraps.
+                        let mut key = b"shared-prefix/".to_vec();
+                        key.extend_from_slice(&((batch * 211 + i / 2) % 6000).to_be_bytes());
+                        let r = Record {
+                            seq: batch * 320 + i + 1,
+                            value: (i % 7 != 0)
+                                .then(|| Bytes::from(vec![batch as u8; (i % 19) as usize])),
+                        };
+                        (key, r)
+                    })
+                    .collect();
+                for (k, r) in &entries {
+                    if remove_deletes && r.value.is_none() {
+                        model.remove(k);
+                    } else {
+                        model.insert(k.clone(), r.clone());
+                    }
+                }
+                map.apply(entries, remove_deletes, &mut bytes);
+                assert_eq!(map.len(), model.len());
+                assert_eq!(
+                    bytes,
+                    model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+                );
+                assert_eq!(
+                    map.iter()
+                        .map(|(k, r)| (k.to_vec(), r.clone()))
+                        .collect::<Vec<_>>(),
+                    model
+                        .iter()
+                        .map(|(k, r)| (k.clone(), r.clone()))
+                        .collect::<Vec<_>>()
+                );
+                if batch % 10 == 0 {
+                    saved.push((map.snapshot(all()).unwrap(), model.clone()));
+                }
+            }
+            for (snapshot, model) in saved {
+                assert_eq!(
+                    snapshot.collect::<Vec<_>>(),
+                    model.into_iter().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_deletes_release_capacity_and_narrow_snapshots_do_not_pin_unrelated_pages() {
+        let mut map = MemIndex::default();
+        for n in 0..20_000u64 {
+            map.insert(n.to_be_bytes().to_vec(), record(n));
+        }
+        let before = map.allocated_bytes();
+        let scan = map
+            .snapshot(Arc::new(
+                KeyRange::new(10u64.to_be_bytes().as_slice()..20u64.to_be_bytes().as_slice())
+                    .unwrap(),
+            ))
+            .unwrap();
+        let unrelated = Arc::downgrade(map.groups[0].pages.last().unwrap());
+        for n in 0..20_000u64 {
+            if n % 100 != 0 {
+                map.remove(&n.to_be_bytes());
+            }
+        }
+        assert!(unrelated.upgrade().is_none());
+        assert!(map.allocated_bytes() < before / 8);
+        assert!(map.groups.iter().map(|g| g.pages.len()).sum::<usize>() < 20);
+        assert_eq!(
+            scan.map(|(_, r)| r.seq).collect::<Vec<_>>(),
+            (10..20).collect::<Vec<_>>()
+        );
+        for n in (0..20_000u64).step_by(100) {
+            map.remove(&n.to_be_bytes());
+        }
+        assert_eq!(map.allocated_bytes(), 0);
     }
 
     #[test]

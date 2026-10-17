@@ -22,6 +22,16 @@ pub(crate) struct MemTable {
     pub bytes: usize,
 }
 impl MemTable {
+    pub fn apply(
+        &mut self,
+        entries: impl IntoIterator<Item = (Vec<u8>, Record)>,
+        remove_deletes: bool,
+    ) {
+        self.data.apply(entries, remove_deletes, &mut self.bytes);
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        self.data.allocated_bytes()
+    }
     pub fn insert(&mut self, key: Vec<u8>, record: Record) {
         self.bytes += record.memory_size(&key);
         let key_len = key.len();

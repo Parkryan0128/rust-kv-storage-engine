@@ -105,15 +105,25 @@ Snapshot creation shares overlapping groups of active/frozen memory pages and
 captures SST handles under the state lock. One group contains at most 64 pages;
 creation clones group handles instead of touching every page or matching key.
 Keys are copied when consumed; completed groups and sources are released. A
-boundary group can retain pages outside the requested range. Later writes copy
-only shared group metadata and changed pages, so retaining a snapshot can increase
-write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
+boundary slice of at most four pages retains only those pages; larger boundary
+groups can still retain pages outside the requested range. Shared-page updates
+copy a bounded delta (up to 16 records), sharing unchanged keys and values.
+Structural edits and delta folds copy the page contents, so retaining a snapshot
+can still increase write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
 except that one larger key occupies its own page.
 Iteration buffers one block and candidate record per SST, rather than all disk
 results. `.take(n)` limits consumption; `.collect()` allocates the full result.
 Drop or exhaust scans promptly: they retain the database lock and old SST handles,
 which can delay reclaiming disk space after compaction. They also keep selected
 memory values alive. Transactions and replication are not implemented.
+
+`Stats::*_memtable_bytes` are logical rotation charges (key/value lengths plus
+48 bytes per entry), not RAM usage. `*_memtable_allocated_bytes` estimate reachable
+page/directory capacities and base/delta payload lengths. They exclude allocator
+headers, spare `Bytes` backing capacity, and old pages held only by scans; shared
+payload can also be counted more than once. Use process RSS/peak RSS for total
+memory comparisons. Allocation estimates visit pages, so avoid polling them on a
+latency-sensitive path. The rotation policy continues to use logical charges.
 
 Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads.
 

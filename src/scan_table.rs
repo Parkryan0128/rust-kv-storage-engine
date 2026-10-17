@@ -13,6 +13,16 @@ pub(crate) struct TableScan {
 }
 
 impl Table {
+    pub(crate) fn overlaps(&self, range: &KeyRange) -> bool {
+        self.index
+            .first()
+            .is_some_and(|first| range.allows_end(&first.first))
+            && self.last_key.get().is_none_or(|last| match &range.start {
+                Bound::Included(start) => last >= start,
+                Bound::Excluded(start) => last > start,
+                Bound::Unbounded => true,
+            })
+    }
     pub fn scan(self: &Arc<Self>, range: Arc<KeyRange>) -> TableScan {
         let next_block = match &range.start {
             Bound::Included(start) | Bound::Excluded(start) => self
@@ -80,7 +90,7 @@ impl TableScan {
                     let (mut lo, mut hi) = (0, block.record_count());
                     while lo < hi {
                         let mid = lo + (hi - lo) / 2;
-                        let key = block.record_at(mid)?.key;
+                        let key = block.key_at(mid)?;
                         if key < start.as_slice() || (excluded && key == start.as_slice()) {
                             lo = mid + 1;
                         } else {

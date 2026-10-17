@@ -45,8 +45,11 @@ impl Bloom {
             h = h.wrapping_add(delta);
         }
     }
+    #[cfg(test)]
     pub fn contains(&self, key: &[u8]) -> bool {
-        let mut h = hash(key);
+        self.contains_hash(hash(key))
+    }
+    pub fn contains_hash(&self, mut h: u64) -> bool {
         let delta = delta(h);
         let n = self.bits.len() as u64 * 8;
         for _ in 0..self.probes {
