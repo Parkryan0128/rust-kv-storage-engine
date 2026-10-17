@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::cache::Cache;
 use crate::{
-    block::{indexed_records, ReadBlock},
+    block::{indexed_records, BlockCursor, ReadBlock},
     bloom::Bloom,
     cache::{BlockCache, CacheKey, Counters},
     codec::*,

@@ -44,7 +44,7 @@ mod wal_preallocation;
 pub mod write_profile;
 pub use batch::WriteBatch;
 pub use compaction::CompactionStyle;
-pub use engine::{Engine, KvEngine, Options, Result, Stats};
+pub use engine::{ActivityStats, Engine, KvEngine, Options, Result, Stats};
 pub use error::EngineError;
 pub use inspection::{Inspection, MemtableInfo, RecordPreview, TableInfo};
 pub use scan::Scan;

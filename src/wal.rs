@@ -97,7 +97,7 @@ impl Wal {
                 } else {
                     table.apply(pending.drain(..), false);
                     pending_bytes = 0;
-                    replay(&buffer, &mut table, last_seq)?;
+                    replay_batch(&buffer, &mut table, last_seq)?;
                 }
                 // Commit the logical offset only after CRC and replay validation.
                 // BufReader may have already read past this frame into a torn tail.
@@ -203,14 +203,11 @@ fn decode_single(payload: &[u8], last_seq: &mut u64) -> Result<(Vec<u8>, Record)
     Ok(entry)
 }
 
-fn replay(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
-    if !payload.starts_with(&[0; 8]) {
-        let (key, record) = decode_single(payload, last_seq)?;
-        table.insert(key, record);
-        return Ok(());
-    }
+fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
     let mut c = Cursor { b: payload };
-    c.u64()?;
+    if c.u64()? != 0 {
+        return Err(corrupt("WAL batch envelope"));
+    }
     if c.u32()? != BATCH_VERSION {
         return Err(corrupt("WAL batch version"));
     }

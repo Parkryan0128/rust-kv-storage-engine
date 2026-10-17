@@ -229,6 +229,91 @@ impl ReadBlock {
     }
 }
 
+// Own the immutable block and decoded head offsets together. No self-reference
+// or unchecked slice is needed, and repeated current() calls never decode again.
+pub(crate) struct BlockCursor {
+    block: ReadBlock,
+    head: Option<RecordPosition>,
+}
+struct RecordPosition {
+    key_start: usize,
+    key_end: usize,
+    end: usize,
+    seq: u64,
+    has_value: bool,
+}
+impl BlockCursor {
+    pub fn new(block: ReadBlock, index: usize) -> Result<Self> {
+        let offset = if index == block.record_count() {
+            None
+        } else {
+            let end = if block.index_start == 0 {
+                block.bytes.len()
+            } else {
+                block.index_start
+            };
+            Some(end - block.record_bytes(index)?.len())
+        };
+        let mut out = Self { block, head: None };
+        if let Some(offset) = offset {
+            out.decode_at(offset)?;
+        }
+        Ok(out)
+    }
+    fn data_end(&self) -> usize {
+        if self.block.index_start == 0 {
+            self.block.bytes.len()
+        } else {
+            self.block.index_start
+        }
+    }
+    fn decode_at(&mut self, offset: usize) -> Result<()> {
+        let bytes = self
+            .block
+            .bytes
+            .get(offset..self.data_end())
+            .ok_or_else(|| corrupt("SST cursor offset"))?;
+        let mut c = Cursor { b: bytes };
+        let record = decode_record_ref(&mut c)?;
+        let key_start = offset + 17;
+        let key_end = key_start + record.key.len();
+        self.head = Some(RecordPosition {
+            key_start,
+            key_end,
+            end: self.data_end() - c.b.len(),
+            seq: record.seq,
+            has_value: record.value.is_some(),
+        });
+        Ok(())
+    }
+    pub fn current(&self) -> Option<RecordRef<'_>> {
+        let head = self.head.as_ref()?;
+        Some(RecordRef {
+            key: &self.block.bytes[head.key_start..head.key_end],
+            seq: head.seq,
+            value: head
+                .has_value
+                .then(|| &self.block.bytes[head.key_end..head.end]),
+        })
+    }
+    pub fn advance(&mut self) -> Result<()> {
+        let Some(head) = self.head.take() else {
+            return Ok(());
+        };
+        if head.end != self.data_end() {
+            self.decode_at(head.end)?;
+        }
+        Ok(())
+    }
+    pub fn into_block(self) -> ReadBlock {
+        self.block
+    }
+    #[cfg(test)]
+    pub fn frame_capacity(&self) -> usize {
+        self.block.frame_capacity()
+    }
+}
+
 pub(crate) fn indexed_records(payload: &[u8]) -> Result<&[u8]> {
     let footer = payload
         .get(payload.len().saturating_sub(4)..)
@@ -316,6 +401,45 @@ mod tests {
     }
 
     type TestRecord<'a> = (&'a [u8], u64, Option<&'a [u8]>);
+
+    #[test]
+    fn sequential_cursor_reuses_heads_and_checks_record_boundaries() {
+        let records: &[TestRecord<'_>] = &[
+            (b"", 1, None),
+            (b"a", 2, Some(b"")),
+            (b"b", 3, Some(b"value")),
+        ];
+        for indexed in [false, true] {
+            let make = || {
+                if indexed {
+                    ReadBlock::decode_indexed(indexed_frame(records), b"", None, 3, 0)
+                        .unwrap()
+                        .0
+                } else {
+                    ReadBlock::decode(frame(records), b"", None, 3).unwrap()
+                }
+            };
+            for begin in 0..=records.len() {
+                let mut cursor = BlockCursor::new(make(), begin).unwrap();
+                for &(key, seq, value) in &records[begin..] {
+                    for _ in 0..4 {
+                        let head = cursor.current().unwrap();
+                        assert_eq!((head.key, head.seq, head.value), (key, seq, value));
+                    }
+                    cursor.advance().unwrap();
+                }
+                assert!(cursor.current().is_none());
+                cursor.advance().unwrap();
+                assert!(cursor.current().is_none());
+            }
+            assert!(BlockCursor::new(make(), records.len() + 1).is_err());
+            let mut cursor = BlockCursor::new(make(), 0).unwrap();
+            let next = cursor.head.as_ref().unwrap().end;
+            cursor.block.bytes[next + 8] = 2;
+            assert!(cursor.advance().is_err());
+            assert!(cursor.current().is_none());
+        }
+    }
 
     #[test]
     fn key_only_probes_match_records_and_reject_invalid_slices() {

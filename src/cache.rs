@@ -303,7 +303,44 @@ impl Cache {
         while self.bytes > capacity {
             self.remove(self.tail);
         }
+        let shrinking = capacity < self.capacity;
         self.capacity = capacity;
+        if shrinking {
+            self.shrink_metadata();
+        }
+    }
+    // Rebuild only after a large occupancy decrease, not on normal eviction.
+    // Compact slot identities and LRU links together without cloning blocks.
+    fn shrink_metadata(&mut self) {
+        let live = self.entries.len();
+        if live == 0 {
+            self.entries = HashMap::default();
+            self.slots = Vec::new();
+            self.free = Vec::new();
+            self.head = NONE;
+            self.tail = NONE;
+            return;
+        }
+        let threshold = live.max(16).saturating_mul(4);
+        if self.slots.capacity() <= threshold && self.entries.capacity() <= threshold {
+            return;
+        }
+        let mut old = std::mem::take(&mut self.slots);
+        let mut index = self.head;
+        self.entries = HashMap::with_capacity_and_hasher(live, Default::default());
+        self.slots = Vec::with_capacity(live);
+        self.free = Vec::new();
+        while index != NONE {
+            let mut entry = old[index].take().unwrap();
+            index = entry.next;
+            let slot = self.slots.len();
+            entry.prev = if slot == 0 { NONE } else { slot - 1 };
+            entry.next = if slot + 1 == live { NONE } else { slot + 1 };
+            self.entries.insert(entry.key, slot);
+            self.slots.push(Some(entry));
+        }
+        self.head = 0;
+        self.tail = live - 1;
     }
     fn unlink(&mut self, index: usize) {
         let e = self.slots[index].as_ref().unwrap();
@@ -420,11 +457,7 @@ impl Cache {
             }
             index = next;
         }
-        if self.entries.is_empty() {
-            self.entries.shrink_to_fit();
-            self.slots = Vec::new();
-            self.free = Vec::new();
-        }
+        self.shrink_metadata();
     }
 }
 
@@ -433,6 +466,42 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn budget_shrink_reclaims_metadata_without_changing_live_lru_or_handles() {
+        let value = block(16);
+        let charge = value.allocated_bytes() + ENTRY_OVERHEAD;
+        let mut cache = Cache::new(charge * 512);
+        for n in 0..512 {
+            cache.insert((1, n), value.clone());
+        }
+        cache.get((1, 500)).unwrap();
+        let hits = cache.hits;
+        cache.resize(charge * 4);
+        assert_eq!(cache.entries.len(), 4);
+        assert!(cache.slots.capacity() <= 16);
+        assert!(cache.entries.capacity() <= 16);
+        assert!(cache.free.is_empty());
+        assert_eq!(cache.hits, hits);
+        let mut order = Vec::new();
+        let mut cursor = cache.head;
+        while cursor != NONE {
+            let entry = cache.slots[cursor].as_ref().unwrap();
+            order.push(entry.key.identity.1);
+            assert!(Arc::ptr_eq(&entry.block, &value));
+            cursor = entry.next;
+        }
+        assert_eq!(order, vec![500, 511, 510, 509]);
+        cache.resize(charge * 5);
+        cache.insert((2, 0), value.clone());
+        cache.remove_tables(&HashSet::from([1]));
+        assert!(Arc::ptr_eq(&cache.get((2, 0)).unwrap(), &value));
+        cache.resize(0);
+        assert_eq!(cache.slots.capacity(), 0);
+        assert_eq!(cache.entries.capacity(), 0);
+        assert!(cache.free.is_empty());
+        assert_eq!(cache.bytes(), 0);
+    }
 
     #[test]
     fn four_megabyte_admission_preserves_small_cache_and_idle_budget_returns() {

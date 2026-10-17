@@ -8,9 +8,10 @@ pub(crate) struct Record {
     pub seq: u64,
     pub value: Option<Bytes>,
 }
+pub(crate) const RECORD_CHARGE: usize = 48;
 impl Record {
     pub fn memory_size(&self, key: &[u8]) -> usize {
-        48 + key.len() + self.value.as_ref().map_or(0, Bytes::len)
+        RECORD_CHARGE + key.len() + self.value.as_ref().map_or(0, Bytes::len)
     }
     pub fn encoded_len(&self, key: &[u8]) -> usize {
         17 + key.len() + self.value.as_ref().map_or(0, Bytes::len)
@@ -36,7 +37,7 @@ impl MemTable {
         self.bytes += record.memory_size(&key);
         let key_len = key.len();
         if let Some(old) = self.data.insert(key, record) {
-            self.bytes -= 48 + key_len + old.value.as_ref().map_or(0, Bytes::len);
+            self.bytes -= RECORD_CHARGE + key_len + old.value.as_ref().map_or(0, Bytes::len);
         }
     }
     pub fn remove(&mut self, key: &[u8]) {

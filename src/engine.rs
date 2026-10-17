@@ -118,6 +118,28 @@ pub struct Stats {
     /// Largest number of input SSTs in a single merge since open (at most sixteen).
     pub max_compaction_inputs: u64,
 }
+/// Lightweight activity sample. Does not traverse memtable pages.
+/// Cache counters are sampled after releasing the state lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityStats {
+    pub sequence: u64,
+    pub active_memtable_bytes: usize,
+    pub immutable_memtable_bytes: usize,
+    pub immutable_memtables: usize,
+    pub sst_files: usize,
+    pub sst_records: u64,
+    pub block_reads: u64,
+    pub cache_hits: u64,
+    pub bloom_negatives: u64,
+    pub cache_bytes: usize,
+    pub sst_bytes: u64,
+    pub flush_bytes: u64,
+    pub compaction_input_bytes: u64,
+    pub compaction_output_bytes: u64,
+    pub compactions: u64,
+    pub max_compaction_inputs: u64,
+}
+
 pub(crate) struct Frozen {
     id: u64,
     pub(crate) mem: MemTable,
@@ -594,33 +616,48 @@ impl Engine {
         }
         Ok(preview)
     }
+    /// Sample counters without traversing memory pages. Prefer this for polling.
+    pub fn activity_stats(&self) -> ActivityStats {
+        let c = &self.inner.core;
+        let mut out = {
+            let s = c.state.read();
+            c.activity_snapshot(&s)
+        };
+        (out.cache_bytes, out.cache_hits) = c.cache.stats();
+        out
+    }
+    /// Includes detailed memory estimates; computing them visits pages.
     pub fn stats(&self) -> Stats {
         let c = &self.inner.core;
-        let s = c.state.read();
-        let (cache_bytes, cache_hits) = c.cache.stats();
+        let (mut activity, active, immutable) = {
+            let s = c.state.read();
+            (
+                c.activity_snapshot(&s),
+                s.mem.allocated_bytes(),
+                s.immutable.iter().map(|m| m.mem.allocated_bytes()).sum(),
+            )
+        };
+        // Never retain the state guard while waiting for cache shard locks.
+        (activity.cache_bytes, activity.cache_hits) = c.cache.stats();
         Stats {
-            sequence: s.sequence,
-            active_memtable_bytes: s.mem.bytes,
-            immutable_memtable_bytes: s.immutable.iter().map(|m| m.mem.bytes).sum(),
-            active_memtable_allocated_bytes: s.mem.allocated_bytes(),
-            immutable_memtable_allocated_bytes: s
-                .immutable
-                .iter()
-                .map(|m| m.mem.allocated_bytes())
-                .sum(),
-            immutable_memtables: s.immutable.len(),
-            sst_files: s.tables.len(),
-            sst_records: s.tables.iter().map(|t| t.count).sum(),
-            block_reads: c.counters.reads.load(Ordering::Relaxed),
-            cache_hits,
-            bloom_negatives: c.counters.bloom_negatives.load(Ordering::Relaxed),
-            cache_bytes,
-            sst_bytes: s.tables.iter().map(|t| t.file_bytes).sum(),
-            flush_bytes: c.counters.flush_bytes.load(Ordering::Relaxed),
-            compaction_input_bytes: c.counters.compaction_input_bytes.load(Ordering::Relaxed),
-            compaction_output_bytes: c.counters.compaction_output_bytes.load(Ordering::Relaxed),
-            compactions: c.counters.compactions.load(Ordering::Relaxed),
-            max_compaction_inputs: c.counters.max_compaction_inputs.load(Ordering::Relaxed),
+            sequence: activity.sequence,
+            active_memtable_bytes: activity.active_memtable_bytes,
+            immutable_memtable_bytes: activity.immutable_memtable_bytes,
+            immutable_memtables: activity.immutable_memtables,
+            sst_files: activity.sst_files,
+            sst_records: activity.sst_records,
+            block_reads: activity.block_reads,
+            cache_hits: activity.cache_hits,
+            bloom_negatives: activity.bloom_negatives,
+            cache_bytes: activity.cache_bytes,
+            sst_bytes: activity.sst_bytes,
+            flush_bytes: activity.flush_bytes,
+            compaction_input_bytes: activity.compaction_input_bytes,
+            compaction_output_bytes: activity.compaction_output_bytes,
+            compactions: activity.compactions,
+            max_compaction_inputs: activity.max_compaction_inputs,
+            active_memtable_allocated_bytes: active,
+            immutable_memtable_allocated_bytes: immutable,
         }
     }
 }
@@ -690,6 +727,30 @@ fn ids(dir: &Path, ext: &str) -> Result<Vec<u64>> {
     Ok(out)
 }
 impl Core {
+    fn activity_snapshot(&self, s: &State) -> ActivityStats {
+        ActivityStats {
+            sequence: s.sequence,
+            active_memtable_bytes: s.mem.bytes,
+            immutable_memtable_bytes: s.immutable.iter().map(|m| m.mem.bytes).sum(),
+            immutable_memtables: s.immutable.len(),
+            sst_files: s.tables.len(),
+            sst_records: s.tables.iter().map(|t| t.count).sum(),
+            block_reads: self.counters.reads.load(Ordering::Relaxed),
+            cache_hits: 0,
+            bloom_negatives: self.counters.bloom_negatives.load(Ordering::Relaxed),
+            cache_bytes: 0,
+            sst_bytes: s.tables.iter().map(|t| t.file_bytes).sum(),
+            flush_bytes: self.counters.flush_bytes.load(Ordering::Relaxed),
+            compaction_input_bytes: self.counters.compaction_input_bytes.load(Ordering::Relaxed),
+            compaction_output_bytes: self
+                .counters
+                .compaction_output_bytes
+                .load(Ordering::Relaxed),
+            compactions: self.counters.compactions.load(Ordering::Relaxed),
+            max_compaction_inputs: self.counters.max_compaction_inputs.load(Ordering::Relaxed),
+        }
+    }
+
     fn wake(&self) {
         let _ = self.notify.try_send(());
     }
@@ -789,7 +850,7 @@ impl Core {
             // Maintenance can fail while WAL I/O runs without the state lock.
             // Keep that failure visible; the synced batch may reappear on reopen.
             check(&s)?;
-            let mut entries = batch.entries.into_iter().enumerate().map(|(i, entry)| {
+            let entries = batch.entries.into_iter().enumerate().map(|(i, entry)| {
                 (
                     entry.key,
                     Record {
@@ -798,18 +859,21 @@ impl Core {
                     },
                 )
             });
-            // Keep the fault boundary after one applied entry, while readers
-            // remain excluded by the same state lock throughout the batch.
-            s.mem.apply(entries.next(), self.disk.is_none());
-            #[cfg(test)]
-            crate::test_hooks::pause("batch_after_first_apply");
-            if let Err(e) = fault::hit("batch_after_first_apply") {
-                let e = EngineError::from(e);
-                s.fatal = Some(e.to_string());
-                drop(s);
-                self.progress();
-                return Err(e);
-            }
+            #[cfg(any(test, feature = "fault-injection"))]
+            let entries = {
+                let mut entries = entries;
+                s.mem.apply(entries.next(), self.disk.is_none());
+                #[cfg(test)]
+                crate::test_hooks::pause("batch_after_first_apply");
+                if let Err(e) = fault::hit("batch_after_first_apply") {
+                    let e = EngineError::from(e);
+                    s.fatal = Some(e.to_string());
+                    drop(s);
+                    self.progress();
+                    return Err(e);
+                }
+                entries
+            };
             s.mem.apply(entries, self.disk.is_none());
             s.sequence = end;
         });

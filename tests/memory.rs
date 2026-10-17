@@ -25,3 +25,22 @@ fn volatile_deletes_reclaim_keys_and_do_not_accumulate_tombstones() {
     engine.put(b"keep", b"again").unwrap();
     assert_eq!(clone.get(b"keep").unwrap().unwrap(), "again");
 }
+
+#[test]
+fn lightweight_activity_matches_detailed_stats_without_memory_estimates() {
+    let db = Engine::new();
+    for n in 0..10_000u64 {
+        db.put(&n.to_be_bytes(), &[1; 32]).unwrap();
+    }
+    for n in 0..5000u64 {
+        db.delete(&n.to_be_bytes()).unwrap();
+    }
+    let a = db.activity_stats();
+    let detailed = db.stats();
+    assert_eq!(a.sequence, detailed.sequence);
+    assert_eq!(a.active_memtable_bytes, detailed.active_memtable_bytes);
+    assert_eq!(a.immutable_memtables, detailed.immutable_memtables);
+    assert_eq!(a.cache_bytes, detailed.cache_bytes);
+    assert_eq!(a.sst_bytes, detailed.sst_bytes);
+    assert!(detailed.active_memtable_allocated_bytes > 0);
+}

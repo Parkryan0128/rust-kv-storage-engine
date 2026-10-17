@@ -118,7 +118,7 @@ fn malformed_batch_payloads_never_apply_a_prefix() {
         table.insert(b"base".to_vec(), single(b"old", 1));
         let mut seq = 1;
         assert!(matches!(
-            replay(&bytes, &mut table, &mut seq),
+            replay_batch(&bytes, &mut table, &mut seq),
             Err(EngineError::Corruption(_))
         ));
         assert_eq!(seq, 1);
@@ -130,7 +130,7 @@ fn malformed_batch_payloads_never_apply_a_prefix() {
     }
     let mut table = MemTable::default();
     let mut seq = 1;
-    replay(&good, &mut table, &mut seq).unwrap();
+    replay_batch(&good, &mut table, &mut seq).unwrap();
     assert_eq!(seq, 3);
     assert_eq!(table.get(b"a").unwrap().value.as_deref(), Some(&b"v"[..]));
     assert!(table.get(b"b").unwrap().value.is_none());
@@ -208,10 +208,10 @@ fn sequence_limit_and_legacy_rejection_are_explicit() {
     bytes[second..second + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut table = MemTable::default();
     let mut seq = u64::MAX - 2;
-    replay(&bytes, &mut table, &mut seq).unwrap();
+    replay_batch(&bytes, &mut table, &mut seq).unwrap();
     assert_eq!(seq, u64::MAX);
     assert!(decode_record(&mut Cursor { b: &bytes }).is_err());
-    assert!(replay(&bytes, &mut table, &mut seq).is_err());
+    assert!(replay_batch(&bytes, &mut table, &mut seq).is_err());
 }
 
 #[test]
@@ -369,4 +369,23 @@ fn buffered_recovery_crosses_headers_and_payloads_and_drops_large_storage() {
     drop(wal);
     let (wal, _) = Wal::recover(&dir.path().join("large.wal"), 2, false, &mut 0).unwrap();
     assert_eq!(wal.buffer.capacity(), 0);
+}
+
+#[test]
+fn maximum_sequence_is_checked_through_real_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("limit.wal");
+    let mut bytes = MAGIC.to_vec();
+    let mut body = Vec::new();
+    encode_record(b"last", &single(b"v", u64::MAX), &mut body);
+    write_frame(&mut bytes, &body).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut seq = u64::MAX - 1;
+    let (wal, table) = Wal::recover(&path, 1, false, &mut seq).unwrap();
+    assert_eq!(seq, u64::MAX);
+    assert_eq!(table.get(b"last").unwrap().seq, u64::MAX);
+    drop(wal);
+    write_frame(&mut bytes, &body).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(Wal::recover(&path, 1, false, &mut (u64::MAX - 1)).is_err());
 }

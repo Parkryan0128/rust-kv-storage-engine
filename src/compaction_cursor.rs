@@ -5,8 +5,7 @@ use super::*;
 pub(crate) struct TableCursor {
     table: Arc<Table>,
     next_block: usize,
-    block: Option<ReadBlock>,
-    record: usize,
+    block: Option<BlockCursor>,
 }
 
 impl TableCursor {
@@ -15,23 +14,19 @@ impl TableCursor {
             table,
             next_block: 0,
             block: None,
-            record: 0,
         };
         cursor.advance()?;
         Ok(cursor)
     }
 
     pub fn current(&self) -> Result<Option<RecordRef<'_>>> {
-        self.block
-            .as_ref()
-            .map(|block| block.record_at(self.record))
-            .transpose()
+        Ok(self.block.as_ref().and_then(BlockCursor::current))
     }
 
     pub fn advance(&mut self) -> Result<()> {
-        if let Some(block) = &self.block {
-            self.record += 1;
-            if self.record < block.record_count() {
+        if let Some(block) = &mut self.block {
+            block.advance()?;
+            if block.current().is_some() {
                 return Ok(());
             }
         }
@@ -39,12 +34,12 @@ impl TableCursor {
             self.block = None;
             return Ok(());
         }
-        self.block = Some(
-            self.table
-                .read_stream_block(self.next_block, self.block.take())?,
-        );
+        let block = self.table.read_stream_block(
+            self.next_block,
+            self.block.take().map(BlockCursor::into_block),
+        )?;
+        self.block = Some(BlockCursor::new(block, 0)?);
         self.next_block += 1;
-        self.record = 0;
         Ok(())
     }
 }

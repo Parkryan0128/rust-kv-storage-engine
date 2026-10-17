@@ -6,8 +6,7 @@ pub(crate) struct TableScan {
     table: Arc<Table>,
     range: Arc<KeyRange>,
     next_block: usize,
-    block: Option<ReadBlock>,
-    record: usize,
+    block: Option<BlockCursor>,
     seek: bool,
     done: bool,
 }
@@ -36,7 +35,6 @@ impl Table {
             range,
             next_block,
             block: None,
-            record: 0,
             seek: true,
             done: false,
         }
@@ -45,10 +43,7 @@ impl Table {
 
 impl TableScan {
     pub fn current(&self) -> Result<Option<RecordRef<'_>>> {
-        self.block
-            .as_ref()
-            .map(|b| b.record_at(self.record))
-            .transpose()
+        Ok(self.block.as_ref().and_then(BlockCursor::current))
     }
 
     pub fn advance<T>(
@@ -56,13 +51,12 @@ impl TableScan {
         counters: &Counters,
         consume: impl FnOnce(RecordRef<'_>) -> T,
     ) -> Result<Option<T>> {
-        if self.block.is_some() {
-            self.record += 1;
+        if let Some(block) = &mut self.block {
+            block.advance()?;
         }
         while !self.done {
             if let Some(block) = &self.block {
-                if self.record < block.record_count() {
-                    let record = block.record_at(self.record)?;
+                if let Some(record) = block.current() {
                     if !self.range.allows_end(record.key) {
                         self.done = true;
                         self.block = None;
@@ -80,10 +74,11 @@ impl TableScan {
             counters.reads.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             crate::test_hooks::pause("scan_before_block_read");
-            let block = self
-                .table
-                .read_stream_block(self.next_block, self.block.take())?;
-            self.record = 0;
+            let block = self.table.read_stream_block(
+                self.next_block,
+                self.block.take().map(BlockCursor::into_block),
+            )?;
+            let mut record = 0;
             if self.seek {
                 if let Bound::Included(start) | Bound::Excluded(start) = &self.range.start {
                     let excluded = matches!(&self.range.start, Bound::Excluded(_));
@@ -97,12 +92,12 @@ impl TableScan {
                             hi = mid;
                         }
                     }
-                    self.record = lo;
+                    record = lo;
                 }
                 self.seek = false;
             }
             self.next_block += 1;
-            self.block = Some(block);
+            self.block = Some(BlockCursor::new(block, record)?);
         }
         self.done = true;
         self.block = None;
