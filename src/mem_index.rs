@@ -79,6 +79,7 @@ impl PageGroup {
             self.pages[i].rows[0].0.as_ref() <= key
         })
     }
+    #[inline]
     fn insert(
         &mut self,
         key: Vec<u8>,
@@ -172,6 +173,7 @@ impl MemIndex {
         let p = &group.pages[group.page_for(key, prefix)];
         p.position(key, prefix).ok().map(|i| &p.rows[i].1)
     }
+    #[inline]
     pub fn insert(&mut self, key: Vec<u8>, record: Record) -> Option<Record> {
         let prefix = prefix(&key);
         let append = self.groups.last().is_none_or(|g| {
@@ -273,7 +275,8 @@ impl MemIndex {
         if !range.allows_end(first_key) {
             return None;
         }
-        // Copy one handle per group; per-page Arc counters stay untouched.
+        // Copy one handle per group and retain only the current page directly.
+        let current = Some(self.groups[start].pages[page].clone());
         let groups = self.groups[start..]
             .iter()
             .take_while(|g| range.allows_end(g.first_key()))
@@ -281,6 +284,7 @@ impl MemIndex {
             .collect();
         Some(MemScan {
             groups,
+            current,
             page,
             row,
             range,
@@ -290,6 +294,8 @@ impl MemIndex {
 
 pub(crate) struct MemScan {
     groups: VecDeque<Arc<PageGroup>>,
+    // Cache the current page so each returned row avoids directory traversal.
+    current: Option<Arc<Page>>,
     page: usize,
     row: usize,
     range: Arc<KeyRange>,
@@ -297,10 +303,10 @@ pub(crate) struct MemScan {
 impl Iterator for MemScan {
     type Item = (Vec<u8>, Record);
     fn next(&mut self) -> Option<Self::Item> {
-        let group = self.groups.front()?;
-        let page = &group.pages[self.page];
+        let page = self.current.as_ref()?;
         let (key, record) = &page.rows[self.row];
         if !self.range.allows_end(key) {
+            self.current = None;
             self.groups.clear();
             return None;
         }
@@ -309,10 +315,11 @@ impl Iterator for MemScan {
         if self.row == page.rows.len() {
             self.page += 1;
             self.row = 0;
-            if self.page == group.pages.len() {
+            if self.page == self.groups.front().unwrap().pages.len() {
                 self.groups.pop_front();
                 self.page = 0;
             }
+            self.current = self.groups.front().map(|g| g.pages[self.page].clone());
         }
         Some(out)
     }
@@ -390,7 +397,9 @@ mod tests {
             .groups
             .iter()
             .flat_map(|g| &g.pages)
+            .skip(1)
             .all(|p| Arc::strong_count(p) == 1));
+        assert_eq!(Arc::strong_count(&map.groups[0].pages[0]), 2);
         for n in 0..10u64 {
             assert_eq!(scan.next(), Some((n.to_be_bytes().to_vec(), record(n))));
         }
