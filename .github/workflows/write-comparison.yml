@@ -91,6 +91,12 @@ jobs:
           else
             python3 benchmarks/rocksdb-compare/remaining.py remaining-results
           fi
+      - name: Compare memory scan scaling and active point lookups
+        if: contains(github.event.head_commit.message, '[full-perf]')
+        timeout-minutes: 8
+        run: python3 benchmarks/rocksdb-compare/remaining.py scan-scaling-results --scan-focus
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
       - name: Compare interleaved memory snapshots, writes, and cache hits
         if: contains(github.event.head_commit.message, '[remaining-perf]') || contains(github.event.head_commit.message, '[scan-perf]')
         timeout-minutes: 8
@@ -108,6 +114,7 @@ jobs:
           name: remaining-optimization-comparison
           path: |
             remaining-results/
+            scan-scaling-results/
             internal-profile-results/
           if-no-files-found: ignore
       - name: Compare bounded durable writes and flush pressure
