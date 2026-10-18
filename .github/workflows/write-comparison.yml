@@ -105,6 +105,7 @@ jobs:
         run: |
           mkdir -p internal-profile-results
           cp src/memory_scan_profile.rs baseline/src/memory_scan_profile.rs
+          cp examples/snapshot_profile.rs baseline/examples/snapshot_profile.rs
           cp src/read_profile.rs baseline/src/read_profile.rs
           if ! grep -q 'mod memory_scan_profile;' baseline/src/engine.rs; then
             printf '\n#[cfg(test)]\n#[path = "memory_scan_profile.rs"]\nmod memory_scan_profile;\n' >> baseline/src/engine.rs

@@ -194,7 +194,11 @@ fn point_reads(db: &Backend, c: &Config, worker: usize, pass: ReadPass) -> Resul
     // At most 4,000 API timers across ALL workers, independent of thread count.
     let quota = 4000 / c.threads + usize::from(worker < 4000 % c.threads);
     let stride = c.queries.div_ceil(quota).max(1);
-    let mut samples = Vec::with_capacity(c.queries.div_ceil(stride));
+    let mut samples = if pass == ReadPass::Latency {
+        Vec::with_capacity(c.queries.div_ceil(stride))
+    } else {
+        Vec::new()
+    };
     let mut expected_value = if pass == ReadPass::Verify {
         vec![42; c.value]
     } else {
@@ -898,6 +902,27 @@ fn disjoint_range(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         }
         db.flush()?;
     }
+    let db = if raw["reopen"].as_bool().unwrap_or(false) {
+        drop(db);
+        Backend::open(path, c)?
+    } else {
+        db
+    };
+    // Separate the first post-open seek from an immediate identical repeat.
+    let probe = per * (c.generations as u64 - 1) + per / 2;
+    let mut initial_scans = Vec::new();
+    for _ in 0..2 {
+        let one = Instant::now();
+        let rows = db
+            .scan(&key(probe), &key(probe + c.span))?
+            .collect::<Result<Vec<_>>>()?;
+        initial_scans.push(one.elapsed().as_nanos() as f64 / 1000.0);
+        assert_eq!(rows.len(), c.span as usize);
+        for (i, (k, v)) in rows.into_iter().enumerate() {
+            assert_eq!(k, key(probe + i as u64));
+            assert_eq!(v.as_ref(), value(probe + i as u64, 0, c.value));
+        }
+    }
     let before = metrics(path)?;
     let stats_before = db.stats()?;
     let mut rng = c.seed;
@@ -920,7 +945,7 @@ fn disjoint_range(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     report(
         "disjoint-range",
         raw,
-        json!({"seconds":seconds,"operations":c.queries,"ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+        json!({"first_scan_us":initial_scans[0],"repeat_scan_us":initial_scans[1],"seconds":seconds,"operations":c.queries,"ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
     );
     Ok(())
 }

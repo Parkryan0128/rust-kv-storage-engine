@@ -19,8 +19,8 @@ impl TableCursor {
         Ok(cursor)
     }
 
-    pub fn current(&self) -> Result<Option<RecordRef<'_>>> {
-        Ok(self.block.as_ref().and_then(BlockCursor::current))
+    pub fn current(&self) -> Option<RecordRef<'_>> {
+        self.block.as_ref().and_then(BlockCursor::current)
     }
 
     pub fn advance(&mut self) -> Result<()> {
@@ -74,18 +74,18 @@ mod tests {
         );
         let mut cursor = TableCursor::new(table).unwrap();
         let first = cursor.block.as_ref().unwrap().buffer_addresses().0;
-        assert_eq!(cursor.current().unwrap().unwrap().key, [0]);
+        assert_eq!(cursor.current().unwrap().key, [0]);
         cursor.advance().unwrap();
         assert_eq!(cursor.block.as_ref().unwrap().buffer_addresses().0, first);
         cursor.advance().unwrap();
         assert!(cursor.block.as_ref().unwrap().frame_capacity() > 32 * 1024);
         cursor.advance().unwrap();
         assert!(cursor.block.as_ref().unwrap().frame_capacity() < 1024);
-        assert_eq!(cursor.current().unwrap().unwrap().value.unwrap(), &[3; 128]);
+        assert_eq!(cursor.current().unwrap().value.unwrap(), &[3; 128]);
         cursor.advance().unwrap();
         assert!(cursor.block.is_none());
-        assert!(cursor.current().unwrap().is_none());
+        assert!(cursor.current().is_none());
         cursor.advance().unwrap();
-        assert!(cursor.current().unwrap().is_none());
+        assert!(cursor.current().is_none());
     }
 }

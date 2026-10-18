@@ -26,15 +26,27 @@ fn benches(c: &mut Criterion) {
                 .unwrap();
         })
     });
-    e.compact().unwrap();
-    let keys = i;
+    // Independent fixed fixture: filters and preceding write speed cannot change reads.
+    let read_dir = tempfile::tempdir().unwrap();
+    let read_db = Engine::open_with_options(read_dir.path(), Options::default()).unwrap();
+    let keys = 20_000u64;
+    let mut fixture = rust_kv_storage_engine::WriteBatch::new();
+    for key in 1..=keys {
+        fixture.put(key.to_be_bytes(), &value);
+    }
+    read_db.write_batch(fixture).unwrap();
+    read_db.compact().unwrap();
     let mut rng = 0xace123u64;
     group.bench_function("random_sst_read", |b| {
         b.iter(|| {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            black_box(e.get(black_box(&(rng % keys + 1).to_be_bytes())).unwrap());
+            black_box(
+                read_db
+                    .get(black_box(&(rng % keys + 1).to_be_bytes()))
+                    .unwrap(),
+            );
         })
     });
     let mut n = 0u64;
@@ -43,9 +55,9 @@ fn benches(c: &mut Criterion) {
             n += 1;
             let key = (n % keys + 1).to_be_bytes();
             if n % 2 == 0 {
-                e.put(black_box(&key), black_box(&value)).unwrap();
+                read_db.put(black_box(&key), black_box(&value)).unwrap();
             } else {
-                black_box(e.get(black_box(&key)).unwrap());
+                black_box(read_db.get(black_box(&key)).unwrap());
             }
         })
     });

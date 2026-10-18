@@ -111,7 +111,7 @@ impl Merge {
             // avoids heap keys and materializing values for superseded versions.
             let mut newest: Option<crate::codec::RecordRef<'_>> = None;
             for (i, cursor) in self.cursors.iter().enumerate() {
-                if let Some(record) = cursor.current()? {
+                if let Some(record) = cursor.current() {
                     if newest.as_ref().is_none_or(|old| record.key < old.key) {
                         self.pending.clear();
                         self.pending.push(i);

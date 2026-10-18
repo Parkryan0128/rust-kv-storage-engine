@@ -52,13 +52,15 @@ not identical algorithms. They are too short to establish sustained write rates.
 
 Scans do not fill either point-read cache. RocksDB may still read already-cached
 blocks; this engine bypasses the cache entirely. Both check data integrity.
-RocksDB iterators provide their normal consistent view; engine scans copy matching
-memory keys and pin SST handles. Read fixtures are flushed before timing.
+RocksDB iterators provide their normal consistent view; engine scans share overlapping
+immutable memory page groups and pin selected SST handles. Read fixtures are flushed before timing.
 
 Each point pass issues 100,000 reads in total; range passes issue 512 short or
-256 long scans. Point latency samples time only the API call. Scan latency includes validation
-and row destruction as well as the scan. Throughput includes RNG, checks and
-value destruction; four-thread throughput also includes startup/join. Do not
+256 long scans. Point latency samples time only the API call. General read workloads use separate
+throughput, warm latency and seeded full-validation passes. Throughput includes RNG,
+allocations and value destruction, but excludes per-query timers and validation.
+Workers are ready before the throughput timer, and finish before joining. Scan
+latency includes traversal and row destruction, with validation in a separate pass. Do not
 compare scan-query ops/s with point ops/s; scan row counts are reported separately.
 Writes include native batch construction from the same prebuilt bounded trace.
 Percentiles include sample counts; p95 is omitted below 20 samples and p99 below
@@ -188,22 +190,24 @@ explicit; these are not cold-device or power-loss measurements.
 
 Point latency collection now uses a shared budget of at most 4,000 samples across
 all workers. The existing end-to-end mode remains. The additional throughput mode
-uses ready workers and no per-query timers; timed work still includes RNG,
-validation, allocations and owned-value destruction. Do not merge its rates with
+uses ready workers and no per-query timers; timed work includes RNG,
+allocations and owned-value destruction. Full validation runs in a separate pass. Do not merge its rates with
 the older timed-query results. Internal frozen scans hold maintenance paused in
 both versions and report creation/first-row time; they have no RocksDB comparison.
 Internal profiles alternate baseline/current execution in six paired trials.
-Memory snapshots share only overlapping copy-on-write pages (up to 256 records
-and 64 KiB of keys per page, except a single larger key). Scans copy a key only
-when it is consumed and release completed pages; they still clone page handles
-at creation, and a write to a shared page copies that page. This is not zero-cost
-snapshotting or a guarantee of unchanged write performance.
+Memory snapshots share overlapping copy-on-write page groups (up to 64 pages,
+256 records and 64 KiB of keys per page, except a single larger key). Small boundary
+ranges retain only selected pages. Completed groups are released during traversal.
+Memory merge candidates share key handles and borrow values; only emitted rows copy
+keys and retain values. Shared updates use 16–32 row deltas before materialization;
+structural edits can copy a page. Snapshotting can therefore still increase write cost.
 
 Additional cases cover 2/4 MiB values followed by small-only phases with 20k,
 40k, and 80k small keys, mixed cache pressure, 100k-key early scans, full memory
-traversal, and batch writes while a snapshot is retained. Internal volatile
-write profiles isolate copy-on-write costs from fsync, separately from durable
-RocksDB comparisons. Cache hits/block reads are logical reads, not physical I/O.
+traversal, and batch writes while a snapshot is retained. The volatile snapshot-write
+profile runs as a normal release example on baseline and current, without cfg(test)
+batch hooks. It isolates copy-on-write costs from fsync, separately from durable
+RocksDB comparisons. Frozen/cache diagnostics still run in release libtest builds. Cache hits/block reads are logical reads, not physical I/O.
 The engine keeps at least a quarter of its cache budget for ordinary blocks;
 large entries exceeding the remaining budget bypass caching. Idle oversized
 entries can be reclaimed under sustained ordinary miss pressure.
@@ -216,7 +220,13 @@ trials. Early-stop scans consume ten rows from 2k, 20k, 100k, and 200k key
 memtables; 5,000 queries per case reduce timer noise. Random lower bounds, narrow
 ranges, full scans, active-memory point reads, WAL recovery, and writes with a
 retained snapshot guard against moving cost elsewhere. Creation, first-row, and
-iterator-drop latency are reported separately; total throughput includes validation
-and all three phases. The 200k case uses a 128 MiB memtable on all backends to
+iterator-drop latency are reported separately. Memory-scan diagnostics retain
+validation and all three phases in total throughput; general disk read passes do not. The 200k case uses a 128 MiB memtable on all backends to
 avoid accidentally measuring disk scans. Internal profiles also isolate snapshot
 copy-on-write cost. These measurements do not establish constant-time scaling.
+
+The disjoint-range suite also reopens the database and reports first_scan_us and
+repeat_scan_us outside the repeated-loop throughput timer. Reopen lazily learns SST
+upper bounds in the engine; these are warm-OS-cache probes, not cold-device latency.
+The standalone Criterion read/mixed benchmarks use a fixed 20,000-key fixture,
+independent of selected filters and earlier write throughput.

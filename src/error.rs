@@ -7,6 +7,8 @@ pub enum EngineError {
     InvalidConfig(String),
     Locked,
     Background(String),
+    /// Retained for API compatibility; current engines close when their last handle drops.
+    /// No current operation produces this variant.
     Closed,
     SequenceExhausted,
 }

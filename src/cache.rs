@@ -395,8 +395,13 @@ impl Cache {
         if let Some(&index) = self.entries.get(&key) {
             self.remove(index);
         }
+        let live_before = self.entries.len();
         while self.bytes > self.capacity - size {
             self.remove(self.tail);
+        }
+        // Compact only after a bulk eviction, never on an ordinary one-for-one miss.
+        if live_before.saturating_sub(self.entries.len()) >= 16 {
+            self.shrink_metadata();
         }
         let index = self.free.pop().unwrap_or_else(|| {
             self.slots.push(None);
@@ -466,6 +471,34 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn ordinary_bulk_eviction_reclaims_metadata_without_resizing_budget() {
+        let small = block(16);
+        let budget = (small.allocated_bytes() + ENTRY_OVERHEAD) * 512;
+        let mut cache = Cache::new(budget);
+        for n in 0..512 {
+            cache.insert((1, n), small.clone());
+        }
+        let large = block(budget - ENTRY_OVERHEAD - 512);
+        let pinned = large.clone();
+        cache.insert((2, 0), large);
+        assert_eq!(cache.capacity, budget);
+        assert!(cache.entries.len() < 16);
+        assert!(cache.slots.capacity() <= 16);
+        assert!(cache.entries.capacity() <= 16);
+        assert!(Arc::ptr_eq(&cache.get((2, 0)).unwrap(), &pinned));
+        for n in 0..512 {
+            cache.insert((3, n), small.clone());
+        }
+        assert_eq!(cache.entries.len(), 512);
+        assert!(cache.get((2, 0)).is_none());
+        for n in 0..512 {
+            assert!(cache.get((3, n)).is_some());
+        }
+        assert!(cache.bytes() <= budget);
+        assert!(pinned.allocated_bytes() > budget / 2);
+    }
 
     #[test]
     fn budget_shrink_reclaims_metadata_without_changing_live_lru_or_handles() {

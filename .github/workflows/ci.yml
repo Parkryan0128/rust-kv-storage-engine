@@ -25,6 +25,11 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo test --locked --release --all-features
       - run: cargo bench --locked --bench engine --no-run
+      - name: Check each Criterion filter independently
+        run: |
+          cargo bench --locked --bench engine -- sequential_sync_write --test
+          cargo bench --locked --bench engine -- random_sst_read --test
+          cargo bench --locked --bench engine -- mixed_half_sync_write --test
       - run: cargo build --locked --release --example demo
       - run: python3 scripts/test_demo.py
   msrv:

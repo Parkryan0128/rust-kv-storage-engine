@@ -603,7 +603,7 @@ impl Engine {
         };
         let mut cursor = TableCursor::new(table)?;
         let mut preview = Vec::new();
-        while let Some(record) = cursor.current()? {
+        while let Some(record) = cursor.current() {
             preview.push(RecordPreview::from_parts(
                 record.key,
                 record.seq,

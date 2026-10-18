@@ -194,3 +194,30 @@ fn maintenance_alternates_urgent_flush_and_compaction_and_respects_flush_goal() 
         assert_eq!(db.get(key).unwrap().as_deref(), Some(&[7; 128][..]));
     }
 }
+
+#[test]
+fn activity_statistics_match_with_frozen_memory_ssts_and_populated_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(dir.path()).unwrap();
+    db.put(b"disk", &[7; 128]).unwrap();
+    db.flush().unwrap();
+    db.get(b"disk").unwrap();
+    db.get(b"disk").unwrap();
+    let guard = db.inner.core.maintenance.lock();
+    db.put(b"frozen", &[8; 128]).unwrap();
+    db.inner
+        .core
+        .freeze(&mut db.inner.core.writer.lock())
+        .unwrap();
+    db.put(b"active", &[9; 128]).unwrap();
+    let a = db.activity_stats();
+    let s = db.stats();
+    drop(guard);
+    assert_eq!(a.sequence, s.sequence);
+    assert_eq!(a.active_memtable_bytes, s.active_memtable_bytes);
+    assert_eq!(a.immutable_memtable_bytes, s.immutable_memtable_bytes);
+    assert_eq!(a.immutable_memtables, 1);
+    assert_eq!(a.sst_bytes, s.sst_bytes);
+    assert_eq!(a.cache_bytes, s.cache_bytes);
+    assert!(a.sst_bytes > 0 && a.cache_bytes > 0 && a.cache_hits > 0);
+}

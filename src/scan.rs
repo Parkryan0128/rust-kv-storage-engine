@@ -1,5 +1,5 @@
 use crate::{
-    memtable::{MemScan, Record},
+    memtable::MemScan,
     sstable::{Table, TableScan},
     Engine, EngineError, Result,
 };
@@ -52,8 +52,45 @@ impl KeyRange {
     }
 }
 
+// Memory keys share their immutable allocation; SST keys retain their owned buffer.
+// Both compare by bytes so source type never affects merge ordering.
+enum CandidateKey {
+    Shared(Bytes),
+    Owned(Vec<u8>),
+}
+impl CandidateKey {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Shared(k) => k,
+            Self::Owned(k) => k,
+        }
+    }
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Shared(k) => k.to_vec(),
+            Self::Owned(k) => k,
+        }
+    }
+}
+impl PartialEq for CandidateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+impl Eq for CandidateKey {}
+impl PartialOrd for CandidateKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CandidateKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bytes().cmp(other.bytes())
+    }
+}
+
 enum Source {
-    Memory { iter: MemScan, head: Option<Record> },
+    Memory { iter: MemScan, started: bool },
     Table(TableScan),
     Exhausted,
 }
@@ -74,7 +111,7 @@ enum Source {
 pub struct Scan {
     engine: Option<Engine>,
     sources: Vec<Source>,
-    heap: BinaryHeap<Reverse<(Vec<u8>, usize, u64)>>,
+    heap: BinaryHeap<Reverse<(CandidateKey, usize, u64)>>,
     pending: Vec<usize>,
     initialized: bool,
     live_sources: usize,
@@ -87,12 +124,11 @@ impl Scan {
         tables: &[Arc<Table>],
         range: Arc<KeyRange>,
     ) -> Self {
-        let mut sources = Vec::with_capacity(tables.len() + memory.len());
-        sources.extend(
-            memory
-                .into_iter()
-                .map(|iter| Source::Memory { iter, head: None }),
-        );
+        let mut sources = Vec::with_capacity(memory.len());
+        sources.extend(memory.into_iter().map(|iter| Source::Memory {
+            iter,
+            started: false,
+        }));
         sources.extend(
             tables
                 .iter()
@@ -122,10 +158,17 @@ impl Scan {
 
     fn advance(&mut self, index: usize) -> Result<()> {
         match &mut self.sources[index] {
-            Source::Memory { iter, head } => {
-                if let Some((key, record)) = iter.next() {
-                    self.heap.push(Reverse((key, index, record.seq)));
-                    *head = Some(record);
+            Source::Memory { iter, started } => {
+                if *started {
+                    iter.advance();
+                }
+                *started = true;
+                if let Some((key, record)) = iter.current() {
+                    self.heap.push(Reverse((
+                        CandidateKey::Shared(key.clone()),
+                        index,
+                        record.seq,
+                    )));
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
@@ -137,7 +180,8 @@ impl Scan {
                         (record.key.to_vec(), record.seq)
                     })?
                 {
-                    self.heap.push(Reverse((key, index, seq)));
+                    self.heap
+                        .push(Reverse((CandidateKey::Owned(key), index, seq)));
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
@@ -200,25 +244,25 @@ impl Scan {
             // Each source has strictly increasing keys, so all versions of this
             // key are already in the heap; no source needs advancing to find more.
             let value = match &mut self.sources[winner] {
-                Source::Memory { head, .. } => head.take().unwrap().value,
-                Source::Table(iter) => iter.current()?.unwrap().to_owned().value,
+                Source::Memory { iter, .. } => iter.current().unwrap().1.value.clone(),
+                Source::Table(iter) => iter.current().unwrap().to_owned().value,
                 Source::Exhausted => unreachable!("exhausted sources have no heap entry"),
             };
-            for &index in &self.pending {
-                if let Source::Memory { head, .. } = &mut self.sources[index] {
-                    *head = None;
-                }
-            }
             if let Some(value) = value {
                 if self.live_sources == 1 && self.sources.len() > 1 {
                     // The head being returned is already consumed. The next
                     // call can advance this sole remaining source directly.
                     debug_assert!(self.heap.is_empty());
-                    let source = std::mem::replace(&mut self.sources[winner], Source::Exhausted);
+                    let mut source =
+                        std::mem::replace(&mut self.sources[winner], Source::Exhausted);
+                    if let Source::Memory { iter, started } = &mut source {
+                        iter.advance();
+                        *started = false;
+                    }
                     self.sources = vec![source];
                     self.pending.clear();
                 }
-                return Ok(Some((key, value)));
+                return Ok(Some((key.into_vec(), value)));
             }
         }
     }
@@ -255,6 +299,62 @@ impl FusedIterator for Scan {}
 mod tests {
     use super::*;
     use crate::Options;
+
+    #[test]
+    fn borrowed_memory_heads_merge_versions_and_switch_without_skipping() {
+        use crate::memtable::{MemIndex, Record};
+        let mut older = MemIndex::default();
+        let mut newer = MemIndex::default();
+        for k in 0..600u64 {
+            older.insert(
+                k.to_be_bytes().to_vec(),
+                Record {
+                    seq: k + 1,
+                    value: Some(Bytes::from(vec![1; 128])),
+                },
+            );
+            if k < 300 {
+                newer.insert(
+                    k.to_be_bytes().to_vec(),
+                    Record {
+                        seq: k + 1000,
+                        value: (k % 3 != 0).then(|| Bytes::from(vec![2; 128])),
+                    },
+                );
+            }
+        }
+        let range = Arc::new(KeyRange::new(..).unwrap());
+        let mut scan = Scan::new(
+            Engine::new(),
+            vec![
+                older.snapshot(range.clone()).unwrap(),
+                newer.snapshot(range.clone()).unwrap(),
+            ],
+            &[],
+            range,
+        );
+        for i in 0..2 {
+            scan.advance(i).unwrap();
+        }
+        scan.initialized = true;
+        assert!(scan
+            .heap
+            .iter()
+            .all(|Reverse((key, _, _))| matches!(key, CandidateKey::Shared(_))));
+        let rows = scan.collect::<Result<Vec<_>>>().unwrap();
+        let expected: Vec<_> = (0..600u64).filter(|k| *k >= 300 || k % 3 != 0).collect();
+        assert_eq!(rows.len(), expected.len());
+        for ((key, value), k) in rows.into_iter().zip(expected) {
+            assert_eq!(key, k.to_be_bytes());
+            assert_eq!(value.as_ref(), &[if k < 300 { 2 } else { 1 }; 128]);
+        }
+        assert!(
+            CandidateKey::Shared(Bytes::from_static(b"a")) < CandidateKey::Owned(b"b".to_vec())
+        );
+        assert!(
+            CandidateKey::Owned(b"a".to_vec()) == CandidateKey::Shared(Bytes::from_static(b"a"))
+        );
+    }
 
     #[test]
     fn merge_switches_to_single_source_without_skipping_rows_or_tombstones() {
@@ -302,6 +402,10 @@ mod tests {
         let hi = 1008u64.to_be_bytes();
         let scan = db.scan(lo.as_slice()..hi.as_slice()).unwrap();
         assert_eq!(scan.sources.len(), 1);
+        assert!(scan.sources.capacity() <= 4);
+        let empty = db.scan(2000u64.to_be_bytes().as_slice()..).unwrap();
+        assert_eq!(empty.sources.capacity(), 0);
+        drop(empty);
         let before = db.stats().block_reads;
         assert_eq!(scan.count(), 3);
         assert_eq!(db.stats().block_reads - before, 1);

@@ -21,6 +21,7 @@ pub(crate) struct TableWriter {
     count: u64,
     max_seq: u64,
     block_size: usize,
+    small_blocks: usize,
 }
 
 impl TableWriter {
@@ -51,6 +52,7 @@ impl TableWriter {
             count: 0,
             max_seq: 0,
             block_size,
+            small_blocks: 0,
         })
     }
 
@@ -121,7 +123,19 @@ impl TableWriter {
             validated: AtomicU64::new(0),
         });
         self.position += self.block.len() as u64;
+        // A large record should not pin scratch space for the rest of a long merge.
+        // Consecutive large records keep their reusable buffer.
+        let target = self.block_size.max(4096);
+        if self.block.capacity() > target.saturating_mul(4) && self.block.len() <= target * 2 {
+            self.small_blocks += 1;
+        } else {
+            self.small_blocks = 0;
+        }
         self.block.truncate(HEADER);
+        if self.small_blocks >= 4 {
+            self.block.shrink_to(target);
+            self.small_blocks = 0;
+        }
         self.offsets.clear();
         self.last_key = None;
         Ok(())
@@ -205,6 +219,37 @@ impl TableWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_scratch_shrinks_after_small_blocks_but_reuses_consecutive_giants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch.sst");
+        let mut writer = TableWriter::new(&path, 40, 4096, 10, false).unwrap();
+        let large = vec![7; 1024 * 1024];
+        writer.push(&0u64.to_be_bytes(), 1, Some(&large)).unwrap();
+        writer.push(&1u64.to_be_bytes(), 2, Some(&large)).unwrap();
+        let capacity = writer.block.capacity();
+        writer.push(&2u64.to_be_bytes(), 3, Some(&large)).unwrap();
+        assert_eq!(writer.block.capacity(), capacity);
+        for n in 3..40u64 {
+            writer
+                .push(&n.to_be_bytes(), n + 1, Some(&[9; 2048]))
+                .unwrap();
+        }
+        assert!(writer.block.capacity() <= 8192);
+        let table = Arc::new(writer.finish(&path, 1, 10).unwrap());
+        let mut cursor = TableCursor::new(table).unwrap();
+        for n in 0..40u64 {
+            let row = cursor.current().unwrap();
+            assert_eq!(row.key, n.to_be_bytes());
+            assert_eq!(
+                row.value.unwrap().len(),
+                if n < 3 { large.len() } else { 2048 }
+            );
+            cursor.advance().unwrap();
+        }
+        assert!(cursor.current().is_none());
+    }
 
     #[test]
     fn published_metadata_matches_reopened_table_and_bounds_are_learned_lazily() {
@@ -321,12 +366,12 @@ mod tests {
                 let table = Arc::new(writer.finish(&path, 1, 10).unwrap());
                 let mut cursor = TableCursor::new(table).unwrap();
                 for (n, &len) in sizes.iter().enumerate() {
-                    let record = cursor.current().unwrap().unwrap();
+                    let record = cursor.current().unwrap();
                     assert_eq!(record.key, (n as u64).to_be_bytes());
                     assert_eq!(record.value.unwrap(), vec![42; len]);
                     cursor.advance().unwrap();
                 }
-                assert!(cursor.current().unwrap().is_none());
+                assert!(cursor.current().is_none());
                 outputs.push(fs::read(path).unwrap());
             }
             assert_eq!(outputs[0], outputs[1]);

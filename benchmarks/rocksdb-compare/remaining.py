@@ -44,6 +44,7 @@ def main():
         ("snapshot-write32", "snapshot-write", dict(common, batch=32, queries=200), None),
         ("snapshot-narrow-write32", "snapshot-write", dict(common, batch=32, queries=200, narrow=True), None),
         ("disjoint12-range10", "disjoint-range", dict(common, keys=24000, generations=12, queries=2000), None),
+        ("disjoint12-reopened-range10", "disjoint-range", dict(common, keys=24000, generations=12, queries=2000, reopen=True), None),
         ("mixed-steady32", "mixed-steady", dict(common, batch=32, queries=2000, fixed=False, memtable=524288), None),
     ])
     cases.extend([

@@ -105,6 +105,34 @@ impl Page {
         &self.rows[row].1
     }
     fn materialize(&mut self) -> &mut PageData {
+        if !self.updates.is_empty() && Arc::get_mut(&mut self.base).is_none() {
+            // Copy unchanged handles once and move delta records directly into place.
+            // Sorted deltas merge linearly; no per-row binary search or obsolete value clone.
+            let mut updates = std::mem::take(&mut self.updates).into_iter().peekable();
+            let mut value_bytes = self.value_bytes;
+            let rows = self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, (key, original))| {
+                    let record = if updates.peek().is_some_and(|(row, _)| *row == i) {
+                        let (_, record) = updates.next().unwrap();
+                        value_bytes -= original.value.as_ref().map_or(0, Bytes::len);
+                        value_bytes += record.value.as_ref().map_or(0, Bytes::len);
+                        record
+                    } else {
+                        original.clone()
+                    };
+                    (key.clone(), record)
+                })
+                .collect();
+            self.base = Arc::new(PageData {
+                rows,
+                prefixes: self.prefixes.clone(),
+                key_bytes: self.key_bytes,
+                value_bytes,
+            });
+        }
         let base = Arc::make_mut(&mut self.base);
         base.fold(&mut self.updates);
         base
@@ -117,7 +145,7 @@ impl Page {
         }
         match self.updates.binary_search_by_key(&row, |(i, _)| *i) {
             Ok(i) => std::mem::replace(&mut self.updates[i].1, record),
-            Err(i) if self.updates.len() < PAGE_UPDATES => {
+            Err(i) if self.updates.len() < (self.rows.len() / 8).clamp(PAGE_UPDATES, 32) => {
                 let old = self.rows[row].1.clone();
                 self.updates.insert(i, (row, record));
                 old
@@ -629,23 +657,24 @@ pub(crate) struct MemScan {
     row: usize,
     range: Arc<KeyRange>,
 }
-impl Iterator for MemScan {
-    type Item = (Vec<u8>, Record);
-    fn next(&mut self) -> Option<Self::Item> {
+impl MemScan {
+    // The merge keeps a borrowed head; losing versions never clone their values.
+    pub(crate) fn current(&self) -> Option<(&Bytes, &Record)> {
         let page = self.current.as_ref()?;
         let key = &page.rows[self.row].0;
-        let record = page.record(self.row);
-        if !self.range.allows_end(key) {
-            self.current = None;
-            self.groups.clear();
-            return None;
-        }
-        let out = (key.to_vec(), record.clone());
+        self.range
+            .allows_end(key)
+            .then(|| (key, page.record(self.row)))
+    }
+    pub(crate) fn advance(&mut self) {
+        let Some(page) = self.current.as_ref() else {
+            return;
+        };
         self.row += 1;
         if self.row == page.rows.len() {
             if self.groups.is_empty() {
                 self.current = None;
-                return Some(out);
+                return;
             }
             self.page += 1;
             self.row = 0;
@@ -655,6 +684,18 @@ impl Iterator for MemScan {
             }
             self.current = self.groups.front().map(|g| g.pages[self.page].clone());
         }
+    }
+}
+impl Iterator for MemScan {
+    type Item = (Vec<u8>, Record);
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some((key, record)) = self.current() else {
+            self.current = None;
+            self.groups.clear();
+            return None;
+        };
+        let out = (key.to_vec(), record.clone());
+        self.advance();
         Some(out)
     }
 }
@@ -670,6 +711,40 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn full_pages_keep_bounded_deltas_and_fold_only_visible_versions() {
+        let mut map = MemIndex::default();
+        for n in 0..256u64 {
+            map.insert(n.to_be_bytes().to_vec(), record(n + 1));
+        }
+        let old = map.snapshot(all()).unwrap();
+        let base = map.groups[0].pages[0].base.clone();
+        for n in 0..32u64 {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: 1000 + n,
+                    value: Some(Bytes::from(vec![3; 17])),
+                },
+            );
+            assert!(Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
+        }
+        let middle = map.snapshot(all()).unwrap();
+        map.insert(32u64.to_be_bytes().to_vec(), record(2000));
+        assert!(!Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
+        assert!(map.groups[0].pages[0].updates.is_empty());
+        assert_eq!(map.groups[0].pages[0].value_bytes, 32 * 17);
+        assert!(old.enumerate().all(|(n, (_, r))| r.seq == n as u64 + 1));
+        assert!(middle.enumerate().all(|(n, (_, r))| r.seq
+            == if n < 32 {
+                1000 + n as u64
+            } else {
+                n as u64 + 1
+            }));
+        map.insert(0u64.to_be_bytes().to_vec(), record(3000));
+        assert_eq!(map.groups[0].pages[0].value_bytes, 31 * 17);
     }
 
     #[test]

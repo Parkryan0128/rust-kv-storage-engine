@@ -25,7 +25,7 @@ fn memory(m: MemtableInfo) -> Value {
 }
 fn snapshot(e: &Engine) -> Result<Value> {
     let i = e.inspect()?;
-    let s = e.stats();
+    let s = e.activity_stats();
     Ok(
         json!({"sequence":i.sequence,"active":memory(i.active),"frozen":i.frozen.into_iter().map(memory).collect::<Vec<_>>(),
         "tables":i.tables.into_iter().map(|t|json!({"id":t.id,"bytes":t.bytes,"records":t.records,"max_sequence":t.max_sequence,"tier":t.bytes.max(1).ilog2()})).collect::<Vec<_>>(),
@@ -70,8 +70,8 @@ impl Comparison {
         Ok(c)
     }
     fn point(&self) -> Value {
-        let f = self.full.stats();
-        let t = self.tiered.stats();
+        let f = self.full.activity_stats();
+        let t = self.tiered.activity_stats();
         json!({"batch":self.batch,"full":f.flush_bytes+f.compaction_output_bytes,"tiered":t.flush_bytes+t.compaction_output_bytes})
     }
     fn step(&mut self) -> Result<()> {

@@ -42,8 +42,8 @@ impl Table {
 }
 
 impl TableScan {
-    pub fn current(&self) -> Result<Option<RecordRef<'_>>> {
-        Ok(self.block.as_ref().and_then(BlockCursor::current))
+    pub fn current(&self) -> Option<RecordRef<'_>> {
+        self.block.as_ref().and_then(BlockCursor::current)
     }
 
     pub fn advance<T>(
