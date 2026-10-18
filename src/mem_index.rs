@@ -686,16 +686,34 @@ impl MemScan {
         }
     }
 }
+// Keep the single-source iterator in one body; borrowed merge traversal uses
+// the cursor methods above without forcing this hot path through them.
 impl Iterator for MemScan {
     type Item = (Vec<u8>, Record);
     fn next(&mut self) -> Option<Self::Item> {
-        let Some((key, record)) = self.current() else {
+        let page = self.current.as_ref()?;
+        let key = &page.rows[self.row].0;
+        let record = page.record(self.row);
+        if !self.range.allows_end(key) {
             self.current = None;
             self.groups.clear();
             return None;
-        };
+        }
         let out = (key.to_vec(), record.clone());
-        self.advance();
+        self.row += 1;
+        if self.row == page.rows.len() {
+            if self.groups.is_empty() {
+                self.current = None;
+                return Some(out);
+            }
+            self.page += 1;
+            self.row = 0;
+            if self.page == self.groups.front().unwrap().pages.len() {
+                self.groups.pop_front();
+                self.page = 0;
+            }
+            self.current = self.groups.front().map(|g| g.pages[self.page].clone());
+        }
         Some(out)
     }
 }
