@@ -117,3 +117,9 @@ Read measurement v2
 The workload read harness separates throughput, warm latency sampling, and full seeded verification. Throughput consumes and drops owned results without constructing expected values, checking all bytes, or timing each operation. Point workers are ready before timing starts. The same query trace is fully checked outside the timed pass; range row counts must match. First/repeat throughput resource samples are captured before the extra passes. Latency samples come from a separate warm pass. Earlier v1 absolute throughput is not directly comparable: use an identical v2 harness against both revisions. Other diagnostic modes retain their explicitly documented validation and timing costs.
 
 Remaining comparisons also distinguish sorted, shuffled, and repeated-key WAL histories, and check reachable memtable allocation after releasing a large-value snapshot. Allocation counters are engine-specific estimates; compare process RSS separately.
+
+Production snapshot-write diagnostics
+
+The snapshot mutation profile now builds `examples/snapshot_profile.rs` as a normal release example for both revisions. It no longer measures the test-only split-first-entry batch path. Frozen-memory and cache profiles remain release libtest diagnostics and are labeled separately in JSONL. Compare revisions with the same copied example; do not treat earlier libtest timings as production batch latency.
+
+The disjoint-range suite reports first and immediate-repeat scan latency and includes an explicit reopen variant. These probes use warm OS cache and do not measure power-loss recovery or cold-device reads. Criterion random-read and mixed fixtures now have a fixed 20,000 keys and can run independently by name.
