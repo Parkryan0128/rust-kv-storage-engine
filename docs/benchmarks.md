@@ -123,3 +123,11 @@ Production snapshot-write diagnostics
 The snapshot mutation profile now builds `examples/snapshot_profile.rs` as a normal release example for both revisions. It no longer measures the test-only split-first-entry batch path. Frozen-memory and cache profiles remain release libtest diagnostics and are labeled separately in JSONL. Compare revisions with the same copied example; do not treat earlier libtest timings as production batch latency.
 
 The disjoint-range suite reports first and immediate-repeat scan latency and includes an explicit reopen variant. These probes use warm OS cache and do not measure power-loss recovery or cold-device reads. Criterion random-read and mixed fixtures now have a fixed 20,000 keys and can run independently by name.
+
+
+Warm range repeats now use the same fixed seeded trace multiple times (16 for
+512-key spans, 32 for 32-key spans), identically for every backend. First-pass
+and latency/verification sampling retain their original trace lengths. See
+[workload methodology](../benchmarks/rocksdb-compare/WORKLOADS.md) for counts and
+the longer production snapshot diagnostics. Criterion joins the write fixture's
+worker before preparing read measurements.

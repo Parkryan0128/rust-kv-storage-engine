@@ -40,7 +40,14 @@ fn remaining_memory_scan_profile() -> Result<()> {
             for consumed in [10u64, keys] {
                 let mut create_ns = 0;
                 let mut first_ns = 0;
-                let queries = if consumed == keys { 10 } else { 100 };
+                // Warm separately, then measure enough identical queries to
+                // avoid interpreting a sub-millisecond timer interval.
+                for _ in 0..16 {
+                    for row in db.scan(..)?.take(consumed as usize) {
+                        black_box(row?);
+                    }
+                }
+                let queries = if consumed == keys { 100 } else { 200_000 };
                 let start = Instant::now();
                 for _ in 0..queries {
                     let one = Instant::now();

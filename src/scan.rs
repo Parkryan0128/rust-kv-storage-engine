@@ -89,10 +89,43 @@ impl Ord for CandidateKey {
     }
 }
 
+const BORROWED_MERGE_SOURCES: usize = 8;
+
 enum Source {
     Memory { iter: MemScan, started: bool },
     Table(TableScan),
     Exhausted,
+}
+
+impl Source {
+    fn head(&self) -> Option<(&[u8], u64)> {
+        match self {
+            Self::Memory { iter, .. } => iter
+                .current()
+                .map(|(key, record)| (key.as_ref(), record.seq)),
+            Self::Table(iter) => iter.current().map(|record| (record.key, record.seq)),
+            Self::Exhausted => None,
+        }
+    }
+    fn owned_live_head(&self) -> Option<(Vec<u8>, Bytes)> {
+        match self {
+            Self::Memory { iter, .. } => {
+                let (key, record) = iter.current()?;
+                record
+                    .value
+                    .as_ref()
+                    .map(|value| (key.to_vec(), value.clone()))
+            }
+            Self::Table(iter) => {
+                let record = iter.current()?;
+                record
+                    .to_owned()
+                    .value
+                    .map(|value| (record.key.to_vec(), value))
+            }
+            Self::Exhausted => None,
+        }
+    }
 }
 
 /// An owned, forward iterator over one point-in-time key range.
@@ -104,8 +137,9 @@ enum Source {
 /// The iterator retains the database lock, overlapping immutable memory page groups and
 /// selected SST handles. Consumed sources release their handles early. Compaction may unlink those SSTs,
 /// but their disk space cannot be reclaimed while a scan still holds them.
-/// SST buffering is one encoded block plus one candidate key per source;
-/// scans bypass the point-read cache. Collecting the iterator allocates the full
+/// SST buffering is one encoded block per source. Small disk/mixed merges borrow
+/// their heads; larger merges additionally retain one candidate key per source.
+/// Scans bypass the point-read cache. Collecting the iterator allocates the full
 /// result in the caller. Later writes and batches do not change this snapshot.
 #[must_use = "scans read SST data only when iterated"]
 pub struct Scan {
@@ -114,6 +148,7 @@ pub struct Scan {
     heap: BinaryHeap<Reverse<(CandidateKey, usize, u64)>>,
     pending: Vec<usize>,
     initialized: bool,
+    borrowed_merge: bool,
     live_sources: usize,
 }
 
@@ -135,8 +170,13 @@ impl Scan {
                 .filter(|table| table.overlaps(&range))
                 .map(|table| Source::Table(table.scan(range.clone()))),
         );
+        let borrowed_merge = sources.len() <= BORROWED_MERGE_SOURCES
+            && sources
+                .iter()
+                .any(|source| matches!(source, Source::Table(_)));
         Self {
             engine: Some(engine),
+            borrowed_merge,
             live_sources: sources.len(),
             sources,
             heap: BinaryHeap::new(),
@@ -148,6 +188,7 @@ impl Scan {
     pub(crate) fn empty() -> Self {
         Self {
             engine: None,
+            borrowed_merge: false,
             sources: Vec::new(),
             heap: BinaryHeap::new(),
             pending: Vec::new(),
@@ -157,6 +198,7 @@ impl Scan {
     }
 
     fn advance(&mut self, index: usize) -> Result<()> {
+        let borrowed = self.borrowed_merge;
         match &mut self.sources[index] {
             Source::Memory { iter, started } => {
                 if *started {
@@ -164,24 +206,27 @@ impl Scan {
                 }
                 *started = true;
                 if let Some((key, record)) = iter.current() {
-                    self.heap.push(Reverse((
-                        CandidateKey::Shared(key.clone()),
-                        index,
-                        record.seq,
-                    )));
+                    if !borrowed {
+                        self.heap.push(Reverse((
+                            CandidateKey::Shared(key.clone()),
+                            index,
+                            record.seq,
+                        )));
+                    }
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
                 }
             }
             Source::Table(iter) => {
-                if let Some((key, seq)) = iter
-                    .advance(self.engine.as_ref().unwrap().scan_counters(), |record| {
-                        (record.key.to_vec(), record.seq)
+                if let Some(head) =
+                    iter.advance(self.engine.as_ref().unwrap().scan_counters(), |record| {
+                        (!borrowed).then(|| (CandidateKey::Owned(record.key.to_vec()), record.seq))
                     })?
                 {
-                    self.heap
-                        .push(Reverse((CandidateKey::Owned(key), index, seq)));
+                    if let Some((key, seq)) = head {
+                        self.heap.push(Reverse((key, index, seq)));
+                    }
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
@@ -211,6 +256,9 @@ impl Scan {
                     None => return Ok(None),
                 }
             }
+        }
+        if self.borrowed_merge {
+            return self.read_borrowed();
         }
         if !self.initialized {
             for index in 0..self.sources.len() {
@@ -250,21 +298,73 @@ impl Scan {
             };
             if let Some(value) = value {
                 if self.live_sources == 1 && self.sources.len() > 1 {
-                    // The head being returned is already consumed. The next
-                    // call can advance this sole remaining source directly.
-                    debug_assert!(self.heap.is_empty());
-                    let mut source =
-                        std::mem::replace(&mut self.sources[winner], Source::Exhausted);
-                    if let Source::Memory { iter, started } = &mut source {
-                        iter.advance();
-                        *started = false;
-                    }
-                    self.sources = vec![source];
-                    self.pending.clear();
+                    self.keep_only(winner);
                 }
                 return Ok(Some((key.into_vec(), value)));
             }
         }
+    }
+
+    // No key allocation for losing versions or deletions. The linear walk is
+    // bounded; large fan-in and memory-only merges keep the existing heap.
+    fn read_borrowed(&mut self) -> Result<Option<(Vec<u8>, Bytes)>> {
+        if !self.initialized {
+            for index in 0..self.sources.len() {
+                self.advance(index)?;
+            }
+            self.initialized = true;
+        }
+        loop {
+            while let Some(index) = self.pending.pop() {
+                self.advance(index)?;
+            }
+            let mut best: Option<(&[u8], usize, u64)> = None;
+            for (index, source) in self.sources.iter().enumerate() {
+                let Some((key, seq)) = source.head() else {
+                    continue;
+                };
+                match best {
+                    None => {
+                        self.pending.push(index);
+                        best = Some((key, index, seq));
+                    }
+                    Some((old, _, _)) if key < old => {
+                        self.pending.clear();
+                        self.pending.push(index);
+                        best = Some((key, index, seq));
+                    }
+                    Some((old, _, old_seq)) if key == old => {
+                        self.pending.push(index);
+                        if seq > old_seq {
+                            best = Some((key, index, seq));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some((_, winner, _)) = best else {
+                return Ok(None);
+            };
+            if let Some(item) = self.sources[winner].owned_live_head() {
+                if self.live_sources == 1 {
+                    self.keep_only(winner);
+                }
+                return Ok(Some(item));
+            }
+        }
+    }
+
+    fn keep_only(&mut self, winner: usize) {
+        // The returned memory head is consumed, while TableScan advances on
+        // its next call. Preserve that distinction without disk prefetch.
+        debug_assert!(self.heap.is_empty());
+        let mut source = std::mem::replace(&mut self.sources[winner], Source::Exhausted);
+        if let Source::Memory { iter, started } = &mut source {
+            iter.advance();
+            *started = false;
+        }
+        self.sources = vec![source];
+        self.pending.clear();
     }
 
     fn finish(&mut self) {
@@ -299,6 +399,80 @@ impl FusedIterator for Scan {}
 mod tests {
     use super::*;
     use crate::Options;
+
+    #[test]
+    fn borrowed_and_heap_merges_match_with_binary_keys_deletes_and_memory_tail() {
+        use crate::memtable::{MemIndex, Record};
+        use std::collections::BTreeMap;
+        for count in [1, 2, 3, 7, 8, 15] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tables = Vec::new();
+            let mut model = BTreeMap::new();
+            for generation in 0..count {
+                let rows: Vec<_> = (0..40u64)
+                    .map(|n| {
+                        let mut key = vec![0; 80];
+                        key.extend(n.to_be_bytes());
+                        let record = Record {
+                            seq: generation as u64 * 100 + n + 1,
+                            value: (n % 5 != generation as u64 % 5)
+                                .then(|| Bytes::from(vec![generation as u8; 128])),
+                        };
+                        model.insert(key.clone(), record.value.clone());
+                        (key, record)
+                    })
+                    .collect();
+                tables.push(Arc::new(
+                    Table::write(
+                        &dir.path().join(format!("{generation}.sst")),
+                        generation as u64 + 1,
+                        rows.into_iter().map(Ok),
+                        40,
+                        128,
+                        10,
+                    )
+                    .unwrap(),
+                ));
+            }
+            let mut memory = MemIndex::default();
+            memory.insert(
+                vec![255; 90],
+                Record {
+                    seq: 100_000,
+                    value: Some(Bytes::from_static(b"tail")),
+                },
+            );
+            model.insert(vec![255; 90], Some(Bytes::from_static(b"tail")));
+            let range = Arc::new(KeyRange::new(..).unwrap());
+            for force_heap in [false, true] {
+                let mut scan = Scan::new(
+                    Engine::new(),
+                    vec![memory.snapshot(range.clone()).unwrap()],
+                    &tables,
+                    range.clone(),
+                );
+                let borrowed = count < BORROWED_MERGE_SOURCES && !force_heap;
+                if force_heap {
+                    scan.borrowed_merge = false;
+                }
+                assert_eq!(scan.borrowed_merge, borrowed);
+                let mut expected = model
+                    .iter()
+                    .filter_map(|(key, value)| value.as_ref().map(|v| (key.clone(), v.clone())));
+                while let Some(row) = scan.next() {
+                    assert_eq!(row.unwrap(), expected.next().unwrap());
+                    if borrowed {
+                        assert!(
+                            scan.heap.is_empty(),
+                            "borrowed heads must not allocate heap keys"
+                        );
+                    }
+                }
+                assert!(expected.next().is_none());
+                assert!(scan.next().is_none());
+            }
+        }
+    }
 
     #[test]
     fn borrowed_memory_heads_merge_versions_and_switch_without_skipping() {

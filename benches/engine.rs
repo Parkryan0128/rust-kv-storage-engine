@@ -26,7 +26,8 @@ fn benches(c: &mut Criterion) {
                 .unwrap();
         })
     });
-    // Independent fixed fixture: filters and preceding write speed cannot change reads.
+    drop(e); // Join the previous maintenance worker before measuring another DB.
+             // Independent fixed fixture: filters and preceding write speed cannot change reads.
     let read_dir = tempfile::tempdir().unwrap();
     let read_db = Engine::open_with_options(read_dir.path(), Options::default()).unwrap();
     let keys = 20_000u64;

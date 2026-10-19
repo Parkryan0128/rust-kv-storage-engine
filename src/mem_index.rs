@@ -732,6 +732,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_snapshot_folds_preserve_each_generation_and_release_payloads() {
+        let mut map = MemIndex::default();
+        let mut model = std::collections::BTreeMap::new();
+        for n in 0..256u64 {
+            let r = Record {
+                seq: n + 1,
+                value: Some(Bytes::from(vec![0; 128])),
+            };
+            map.insert(n.to_be_bytes().to_vec(), r.clone());
+            model.insert(n.to_be_bytes().to_vec(), r);
+        }
+        let mut saved = Vec::new();
+        for generation in 1..=8u64 {
+            saved.push((map.snapshot(all()).unwrap(), model.clone()));
+            for n in 0..64u64 {
+                let key = ((n * 17 + generation * 7) % 256).to_be_bytes().to_vec();
+                let r = Record {
+                    seq: 1000 + generation * 64 + n,
+                    value: (n % 7 != 0).then(|| Bytes::from(vec![generation as u8; 1024])),
+                };
+                assert_eq!(map.insert(key.clone(), r.clone()), model.insert(key, r));
+            }
+        }
+        for (scan, expected) in saved {
+            assert_eq!(
+                scan.collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>()
+            );
+        }
+        for n in 0..256u64 {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: 10_000 + n,
+                    value: Some(Bytes::new()),
+                },
+            );
+        }
+        assert_eq!(map.groups[0].pages[0].value_bytes, 0);
+        assert!(map.groups[0].pages[0].updates.is_empty());
+    }
+
+    #[test]
     fn full_pages_keep_bounded_deltas_and_fold_only_visible_versions() {
         let mut map = MemIndex::default();
         for n in 0..256u64 {

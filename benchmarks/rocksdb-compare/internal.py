@@ -58,5 +58,5 @@ with (output / "results.jsonl").open("w") as sink:
                             count += 1
                             break
                 assert count == {"remaining_memory_scan_profile": 4, "current_cache_hit_profile": 1,
-                                 "snapshot_mutation_profile": 2}[profile], (profile, count)
+                                 "snapshot_mutation_profile": 3}[profile], (profile, count)
 print("INTERNAL_COMPLETE", flush=True)

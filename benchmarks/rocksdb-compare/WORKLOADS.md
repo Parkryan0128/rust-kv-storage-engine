@@ -230,3 +230,28 @@ repeat_scan_us outside the repeated-loop throughput timer. Reopen lazily learns 
 upper bounds in the engine; these are warm-OS-cache probes, not cold-device latency.
 The standalone Criterion read/mixed benchmarks use a fixed 20,000-key fixture,
 independent of selected filters and earlier write throughput.
+
+
+Warm range measurements and merge paths (October 18)
+--------------------------------------------------
+The first range-throughput pass still runs one trace. The warm repeat pass runs
+the identical seeded trace 32 times for span 32, or 16 times for span 512
+(two repetitions in smoke mode). All backends receive the same count; operation
+and row totals include those repetitions. Latency and full verification each
+run the trace once outside throughput timing. Results report
+throughput_trace_repetitions. This extends warm measurement without multiplying
+the expensive expected-value verification. Compare revisions with this same
+harness, not absolute timings from the former single-pass repeat measurement.
+
+Disk/mixed scans with at most eight selected sources compare borrowed heads.
+Only emitted rows allocate keys/values; larger merges retain the heap, and
+memory-only merges retain shared-key heads. The direct single-source path and
+lazy next-block reads are preserved.
+
+Production snapshot diagnostics warm 2,000 batches, then measure 40,000.
+In addition to distributed updates with/without a retained snapshot, the
+repeated-fold case retains successive snapshots over a 256-row page and updates
+64 distinct rows per batch. CPU diagnostics include snapshot creation/drop and
+report a separate batch timer. Internal memory-scan diagnostics also warm
+before longer fixed-count measurements. Criterion closes its sequential-write
+engine before preparing the independent read fixture.

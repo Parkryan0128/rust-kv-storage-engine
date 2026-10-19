@@ -395,12 +395,12 @@ impl Cache {
         if let Some(&index) = self.entries.get(&key) {
             self.remove(index);
         }
-        let live_before = self.entries.len();
         while self.bytes > self.capacity - size {
             self.remove(self.tail);
         }
-        // Compact only after a bulk eviction, never on an ordinary one-for-one miss.
-        if live_before.saturating_sub(self.entries.len()) >= 16 {
+        // Occupancy can fall gradually, including a victim recycled before insert.
+        // Check only sparse slots; shrink_metadata retains its 4x hysteresis.
+        if self.free.len() > self.entries.len().max(16) {
             self.shrink_metadata();
         }
         let index = self.free.pop().unwrap_or_else(|| {
@@ -471,6 +471,46 @@ mod tests {
     use super::*;
     use crate::memtable::Record;
     use bytes::Bytes;
+
+    #[test]
+    fn gradual_evictions_reclaim_metadata_with_a_fixed_budget() {
+        let small = block(16);
+        let charge = small.allocated_bytes() + ENTRY_OVERHEAD;
+        let budget = charge * 512;
+        let large = block(charge * 8);
+        let mut cache = Cache::new(budget);
+        for n in 0..512 {
+            cache.insert((1, n), small.clone());
+        }
+        let peak = cache.slots.capacity();
+        for n in 0..128 {
+            let before = cache.entries.len();
+            cache.insert((2, n), large.clone());
+            let removed = before + 1 - cache.entries.len();
+            assert!(removed < 16, "must exercise gradual eviction");
+            assert_eq!(cache.capacity, budget);
+            assert!(cache.bytes() <= budget);
+        }
+        assert!(cache.entries.len() < 64);
+        assert!(cache.slots.capacity() < peak);
+        assert!(cache.slots.capacity() <= cache.entries.len().max(16) * 4);
+        assert!(cache.entries.capacity() <= cache.entries.len().max(16) * 4);
+        let live = cache.entries.len();
+        let mut cursor = cache.head;
+        for n in (128 - live..128).rev() {
+            let entry = cache.slots[cursor].as_ref().unwrap();
+            assert_eq!(entry.key, CacheKey::from((2, n)));
+            cursor = entry.next;
+        }
+        assert_eq!(cursor, NONE);
+        assert_eq!(small.get(b"k").unwrap().value.unwrap().len(), 16);
+        for n in 0..512 {
+            cache.insert((3, n), small.clone());
+        }
+        assert_eq!(cache.entries.len(), 512);
+        assert!(cache.get((2, 127)).is_none());
+        assert!(Arc::ptr_eq(&cache.get((3, 511)).unwrap(), &small));
+    }
 
     #[test]
     fn ordinary_bulk_eviction_reclaims_metadata_without_resizing_budget() {

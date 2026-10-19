@@ -2,6 +2,82 @@ use super::*;
 use std::{io, sync::mpsc::sync_channel, time::Duration};
 
 #[test]
+fn borrowed_mixed_merge_crosses_groups_and_survives_publication() {
+    use std::{collections::BTreeMap, ops::Bound};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open_with_options(
+        dir.path(),
+        Options {
+            memtable_size_limit: 64 * 1024 * 1024,
+            max_immutable_memtables: 4,
+            compaction_file_threshold: 1000,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut expected = BTreeMap::new();
+    let mut batch = WriteBatch::new();
+    for n in 0..24_000u64 {
+        let key = n.to_be_bytes();
+        batch.put(key, [0; 16]);
+        expected.insert(key.to_vec(), Bytes::from(vec![0; 16]));
+    }
+    db.write_batch(batch).unwrap();
+    db.flush().unwrap();
+    let maintenance = db.inner.core.maintenance.lock();
+    let mut batch = WriteBatch::new();
+    for n in 0..20_000u64 {
+        let key = n.to_be_bytes();
+        batch.put(key, [1; 16]);
+        expected.insert(key.to_vec(), Bytes::from(vec![1; 16]));
+    }
+    db.write_batch(batch).unwrap();
+    db.inner
+        .core
+        .freeze(&mut db.inner.core.writer.lock())
+        .unwrap();
+    let mut batch = WriteBatch::new();
+    for n in 0..10_000u64 {
+        let key = n.to_be_bytes();
+        if n % 7 == 0 {
+            batch.delete(key);
+            expected.remove(key.as_slice());
+        } else {
+            batch.put(key, [2; 16]);
+            expected.insert(key.to_vec(), Bytes::from(vec![2; 16]));
+        }
+    }
+    db.write_batch(batch).unwrap();
+    let lo = 0u64.to_be_bytes();
+    let hi = 23_998u64.to_be_bytes();
+    let mut scan = db
+        .scan((
+            Bound::Excluded(lo.as_slice()),
+            Bound::Included(hi.as_slice()),
+        ))
+        .unwrap();
+    let mut expected = expected
+        .into_iter()
+        .filter(|(key, _)| key.as_slice() > lo.as_slice() && key.as_slice() <= hi.as_slice());
+    for _ in 0..100 {
+        assert_eq!(scan.next().unwrap().unwrap(), expected.next().unwrap());
+    }
+    drop(maintenance);
+    let mut later = WriteBatch::new();
+    later
+        .delete(16_384u64.to_be_bytes())
+        .put(23_997u64.to_be_bytes(), [9; 16]);
+    db.write_batch(later).unwrap();
+    db.compact().unwrap();
+    assert_eq!(
+        scan.by_ref().collect::<Result<Vec<_>>>().unwrap(),
+        expected.collect::<Vec<_>>()
+    );
+    assert!(scan.next().is_none());
+    assert!(scan.next().is_none());
+}
+
+#[test]
 fn single_source_scan_keeps_bounds_deletions_and_snapshot() {
     for disk in [false, true] {
         let dir = tempfile::tempdir().unwrap();

@@ -105,7 +105,7 @@ def main():
             "read_layout": "Identical logical public-API write history; automatic compaction disabled; physical SST counts may differ",
             "write_layout": "Each engine's normal background compaction; no compression; 4 MiB memtable target",
             "scan_cache": "No fill on either backend; existing cached blocks may still benefit RocksDB",
-            "cache_state": "Pristine fixture copy and warm OS file cache before every read process; fresh engine cache on first pass; same trace repeated",
+            "cache_state": "Pristine fixture copy and warm OS file cache before every read process; fresh engine cache on first pass; identical seeded scan trace repeated 16/32 times for warm throughput only",
             "latency": "Separate warm pass: point API call only; scan creation/consumption/drop, no expected-value construction or verification",
             "throughput": "v2: includes RNG and owned result/drop; excludes full verification, per-query timers, worker startup/join. Identical seeded full verification runs after timing. Not directly comparable to earlier v1 absolute rates.",
             "memory": "Read RSS/HWM excludes fixture creation but includes harness/runtime; OS page cache excluded",
@@ -166,6 +166,8 @@ def main():
                         config = dict(profile, **scenario, seed=7919 + trial * 104729)
                         if profile["value"] == 4096 and scenario["workload"] == "scan":
                             config["queries"] = 96 if scenario["span"] == 32 else 48
+                        if scenario["workload"] == "scan":
+                            config["scan_repeat_passes"] = 2 if args.smoke else (32 if scenario["span"] == 32 else 16)
                         offset_backend = (trial - 1) % len(binaries)
                         order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
                         for order, name in enumerate(order_names, 1):

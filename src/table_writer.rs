@@ -221,6 +221,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alternating_large_and_small_output_preserves_records_and_reclaims_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bursts.sst");
+        let mut writer = TableWriter::new(&path, 48, 4096, 10, false).unwrap();
+        let giant = vec![5; 1024 * 1024];
+        for n in 0..48u64 {
+            writer
+                .push(
+                    &n.to_be_bytes(),
+                    n + 1,
+                    Some(if n % 8 == 0 {
+                        giant.as_slice()
+                    } else {
+                        &[6; 2048]
+                    }),
+                )
+                .unwrap();
+        }
+        assert!(writer.block.capacity() <= 8192);
+        let table = Arc::new(writer.finish(&path, 1, 10).unwrap());
+        let mut cursor = TableCursor::new(table).unwrap();
+        for n in 0..48u64 {
+            let row = cursor.current().unwrap();
+            assert_eq!(row.key, n.to_be_bytes());
+            assert_eq!(
+                row.value.unwrap(),
+                if n % 8 == 0 {
+                    giant.as_slice()
+                } else {
+                    &[6; 2048]
+                }
+            );
+            cursor.advance().unwrap();
+        }
+        assert!(cursor.current().is_none());
+    }
+
+    #[test]
     fn output_scratch_shrinks_after_small_blocks_but_reuses_consecutive_giants() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scratch.sst");

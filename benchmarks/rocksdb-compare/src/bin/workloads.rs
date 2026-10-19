@@ -22,6 +22,7 @@ struct Config {
     memtable: usize,
     generations: usize,
     queries: usize,
+    scan_repeat_passes: usize,
     seed: u64,
     fixed: bool,
     churn: bool,
@@ -43,6 +44,7 @@ impl Config {
             memtable: n("memtable", 4 * 1024 * 1024) as usize,
             generations: n("generations", 4) as usize,
             queries: n("queries", 20000) as usize,
+            scan_repeat_passes: n("scan_repeat_passes", 1) as usize,
             seed: n("seed", 7919),
             fixed: v["fixed"].as_bool().unwrap_or(true),
             churn: v["churn"].as_bool().unwrap_or(false),
@@ -62,7 +64,7 @@ impl Config {
                 && (1..=16).contains(&c.threads)
         );
         assert!(c.span > 0 && c.span <= c.keys);
-        assert!(c.memtable > 0);
+        assert!(c.memtable > 0 && (1..=256).contains(&c.scan_repeat_passes));
         assert!(matches!(
             c.wal_pattern.as_str(),
             "sorted" | "random" | "overwrite"
@@ -428,10 +430,20 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     for stage in ["first", "repeat"] {
         let before = metrics(path)?;
         let stats_before = db.stats()?;
+        // The first trace remains untouched. Repeat identical seeded traces
+        // only after the first latency/verification passes have warmed the DB.
+        let repetitions = if stage == "repeat" && c.workload == "scan" {
+            c.scan_repeat_passes
+        } else {
+            1
+        };
         let (seconds, row_count) = if c.workload == "scan" {
             let start = Instant::now();
-            let measured = scan_reads(&db, c, ReadPass::Throughput)?;
-            (start.elapsed().as_secs_f64(), measured.rows)
+            let mut rows = 0;
+            for _ in 0..repetitions {
+                rows += scan_reads(&db, c, ReadPass::Throughput)?.rows;
+            }
+            (start.elapsed().as_secs_f64(), rows)
         } else {
             (throughput_reads(&db, c)?, 0)
         };
@@ -440,7 +452,7 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         let stats_after = db.stats()?;
         let (mut samples, mut first_rows) = if c.workload == "scan" {
             let measured = scan_reads(&db, c, ReadPass::Latency)?;
-            assert_eq!(measured.rows, row_count);
+            assert_eq!(measured.rows * repetitions, row_count);
             (measured.latency, measured.first_rows)
         } else if c.throughput {
             (Vec::new(), Vec::new())
@@ -449,17 +461,25 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         };
         // Verify the exact same seeded queries outside every timed pass.
         if c.workload == "scan" {
-            assert_eq!(scan_reads(&db, c, ReadPass::Verify)?.rows, row_count);
+            assert_eq!(
+                scan_reads(&db, c, ReadPass::Verify)?.rows * repetitions,
+                row_count
+            );
         } else {
             for worker in 0..c.threads {
                 point_reads(&db, c, worker, ReadPass::Verify)?;
             }
         }
-        let operations = c.queries * if c.workload == "scan" { 1 } else { c.threads };
+        let operations = c.queries
+            * if c.workload == "scan" {
+                repetitions
+            } else {
+                c.threads
+            };
         report(
             stage,
             raw,
-            json!({"operations":operations,"rows":row_count,"seconds":seconds,
+            json!({"operations":operations,"rows":row_count,"throughput_trace_repetitions":repetitions,"seconds":seconds,
             "ops_per_second":operations as f64/seconds,"latency":distribution(&mut samples),
             "first_row_latency":distribution(&mut first_rows),"before":before,"after":after,
             "stats_before":stats_before,"stats_after":stats_after,
