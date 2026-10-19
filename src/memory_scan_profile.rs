@@ -47,7 +47,7 @@ fn remaining_memory_scan_profile() -> Result<()> {
                         black_box(row?);
                     }
                 }
-                let queries = if consumed == keys { 100 } else { 200_000 };
+                let queries = if consumed == keys { 200 } else { 400_000 };
                 let start = Instant::now();
                 for _ in 0..queries {
                     let one = Instant::now();

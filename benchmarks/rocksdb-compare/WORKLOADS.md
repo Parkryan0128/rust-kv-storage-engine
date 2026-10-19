@@ -235,7 +235,7 @@ independent of selected filters and earlier write throughput.
 Warm range measurements and merge paths (October 18)
 --------------------------------------------------
 The first range-throughput pass still runs one trace. The warm repeat pass runs
-the identical seeded trace 32 times for span 32, or 16 times for span 512
+the identical seeded trace 96 times for span 32, or 24 times for span 512
 (two repetitions in smoke mode). All backends receive the same count; operation
 and row totals include those repetitions. Latency and full verification each
 run the trace once outside throughput timing. Results report
@@ -244,7 +244,7 @@ the expensive expected-value verification. Compare revisions with this same
 harness, not absolute timings from the former single-pass repeat measurement.
 
 Disk/mixed scans with at most eight selected sources compare borrowed heads.
-Only emitted rows allocate keys/values; larger merges retain the heap, and
+During the borrowed merge only emitted rows allocate keys/values; larger merges retain the heap, and
 memory-only merges retain shared-key heads. The direct single-source path and
 lazy next-block reads are preserved.
 

@@ -198,7 +198,6 @@ impl Scan {
     }
 
     fn advance(&mut self, index: usize) -> Result<()> {
-        let borrowed = self.borrowed_merge;
         match &mut self.sources[index] {
             Source::Memory { iter, started } => {
                 if *started {
@@ -206,27 +205,24 @@ impl Scan {
                 }
                 *started = true;
                 if let Some((key, record)) = iter.current() {
-                    if !borrowed {
-                        self.heap.push(Reverse((
-                            CandidateKey::Shared(key.clone()),
-                            index,
-                            record.seq,
-                        )));
-                    }
+                    self.heap.push(Reverse((
+                        CandidateKey::Shared(key.clone()),
+                        index,
+                        record.seq,
+                    )));
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
                 }
             }
             Source::Table(iter) => {
-                if let Some(head) =
-                    iter.advance(self.engine.as_ref().unwrap().scan_counters(), |record| {
-                        (!borrowed).then(|| (CandidateKey::Owned(record.key.to_vec()), record.seq))
+                if let Some((key, seq)) = iter
+                    .advance(self.engine.as_ref().unwrap().scan_counters(), |record| {
+                        (record.key.to_vec(), record.seq)
                     })?
                 {
-                    if let Some((key, seq)) = head {
-                        self.heap.push(Reverse((key, index, seq)));
-                    }
+                    self.heap
+                        .push(Reverse((CandidateKey::Owned(key), index, seq)));
                 } else {
                     self.sources[index] = Source::Exhausted;
                     self.live_sources -= 1;
@@ -307,16 +303,37 @@ impl Scan {
 
     // No key allocation for losing versions or deletions. The linear walk is
     // bounded; large fan-in and memory-only merges keep the existing heap.
+    fn advance_borrowed(&mut self, index: usize) -> Result<()> {
+        let live = match &mut self.sources[index] {
+            Source::Memory { iter, started } => {
+                if *started {
+                    iter.advance();
+                }
+                *started = true;
+                iter.current().is_some()
+            }
+            Source::Table(iter) => iter
+                .advance(self.engine.as_ref().unwrap().scan_counters(), |_| ())?
+                .is_some(),
+            Source::Exhausted => return Ok(()),
+        };
+        if !live {
+            self.sources[index] = Source::Exhausted;
+            self.live_sources -= 1;
+        }
+        Ok(())
+    }
+
     fn read_borrowed(&mut self) -> Result<Option<(Vec<u8>, Bytes)>> {
         if !self.initialized {
             for index in 0..self.sources.len() {
-                self.advance(index)?;
+                self.advance_borrowed(index)?;
             }
             self.initialized = true;
         }
         loop {
             while let Some(index) = self.pending.pop() {
-                self.advance(index)?;
+                self.advance_borrowed(index)?;
             }
             let mut best: Option<(&[u8], usize, u64)> = None;
             for (index, source) in self.sources.iter().enumerate() {
