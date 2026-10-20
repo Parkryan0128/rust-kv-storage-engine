@@ -133,3 +133,10 @@ a visible manifest rename or empty WAL may have survived a process interruption
 before its parent directory was synced. Reopen must publish those entries
 before deleting old files or accepting new writes. This is covered by an
 interrupted-publication regression fixture and the existing crash tests.
+
+Copied benchmark fixtures are file-synced and directory-synced, then read to
+warm the OS cache before starting a measured child process. This prevents
+dirty copytree output from charging fixture publication to one backend during
+a later timed compaction merely because its open path performs fewer syncs.
+The preparation is identical for baseline, current and RocksDB and excluded
+from the reported child-process throughput.

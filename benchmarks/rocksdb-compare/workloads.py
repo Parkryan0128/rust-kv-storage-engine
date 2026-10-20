@@ -16,11 +16,25 @@ def capture(*args):
 
 
 def warm(path):
-    for file in sorted(path.rglob("*")):
+    # copytree leaves dirty file data and directory entries. Establish the same
+    # durable starting state for every backend before its open/timed operations;
+    # otherwise an open optimization can shift fixture-publication I/O into
+    # a later measured compaction. This preparation is outside all child timers.
+    entries = sorted(path.rglob("*"))
+    for file in entries:
         if file.is_file():
             with file.open("rb") as source:
+                os.fsync(source.fileno())
                 while source.read(1024 * 1024):
                     pass
+    directories = sorted((p for p in entries if p.is_dir()),
+                         key=lambda p: len(p.parts), reverse=True)
+    for directory in directories + [path, path.parent]:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def summarize(records, baseline=False):
