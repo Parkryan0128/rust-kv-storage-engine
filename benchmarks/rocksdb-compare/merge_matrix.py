@@ -30,7 +30,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
     binaries = {name: Path("comparison-bin", "workloads-" + name).resolve() for name in names}
-    cases = [(f"n{n}-k{key_bytes}-{shape}", dict(keys=8192, value=128, generations=n,
+    cases = [(f"n{n}-k{key_bytes}-{shape}", dict(keys=32768 if shape == "distinct" else 8192, value=128, generations=n,
               block=4096, merge_key_bytes=key_bytes, churn=shape != "distinct",
               merge_deletes=shape == "deletes"))
              for n in [2, 4, 8, 9, 16] for key_bytes in [8, 136]
@@ -40,7 +40,7 @@ def main():
         "baseline": capture("git", "-C", "baseline", "rev-parse", "HEAD"),
         "platform": platform.platform(), "cpu": capture("lscpu"),
         "rust": capture("rustc", "--version"), "trials": 6,
-        "semantics": "Each trial gets a pristine fixture copy and warm OS cache. Baseline/current use identical SST bytes prepared by baseline; RocksDB uses the same logical write history. 2/4/8/9/16 flushed generations, 8/136-byte common-prefix keys, distinct/overlap/deletion histories, automatic compaction disabled, no compression. All keys verified after compact and reopen outside timing. Final baseline/current SST files must match byte for byte.",
+        "semantics": "Each trial gets a pristine fixture copy and warm OS cache. Baseline/current use identical SST bytes prepared by baseline; RocksDB uses the same logical write history. 2/4/8/9/16 flushed generations, 8/136-byte common-prefix keys, distinct/overlap/deletion histories, 32768 distinct keys or 8192 keys per overlapping generation, automatic compaction disabled, no compression. All keys verified after compact and reopen outside timing. Final baseline/current SST files must match byte for byte.",
         "limits": "Shared CI, warm OS cache, bounded single compactions. Different native table layouts and compaction policies across engine/RocksDB. No claim about sustained writes, cold devices or fsync-tail causality.",
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
     }

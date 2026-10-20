@@ -10,7 +10,8 @@ mod selector;
 use selector::Tournament;
 pub(crate) const MAX_INPUTS: usize = 16;
 pub(crate) const INPUT_BUFFER_BUDGET: usize = 512 * 1024;
-const TOURNAMENT_INPUTS: usize = 9;
+// Actual publisher measurements favor the tree at the largest fan-in.
+const TOURNAMENT_INPUTS: usize = 16;
 
 // Budget encoded input buffers, including reuse slack and legacy offset arrays.
 // Two inputs are always allowed so oversized records cannot prevent progress.
@@ -127,14 +128,30 @@ impl Merge {
     ) -> Result<Option<T>> {
         loop {
             let newest = if let Some(tree) = &mut self.tournament {
+                // A dense duplicate group already requires advancing most
+                // sources. Linear selection avoids repairing most tree nodes
+                // as well; rebuild only when sparse groups resume.
+                let dense = self.pending.len() >= self.cursors.len().div_ceil(2);
+                let rebuild = tree.is_stale();
                 let mut dirty = 0;
                 while let Some(i) = self.pending.pop() {
                     self.cursors[i].advance()?;
-                    dirty |= tree.update_leaf(i, &self.cursors);
+                    if !dense && !rebuild {
+                        dirty |= tree.update_leaf(i, &self.cursors);
+                    }
                 }
-                tree.repair(dirty, &self.cursors);
-                tree.selected(&mut self.pending)
-                    .and_then(|i| self.cursors[i].current())
+                if dense {
+                    tree.invalidate();
+                    Self::select_linear(&self.cursors, &mut self.pending)
+                } else {
+                    if rebuild {
+                        tree.rebuild(&self.cursors);
+                    } else {
+                        tree.repair(dirty, &self.cursors);
+                    }
+                    tree.selected(&mut self.pending)
+                        .and_then(|i| self.cursors[i].current())
+                }
             } else {
                 while let Some(i) = self.pending.pop() {
                     self.cursors[i].advance()?;

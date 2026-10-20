@@ -5,7 +5,7 @@ use bytes::Bytes;
 fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
     let dir = tempfile::tempdir().unwrap();
     for long_keys in [false, true] {
-        for shape in ["distinct", "overlap", "mixed"] {
+        for shape in ["distinct", "overlap", "mixed", "hybrid"] {
             let key = |n: u64| {
                 let mut key = if long_keys { vec![b'x'; 128] } else { vec![] };
                 key.extend_from_slice(&n.to_be_bytes());
@@ -19,8 +19,10 @@ fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
                         source != 3 && (shape != "mixed" || (row + source as u64) % 3 != 0)
                     })
                     .map(|row| {
-                        let n = if shape == "distinct" {
+                        let n = if shape == "distinct" || (shape == "hybrid" && row % 8 != 0) {
                             row * 16 + source as u64
+                        } else if shape == "hybrid" {
+                            row * 16
                         } else {
                             row
                         };

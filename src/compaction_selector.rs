@@ -13,6 +13,7 @@ struct Head {
 pub(super) struct Tournament {
     nodes: [Head; MAX_INPUTS * 2],
     leaves: usize,
+    stale: bool,
 }
 
 impl Tournament {
@@ -21,14 +22,28 @@ impl Tournament {
         let mut out = Self {
             nodes: [Head::default(); MAX_INPUTS * 2],
             leaves: cursors.len().next_power_of_two(),
+            stale: false,
         };
-        for i in 0..cursors.len() {
-            out.update_leaf(i, cursors);
-        }
-        for node in (1..out.leaves).rev() {
-            out.combine(node, cursors);
-        }
+        out.rebuild(cursors);
         out
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    pub fn invalidate(&mut self) {
+        self.stale = true;
+    }
+
+    pub fn rebuild(&mut self, cursors: &[TableCursor]) {
+        for i in 0..cursors.len() {
+            self.update_leaf(i, cursors);
+        }
+        for node in (1..self.leaves).rev() {
+            self.combine(node, cursors);
+        }
+        self.stale = false;
     }
 
     pub fn update_leaf(&mut self, source: usize, cursors: &[TableCursor]) -> u32 {
