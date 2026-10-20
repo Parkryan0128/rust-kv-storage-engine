@@ -129,7 +129,7 @@ fn tournament_visits_corrupt_losing_sources_before_publication() {
             Some(Err(crate::EngineError::Corruption(_)))
         ));
         assert!(merge.next().is_none());
-        let output = dir.path().join("output.sst");
+        let output = dir.path().join(format!("output-{count}.sst"));
         assert!(matches!(
             Table::write_with(&output, 1000, 48, 64, 10, |writer| {
                 Merge::new(inputs, true)?.write_into(writer)
