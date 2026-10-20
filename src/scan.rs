@@ -91,13 +91,14 @@ impl Ord for CandidateKey {
 
 const BORROWED_MERGE_SOURCES: usize = 8;
 
-#[cfg(test)]
+// Keep default release-libtest timing free of key-count instrumentation.
+#[cfg(all(test, feature = "fault-injection"))]
 thread_local! {
     static COPIED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[inline]
 pub(crate) fn copy_scan_key(key: &[u8]) -> Vec<u8> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fault-injection"))]
     COPIED_KEYS.with(|count| count.set(count.get() + 1));
     key.to_vec()
 }
@@ -475,6 +476,7 @@ mod tests {
                         range,
                     )
                 };
+                #[cfg(feature = "fault-injection")]
                 COPIED_KEYS.with(|n| n.set(0));
                 let actual = scan.by_ref().collect::<Result<Vec<_>>>().unwrap();
                 let expected: Vec<_> = rows[start..end]
@@ -482,6 +484,7 @@ mod tests {
                     .filter_map(|(key, r)| r.value.clone().map(|v| (key.clone(), v)))
                     .collect();
                 assert_eq!(actual, expected);
+                #[cfg(feature = "fault-injection")]
                 assert_eq!(COPIED_KEYS.with(|n| n.get()), expected.len());
                 assert!(scan.next().is_none());
             }

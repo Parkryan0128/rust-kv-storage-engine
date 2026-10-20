@@ -21,7 +21,8 @@ permissions:
   contents: read
 concurrency:
   group: write-comparison-${{ github.ref }}
-  cancel-in-progress: false
+  # Explicit replacement runs supersede stale measurements after a harness fix.
+  cancel-in-progress: contains(github.event.head_commit.message, '[replace-perf]')
 jobs:
   compare:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]')
