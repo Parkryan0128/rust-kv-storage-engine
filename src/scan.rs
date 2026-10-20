@@ -91,6 +91,17 @@ impl Ord for CandidateKey {
 
 const BORROWED_MERGE_SOURCES: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    static COPIED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[inline]
+pub(crate) fn copy_scan_key(key: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    COPIED_KEYS.with(|count| count.set(count.get() + 1));
+    key.to_vec()
+}
+
 enum Source {
     Memory { iter: MemScan, started: bool },
     Table(TableScan),
@@ -239,16 +250,19 @@ impl Scan {
         if let [source] = self.sources.as_mut_slice() {
             loop {
                 let item = match source {
-                    Source::Memory { iter, .. } => iter.next().map(|(key, r)| (key, r.value)),
-                    Source::Table(iter) => iter
-                        .advance(self.engine.as_ref().unwrap().scan_counters(), |r| {
-                            (r.key.to_vec(), r.to_owned().value)
-                        })?,
+                    Source::Memory { iter, .. } => iter.next_live().map(Some),
+                    Source::Table(iter) => {
+                        iter.advance(self.engine.as_ref().unwrap().scan_counters(), |r| {
+                            r.to_owned()
+                                .value
+                                .map(|value| (copy_scan_key(r.key), value))
+                        })?
+                    }
                     Source::Exhausted => None,
                 };
                 match item {
-                    Some((key, Some(value))) => return Ok(Some((key, value))),
-                    Some((_, None)) => continue,
+                    Some(Some(row)) => return Ok(Some(row)),
+                    Some(None) => continue,
                     None => return Ok(None),
                 }
             }
@@ -416,6 +430,142 @@ impl FusedIterator for Scan {}
 mod tests {
     use super::*;
     use crate::Options;
+
+    #[test]
+    fn single_source_copies_only_live_keys_across_pages_and_bounds() {
+        use crate::memtable::{MemIndex, Record};
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = MemIndex::default();
+        let rows: Vec<_> = (0..1200u64)
+            .map(|n| {
+                let mut key = vec![7; 128];
+                key.extend(n.to_be_bytes());
+                let record = Record {
+                    seq: n + 1,
+                    value: (n % 17 == 0).then(|| Bytes::from_static(b"live")),
+                };
+                memory.insert(key.clone(), record.clone());
+                (key, record)
+            })
+            .collect();
+        let table = Arc::new(
+            Table::write(
+                &dir.path().join("one.sst"),
+                1,
+                rows.clone().into_iter().map(Ok),
+                rows.len() as u64,
+                512,
+                10,
+            )
+            .unwrap(),
+        );
+        for disk in [false, true] {
+            for (start, end) in [(0, 1200), (1, 17), (250, 800)] {
+                let lo = &rows[start].0;
+                let mut upper = vec![7; 128];
+                upper.extend((end as u64).to_be_bytes());
+                let range = Arc::new(KeyRange::new(lo.as_slice()..upper.as_slice()).unwrap());
+                let mut scan = if disk {
+                    Scan::new(Engine::new(), vec![], std::slice::from_ref(&table), range)
+                } else {
+                    Scan::new(
+                        Engine::new(),
+                        vec![memory.snapshot(range.clone()).unwrap()],
+                        &[],
+                        range,
+                    )
+                };
+                COPIED_KEYS.with(|n| n.set(0));
+                let actual = scan.by_ref().collect::<Result<Vec<_>>>().unwrap();
+                let expected: Vec<_> = rows[start..end]
+                    .iter()
+                    .filter_map(|(key, r)| r.value.clone().map(|v| (key.clone(), v)))
+                    .collect();
+                assert_eq!(actual, expected);
+                assert_eq!(COPIED_KEYS.with(|n| n.get()), expected.len());
+                assert!(scan.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn multi_source_late_errors_are_lazy_fused_and_release_the_database() {
+        use std::fs;
+        for count in [2, 8, 9] {
+            for force_heap in [false, true] {
+                for truncate in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = Engine::open_with_options(
+                        dir.path(),
+                        Options {
+                            block_size: 64,
+                            compaction_file_threshold: 1000,
+                            ..Options::default()
+                        },
+                    )
+                    .unwrap();
+                    for generation in 0..count {
+                        let mut batch = crate::WriteBatch::new();
+                        for key in [b"a", b"b", b"c"] {
+                            batch.put(key, [generation as u8; 64]);
+                        }
+                        db.write_batch(batch).unwrap();
+                        db.flush().unwrap();
+                    }
+                    let path = fs::read_dir(dir.path().join("sst"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let original = fs::read(&path).unwrap();
+                    let second =
+                        8 + 12 + u32::from_le_bytes(original[8..12].try_into().unwrap()) as usize;
+                    if truncate {
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .unwrap()
+                            .set_len(second as u64)
+                            .unwrap();
+                    } else {
+                        let mut damaged = original.clone();
+                        damaged[second + 12] ^= 1;
+                        fs::write(&path, damaged).unwrap();
+                    }
+                    let make_scan = || {
+                        let mut scan = db.scan(..).unwrap();
+                        assert_eq!(scan.sources.len(), count);
+                        if force_heap {
+                            scan.borrowed_merge = false;
+                        }
+                        scan
+                    };
+                    let before = db.stats().block_reads;
+                    let first = make_scan().take(1).collect::<Result<Vec<_>>>().unwrap();
+                    assert_eq!(first[0].0, b"a");
+                    assert_eq!(first[0].1.as_ref(), &[(count - 1) as u8; 64]);
+                    assert_eq!(db.stats().block_reads - before, count as u64);
+                    let mut scan = make_scan();
+                    assert_eq!(scan.next().unwrap().unwrap().0, b"a");
+                    drop(db);
+                    assert!(matches!(Engine::open(dir.path()), Err(EngineError::Locked)));
+                    let error = scan.next().unwrap().unwrap_err();
+                    if truncate {
+                        assert!(matches!(error, EngineError::Io(_)));
+                    } else {
+                        assert!(matches!(error, EngineError::Corruption(_)));
+                    }
+                    assert!(scan.next().is_none());
+                    assert!(scan.next().is_none());
+                    // Restore the fixture so reopening checks pin/lock release,
+                    // independently of the intentionally damaged table.
+                    fs::write(&path, original).unwrap();
+                    assert!(Engine::open(dir.path()).is_ok());
+                }
+            }
+        }
+    }
 
     #[test]
     fn borrowed_and_heap_merges_match_with_binary_keys_deletes_and_memory_tail() {
@@ -616,3 +766,7 @@ mod tests {
         assert_eq!(scan.collect::<Result<Vec<_>>>().unwrap().len(), 3);
     }
 }
+
+#[cfg(test)]
+#[path = "scan_profile.rs"]
+mod scan_profile;

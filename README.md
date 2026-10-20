@@ -107,7 +107,7 @@ creation clones group handles instead of touching every page or matching key.
 Keys are copied when consumed; completed groups and sources are released. A
 boundary slice of at most four pages retains only those pages; larger boundary
 groups can still retain pages outside the requested range. Shared-page updates
-copy a bounded delta (up to 16 records), sharing unchanged keys and values.
+copy a bounded delta (16–32 records, depending on page occupancy), sharing unchanged keys and values.
 Once a base is exclusively owned again, the next update folds pending deltas in place and releases superseded payloads. Sorted appends fill pages before allocating the next page; middle inserts retain balanced splitting.
 Structural edits and shared delta folds copy the page contents, so retaining a snapshot
 can still increase write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,

@@ -97,3 +97,25 @@ Use equal-size rows to compare engines. A smaller block
 can reduce miss processing but increases the index and may affect writes and
 scans, which this benchmark does not measure. Reports retain every block size,
 RSS and SST bytes rather than reporting only the fastest configuration.
+
+## Paired workload and audit suite
+
+The separate write-comparison workflow builds the same workloads harness
+against the selected baseline, current engine and RocksDB. Unlike the older
+random-read runner above, this suite returns owned values on all backends.
+Paired durable batch cases now use at least 1,024 commits and an explicit 64 MiB
+memtable budget; flush pressure remains a separate case. These larger cases
+must not be compared directly to historical 32-commit / 4 MiB measurements.
+Snapshot-write32 runs 2,000 iterations; total throughput includes snapshot
+creation, input generation and verification, while batch_seconds and
+batch_latency isolate the batch call.
+
+With [audit-perf] alongside a performance trigger, the workflow also measures
+128-byte-prefix tombstone scans (memory and SST), repeated warm reopen, and
+separate instrumented baseline/current write phases. Phase builds perturb
+timing and are for attribution, not throughput rankings. The ignored
+merge_policy_profile experiment compares borrowed and heap merging at
+2/4/8/9/16 SST sources, short/long keys, disjoint/overlapping histories and
+deletions. It checks both outputs before timing. This is a warm release-libtest
+policy experiment, not an end-to-end RocksDB comparison; its 80 ms samples
+should be treated as supporting evidence rather than a universal threshold.

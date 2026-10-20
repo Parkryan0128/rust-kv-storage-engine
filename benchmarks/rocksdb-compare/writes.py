@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import platform
 import statistics
+import shutil
 import subprocess
 import tempfile
 
@@ -35,9 +36,9 @@ def main():
     }
     cases = [
         ("put-128b", {"keys": 8192, "value": 128, "batch": 1, "workload": "put"}),
-        ("batch32-128b", {"keys": 16384, "value": 128, "batch": 32, "workload": "batch"}),
-        # At least 100 commits without rotating the default 4 MiB buffer.
-        ("batch256-16b", {"keys": 32768, "value": 16, "batch": 256, "workload": "batch"}),
+        ("batch32-128b", {"keys": 32768, "value": 128, "batch": 32, "memtable": 67108864, "workload": "batch"}),
+        # 1024 commits with an explicit 64 MiB budget; pressure remains separate.
+        ("batch256-16b", {"keys": 262144, "value": 16, "batch": 256, "memtable": 67108864, "workload": "batch"}),
         ("flush-pressure", {"keys": 32768, "value": 128, "batch": 32, "workload": "batch", "memtable": 262144}),
     ]
     records = []
@@ -76,6 +77,7 @@ def main():
                         output.write(json.dumps(row) + "\n")
                         output.flush()
                         print("WRITE_RESULT " + json.dumps(row), flush=True)
+                        shutil.rmtree(root / label)
     summary = []
     for case, _ in cases:
         for name in names:

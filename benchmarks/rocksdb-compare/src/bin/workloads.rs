@@ -820,6 +820,8 @@ fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     populate_memory(&db, c)?;
     let mut generations = vec![0u8; c.keys as usize];
     let mut writes = Vec::new();
+    #[cfg(feature = "write-profiling")]
+    let mut phase_samples = Vec::new();
     let before = metrics(path)?;
     let start = Instant::now();
     for round in 0..c.queries {
@@ -844,7 +846,11 @@ fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
             .collect();
         let one = Instant::now();
         db.batch(&entries)?;
-        writes.push(one.elapsed().as_nanos() as u64);
+        let elapsed = one.elapsed().as_nanos() as u64;
+        writes.push(elapsed);
+        #[cfg(feature = "write-profiling")]
+        phase_samples.push(json!({"total_ns":elapsed,
+            "phase_ns":rust_kv_storage_engine::write_profile::take()}));
         for (i, generation) in expected.into_iter().enumerate() {
             let row = snapshot.next().transpose()?.unwrap();
             assert_eq!(row.0, key(i as u64));
@@ -852,11 +858,17 @@ fn snapshot_write(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         }
     }
     let seconds = start.elapsed().as_secs_f64();
+    #[cfg(feature = "write-profiling")]
+    println!(
+        "WRITE_TIMINGS {}",
+        json!({
+        "phases":rust_kv_storage_engine::write_profile::PHASES,"samples":phase_samples})
+    );
     report(
         "snapshot-write",
         raw,
         json!({"seconds":seconds,"operations":c.queries,
-        "ops_per_second":c.queries as f64/seconds,"batch_latency":distribution(&mut writes),
+        "ops_per_second":c.queries as f64/seconds,"batch_seconds":writes.iter().sum::<u64>() as f64/1e9,"batch_latency":distribution(&mut writes),
         "before":before,"after":metrics(path)?,"stats_after":db.stats()?}),
     );
     Ok(())
@@ -1041,6 +1053,95 @@ fn mixed_steady(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 
+fn tombstone_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    let keys: Vec<_> = (0..c.keys)
+        .map(|i| {
+            let mut k = vec![b'x'; 128];
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+        })
+        .collect();
+    for chunk in keys.chunks(c.batch) {
+        let entries: Vec<_> = chunk
+            .iter()
+            .map(|k| (k.clone(), Some(vec![9; c.value])))
+            .collect();
+        db.batch(&entries)?;
+    }
+    let deleted: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 17 != 0)
+        .map(|(_, k)| (k.clone(), None))
+        .collect();
+    for chunk in deleted.chunks(c.batch) {
+        db.batch(chunk)?;
+    }
+    if raw["disk"].as_bool().unwrap_or(false) {
+        db.flush()?;
+    }
+    let mut hi = vec![b'x'; 128];
+    hi.extend_from_slice(&c.keys.to_be_bytes());
+    let verify = || -> Result<()> {
+        let mut scan = db.scan(&keys[0], &hi)?;
+        for i in (0..keys.len()).step_by(17) {
+            let row = scan.next().transpose()?.unwrap();
+            assert_eq!(row.0, keys[i]);
+            assert_eq!(row.1.as_ref(), vec![9; c.value]);
+        }
+        assert!(scan.next().is_none());
+        Ok(())
+    };
+    verify()?;
+    let before = metrics(path)?;
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let mut count = 0;
+        for row in db.scan(&keys[0], &hi)? {
+            black_box(row?);
+            count += 1;
+        }
+        assert_eq!(count, c.keys.div_ceil(17));
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    report(
+        "tombstone-scan",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"before":before,"after":metrics(path)?,"stats_after":db.stats()?}),
+    );
+    verify()?;
+    Ok(())
+}
+
+fn reopen_loop(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let db = Backend::open(path, c)?;
+    populate_memory(&db, c)?;
+    db.flush()?;
+    drop(db);
+    let mut samples = Vec::with_capacity(c.queries);
+    for _ in 0..c.queries {
+        let start = Instant::now();
+        let db = Backend::open(path, c)?;
+        samples.push(start.elapsed().as_nanos() as u64);
+        assert_eq!(
+            db.get(&key(0))?.as_deref(),
+            Some(value(0, 0, c.value).as_slice())
+        );
+        drop(db);
+    }
+    let seconds = samples.iter().sum::<u64>() as f64 / 1e9;
+    report(
+        "reopen-loop",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"open_latency":distribution(&mut samples),
+        "after":metrics(path)?,"measurement":"sum of opens; close and verification excluded; warm OS cache"}),
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4, "MODE DIRECTORY CONFIG_JSON");
@@ -1048,6 +1149,8 @@ fn main() -> Result<()> {
     let raw: Value = serde_json::from_str(&args[3])?;
     let c = Config::parse(&raw);
     match args[1].as_str() {
+        "tombstone-scan" => tombstone_scan(path, &c, &raw)?,
+        "reopen-loop" => reopen_loop(path, &c, &raw)?,
         "prepare-merge" => prepare_merge(path, &c)?,
         "compact-merge" => compact_merge(path, &c, &raw)?,
         "prepare" => prepare(path, &c)?,

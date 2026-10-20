@@ -191,9 +191,11 @@ def main():
                     order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
                     for order, name in enumerate(order_names, 1):
                         directory = root / f"write-{batch}-{trial}-{name}"
-                        config = {"keys": 64 if args.smoke else 8192, "value": 128, "batch": batch,
+                        config = {"keys": 64 if args.smoke else max(8192, batch * 1024), "value": 128, "batch": batch,
+                                  "memtable": 67108864,
                                   "fixed": False, "workload": "put" if batch == 1 else "batch"}
                         run(name, "write", directory, config, "durable-write", f"batch-{batch}", trial, order)
+                        shutil.rmtree(directory)
     result = summarize(records, args.baseline)
     (args.output / "summary.json").write_text(json.dumps(result, indent=2))
     for row in result:

@@ -26,7 +26,7 @@ jobs:
   compare:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
@@ -176,7 +176,7 @@ jobs:
           if-no-files-found: ignore
       - name: Compare paired reads, writes, and compaction
         if: contains(github.event.head_commit.message, '[paired-perf]')
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: python3 benchmarks/rocksdb-compare/workloads.py paired-results --baseline
         env:
           KV_BENCH_DIR: ${{ runner.temp }}
@@ -185,4 +185,29 @@ jobs:
         with:
           name: paired-workload-comparison
           path: paired-results/
+          if-no-files-found: ignore
+      - name: Check merge policy across source counts and key shapes
+        if: contains(github.event.head_commit.message, '[audit-perf]')
+        timeout-minutes: 5
+        run: |
+          mkdir -p audit-results
+          set -o pipefail
+          cargo test --locked --release --lib merge_policy_profile -- --ignored --nocapture --test-threads=1 | tee audit-results/merge-policy.log
+      - name: Build write phase diagnostics and compare reopen and deletions
+        if: contains(github.event.head_commit.message, '[audit-perf]')
+        timeout-minutes: 12
+        run: |
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine-profile
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline-profile
+          python3 benchmarks/rocksdb-compare/audit.py audit-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-comparison
+          path: audit-results/
           if-no-files-found: ignore

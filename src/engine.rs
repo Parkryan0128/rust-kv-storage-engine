@@ -217,6 +217,7 @@ impl Engine {
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         options.validate()?;
         let dir = create_db_dir(path.as_ref())?;
+        let lock_missing = !dir.join("LOCK").try_exists()?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -230,24 +231,30 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         }
-        fs::create_dir_all(dir.join("wal"))?;
-        fs::create_dir_all(dir.join("sst"))?;
-        sync_dir(&dir)?;
-        let mut wal_ids = ids(&dir.join("wal"), "wal")?;
-        let sst_ids = ids(&dir.join("sst"), "sst")?;
-        let manifest = if dir.join("MANIFEST").exists() {
+        let initialized = dir.join("MANIFEST").try_exists()?;
+        let wal_created = create_storage_dir(&dir.join("wal"))?;
+        let sst_created = create_storage_dir(&dir.join("sst"))?;
+        // A durable manifest proves the normal directory layout was published.
+        // Retry initialization syncs even when an interrupted open left entries.
+        if !initialized || lock_missing || wal_created || sst_created {
+            sync_open_dir(&dir)?;
+        }
+        let wal_files = storage_files(&dir.join("wal"), "wal")?;
+        let sst_files = storage_files(&dir.join("sst"), "sst")?;
+        let manifest = if initialized {
             Manifest::load(&dir)?
         } else {
-            if !wal_ids.is_empty() || !sst_ids.is_empty() {
+            if !wal_files.ids.is_empty() || !sst_files.ids.is_empty() {
                 return Err(corrupt("missing manifest with existing data"));
             }
             let m = Manifest::default();
             m.save(&dir)?;
             m
         };
-        let mut next_id = wal_ids
+        let mut next_id = wal_files
+            .ids
             .iter()
-            .chain(sst_ids.iter())
+            .chain(sst_files.ids.iter())
             .chain(manifest.tables.iter())
             .copied()
             .max()
@@ -264,7 +271,12 @@ impl Engine {
             tables.push(Arc::new(table));
         }
         tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
-        wal_ids.retain(|id| *id > manifest.wal_floor);
+        let wal_ids: Vec<_> = wal_files
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| *id > manifest.wal_floor)
+            .collect();
         let mut sequence = manifest.max_seq;
         let mut immutable = VecDeque::new();
         let mut mem = MemTable::default();
@@ -288,28 +300,31 @@ impl Engine {
                 .checked_add(1)
                 .ok_or(EngineError::SequenceExhausted)?;
             active = Some(Wal::create(&wal_path(&dir, id), id)?);
-            sync_dir(&dir.join("wal"))?;
+            sync_open_dir(&dir.join("wal"))?;
         }
-        // Validate the manifest before deleting files.
+        // Validate all referenced tables and WALs before deleting anything.
+        // Reuse the pre-recovery inventory: a newly created WAL is always live.
         let live: HashSet<_> = manifest.tables.iter().copied().collect();
-        for id in sst_ids {
-            if !live.contains(&id) {
-                fs::remove_file(sst_path(&dir, id))?;
-            }
-        }
-        for id in ids(&dir.join("wal"), "wal")? {
-            if id <= manifest.wal_floor {
-                fs::remove_file(wal_path(&dir, id))?;
-            }
-        }
-        for sub in ["wal", "sst"] {
-            for entry in fs::read_dir(dir.join(sub))? {
-                let p = entry?.path();
-                if p.extension().is_some_and(|x| x == "tmp") {
-                    fs::remove_file(p)?;
+        for (sub, inventory) in [("wal", wal_files), ("sst", sst_files)] {
+            let mut removed = false;
+            for id in inventory.ids {
+                let obsolete = if sub == "wal" {
+                    id <= manifest.wal_floor
+                } else {
+                    !live.contains(&id)
+                };
+                if obsolete {
+                    fs::remove_file(dir.join(sub).join(format!("{id:020}.{sub}")))?;
+                    removed = true;
                 }
             }
-            sync_dir(&dir.join(sub))?;
+            for path in inventory.temporary {
+                fs::remove_file(path)?;
+                removed = true;
+            }
+            if removed {
+                sync_open_dir(&dir.join(sub))?;
+            }
         }
         let state = State {
             mem,
@@ -706,8 +721,31 @@ fn wal_path(dir: &Path, id: u64) -> PathBuf {
 fn sst_path(dir: &Path, id: u64) -> PathBuf {
     dir.join("sst").join(format!("{id:020}.sst"))
 }
-fn ids(dir: &Path, ext: &str) -> Result<Vec<u64>> {
-    let mut out = vec![];
+fn create_storage_dir(path: &Path) -> Result<bool> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static OPEN_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn sync_open_dir(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    OPEN_SYNCS.with(|count| count.set(count.get() + 1));
+    sync_dir(path)
+}
+struct StorageFiles {
+    ids: Vec<u64>,
+    temporary: Vec<PathBuf>,
+}
+fn storage_files(dir: &Path, ext: &str) -> Result<StorageFiles> {
+    let mut out = StorageFiles {
+        ids: Vec::new(),
+        temporary: Vec::new(),
+    };
     for entry in fs::read_dir(dir)? {
         let p = entry?.path();
         if p.extension().is_some_and(|e| e == ext) {
@@ -720,10 +758,12 @@ fn ids(dir: &Path, ext: &str) -> Result<Vec<u64>> {
             if p.file_name().and_then(|n| n.to_str()) != Some(format!("{id:020}.{ext}").as_str()) {
                 return Err(corrupt("noncanonical storage filename"));
             }
-            out.push(id);
+            out.ids.push(id);
+        } else if p.extension().is_some_and(|e| e == "tmp") {
+            out.temporary.push(p);
         }
     }
-    out.sort_unstable();
+    out.ids.sort_unstable();
     Ok(out)
 }
 impl Core {
@@ -1180,3 +1220,49 @@ mod audit_tests {
 #[cfg(test)]
 #[path = "memory_scan_profile.rs"]
 mod memory_scan_profile;
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[test]
+    fn clean_reopen_skips_directory_syncs_but_cleanup_and_creation_are_synced() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("nested/db");
+        drop(Engine::open(&dir).unwrap());
+        OPEN_SYNCS.with(|n| n.set(0));
+        drop(Engine::open(&dir).unwrap());
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 0);
+
+        fs::write(dir.join("wal/abandoned.tmp"), b"partial").unwrap();
+        fs::write(dir.join("sst/abandoned.tmp"), b"partial").unwrap();
+        fs::write(sst_path(&dir, 99), b"orphan").unwrap();
+        OPEN_SYNCS.with(|n| n.set(0));
+        drop(Engine::open(&dir).unwrap());
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 2);
+        assert!(!dir.join("wal/abandoned.tmp").exists());
+        assert!(!dir.join("sst/abandoned.tmp").exists());
+        assert!(!sst_path(&dir, 99).exists());
+
+        fs::remove_dir(dir.join("sst")).unwrap();
+        OPEN_SYNCS.with(|n| n.set(0));
+        drop(Engine::open(&dir).unwrap());
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 1);
+        assert!(dir.join("sst").is_dir());
+    }
+
+    #[test]
+    fn recovery_failure_does_not_delete_inventory_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Engine::open(dir.path()).unwrap());
+        let orphan = sst_path(dir.path(), 99);
+        let temporary = dir.path().join("sst/partial.tmp");
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&temporary, b"partial").unwrap();
+        let wal = storage_files(&dir.path().join("wal"), "wal").unwrap().ids[0];
+        fs::write(wal_path(dir.path(), wal), b"bad magic").unwrap();
+        assert!(Engine::open(dir.path()).is_err());
+        assert!(orphan.exists());
+        assert!(temporary.exists());
+    }
+}

@@ -118,15 +118,18 @@ group handles, without touching each page reference counter. Iteration copies
 only the consumed key and shares immutable value bytes. Groups remain valid
 across writes, flushes and compactions and are released as the cursor finishes
 them. Nonoverlapping groups are not retained; boundary groups can retain pages
-outside the requested range. Deletions remove empty pages/groups but do not
-rebalance sparse groups.
+outside the requested range. Physical removals discard empty pages/groups and merge adjacent sparse pages
+and groups when their combined occupancy fits the configured merge thresholds.
+Logical deletes remain versioned tombstones until safe to discard.
 After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
 
 Each SST iterator seeks through the index to the lower-bound block, then searches
 within that block. It streams forward up to the upper bound, retaining one encoded
-block and a candidate record per source. A min-heap merges sources by key, chooses
-the highest sequence number, and omits tombstones. Scans use the existing validated
+block per source. A single source is consumed directly, skipping tombstones before
+copying keys. Merges with at most eight sources and at least one SST compare
+borrowed heads; memory-only and larger merges use a min-heap of candidate keys.
+All paths choose the highest sequence number and omit tombstones. Scans use the existing validated
 block decoder for all supported SST versions and do not change any file format.
 They bypass the point-read cache; disk reads still increment `stats().block_reads`.
 Errors are iterator items and terminate the scan; earlier rows may already have
