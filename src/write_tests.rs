@@ -82,7 +82,10 @@ fn exhausted_writes_leave_the_wal_and_memtable_in_place() {
         let wal = writer.as_ref().unwrap();
         assert_eq!((wal.id, wal.bytes), (id, bytes));
         assert_eq!(fs::read(wal_path(dir.path(), id)).unwrap(), original);
-        assert_eq!(ids(&dir.path().join("wal"), "wal").unwrap(), [id]);
+        assert_eq!(
+            storage_files(&dir.path().join("wal"), "wal").unwrap().ids,
+            [id]
+        );
         assert_eq!(db.stats().immutable_memtables, 0);
         assert_eq!(db.get(b"old").unwrap().unwrap(), "safe");
         assert!(db.get(b"new").unwrap().is_none());
