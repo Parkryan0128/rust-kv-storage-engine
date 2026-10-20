@@ -119,3 +119,10 @@ merge_policy_profile experiment compares borrowed and heap merging at
 deletions. It checks both outputs before timing. This is a warm release-libtest
 policy experiment, not an end-to-end RocksDB comparison; its 80 ms samples
 should be treated as supporting evidence rather than a universal threshold.
+
+The scan-diagnostics workflow accepts a [scan-diag] push marker with exactly
+one [baseline:<40-character SHA>] marker. It runs the identical active/frozen
+memory, cache-hit and snapshot-mutation diagnostics against both revisions,
+without rebuilding RocksDB. Use this shorter check to investigate a scan
+regression before repeating the full paired suite. Normal release-libtest runs
+exclude the copied-key test counter; all-features tests enable its assertions.
