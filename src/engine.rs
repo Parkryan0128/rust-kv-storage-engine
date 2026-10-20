@@ -305,7 +305,10 @@ impl Engine {
         // Validate all referenced tables and WALs before deleting anything.
         // Reuse the pre-recovery inventory: a newly created WAL is always live.
         let live: HashSet<_> = manifest.tables.iter().copied().collect();
-        for (sub, inventory) in [("wal", wal_files), ("sst", sst_files)] {
+        for (sub, inventory, created) in [
+            ("wal", wal_files, wal_created),
+            ("sst", sst_files, sst_created),
+        ] {
             let mut removed = false;
             for id in inventory.ids {
                 let obsolete = if sub == "wal" {
@@ -322,7 +325,7 @@ impl Engine {
                 fs::remove_file(path)?;
                 removed = true;
             }
-            if removed {
+            if removed || created || !initialized {
                 sync_open_dir(&dir.join(sub))?;
             }
         }
@@ -1247,7 +1250,7 @@ mod open_tests {
         fs::remove_dir(dir.join("sst")).unwrap();
         OPEN_SYNCS.with(|n| n.set(0));
         drop(Engine::open(&dir).unwrap());
-        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 1);
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 2);
         assert!(dir.join("sst").is_dir());
     }
 
