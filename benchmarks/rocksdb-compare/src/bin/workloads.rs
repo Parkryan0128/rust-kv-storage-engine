@@ -1163,7 +1163,7 @@ fn overwrite_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     }
     let mut upper = vec![b'x'; key_bytes];
     upper[key_bytes - 8..].copy_from_slice(&c.keys.to_be_bytes());
-    let snapshot = if raw["snapshot"].as_bool().unwrap_or(false) {
+    let mut snapshot = if raw["snapshot"].as_bool().unwrap_or(false) {
         Some(db.scan(&keys[0], &upper)?)
     } else {
         None
@@ -1198,7 +1198,7 @@ fn overwrite_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
             })
         );
     }
-    if let Some(mut snapshot) = snapshot {
+    if let Some(mut snapshot) = snapshot.take() {
         for key in &keys {
             let row = snapshot.next().transpose()?.unwrap();
             assert_eq!(&row.0, key);
@@ -1206,6 +1206,7 @@ fn overwrite_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         }
         assert!(snapshot.next().is_none());
     }
+    drop(snapshot);
     drop(db);
     let db = Backend::open(path, c)?;
     for (i, key) in keys.iter().enumerate() {
