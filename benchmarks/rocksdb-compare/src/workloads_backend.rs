@@ -53,7 +53,7 @@ impl Backend {
     pub fn stats(&self) -> Result<Value> {
         let s = self.0.stats();
         Ok(
-            json!({"memtable_allocated_bytes":s.active_memtable_allocated_bytes+s.immutable_memtable_allocated_bytes,"sst_files":s.sst_files,"sst_bytes":s.sst_bytes,"sst_records":s.sst_records,"cache_bytes":s.cache_bytes,"block_reads":s.block_reads,"cache_hits":s.cache_hits,"memtable_bytes":s.active_memtable_bytes+s.immutable_memtable_bytes,"flush_bytes":s.flush_bytes,"compaction_input_bytes":s.compaction_input_bytes,"compaction_output_bytes":s.compaction_output_bytes,"compactions":s.compactions}),
+            json!({"memtable_allocated_bytes":s.active_memtable_allocated_bytes+s.immutable_memtable_allocated_bytes,"sst_files":s.sst_files,"sst_bytes":s.sst_bytes,"sst_records":s.sst_records,"cache_bytes":s.cache_bytes,"block_reads":s.block_reads,"cache_hits":s.cache_hits,"memtable_bytes":s.active_memtable_bytes+s.immutable_memtable_bytes,"flush_bytes":s.flush_bytes,"compaction_input_bytes":s.compaction_input_bytes,"compaction_output_bytes":s.compaction_output_bytes,"compactions":s.compactions,"max_compaction_inputs":s.max_compaction_inputs}),
         )
     }
 }

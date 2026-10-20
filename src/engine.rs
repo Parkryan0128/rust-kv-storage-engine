@@ -165,6 +165,9 @@ impl Drop for Disk {
 }
 struct Maintenance {
     prefer_flush: bool,
+    // Finish a selected plan even if an intermediate publication falls below
+    // the automatic threshold. Only live, not yet consumed inputs remain here.
+    pending: VecDeque<Arc<Table>>,
 }
 struct Core {
     options: Options,
@@ -350,7 +353,10 @@ impl Engine {
             disk,
             state: RwLock::new(state),
             writer: Mutex::new(wal),
-            maintenance: Mutex::new(Maintenance { prefer_flush: true }),
+            maintenance: Mutex::new(Maintenance {
+                prefer_flush: true,
+                pending: VecDeque::new(),
+            }),
             cache,
             counters: Counters::default(),
             notify: tx,
@@ -369,24 +375,11 @@ impl Engine {
                                 break;
                             }
                             loop {
-                                let mut guard = c.maintenance.lock();
-                                if c.stop.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                if c.state.read().fatal.is_some() {
-                                    break;
-                                }
-                                match c.maintenance_step(true, &mut guard) {
+                                match c.background_step() {
                                     Ok(true) => {}
                                     Ok(false) => break,
-                                    Err(e) => {
-                                        c.poison(&e);
-                                        break;
-                                    }
+                                    Err(_) => break,
                                 }
-                                // Hand off between jobs so a flush with a finite
-                                // WAL goal cannot wait for all future writes.
-                                parking_lot::MutexGuard::unlock_fair(guard);
                             }
                         }
                     })?,
@@ -558,8 +551,12 @@ impl Engine {
         if c.disk.is_none() {
             return Ok(());
         }
-        let _guard = c.maintenance.lock();
+        let mut guard = c.maintenance.lock();
         check(&c.state.read())?;
+        // A worker may have started another plan after flush released the lock.
+        // Explicit compaction supersedes it with the current live snapshot.
+        guard.pending.clear();
+        guard.prefer_flush = true;
         let result = c.compact_all();
         if let Err(e) = &result {
             c.poison(e);
@@ -1015,6 +1012,21 @@ impl Core {
         sync_dir(&dir.join("wal"))?;
         Ok(())
     }
+    fn background_step(&self) -> Result<bool> {
+        let mut guard = self.maintenance.lock();
+        if self.stop.load(Ordering::Acquire) || self.state.read().fatal.is_some() {
+            return Ok(false);
+        }
+        let result = self.maintenance_step(true, &mut guard);
+        if let Err(error) = &result {
+            // Publish fatal state before another maintenance caller can enter.
+            self.poison(error);
+        }
+        // Yield between bounded publications, including rounds of one plan.
+        parking_lot::MutexGuard::unlock_fair(guard);
+        result
+    }
+
     // The caller holds maintenance. Alternate urgent flushes with eligible
     // compactions so continuous writers cannot starve either kind of work.
     // Explicit flush passes false after reaching its finite WAL goal, so later
@@ -1025,9 +1037,20 @@ impl Core {
             self.flush_one()?;
             schedule.prefer_flush = false;
         } else {
-            let inputs = self.compaction_inputs();
-            if !inputs.is_empty() {
-                self.compact_tables(inputs)?;
+            if schedule.pending.is_empty() {
+                schedule.pending = self.compaction_inputs().into();
+            }
+            if !schedule.pending.is_empty() {
+                let count = compaction::input_count(
+                    schedule.pending.iter().map(|t| t.compaction_buffer_bytes),
+                );
+                let inputs = schedule.pending.drain(..count).collect();
+                let merged = self.compact_group(inputs)?;
+                if !schedule.pending.is_empty() {
+                    schedule.pending.push_back(merged);
+                    #[cfg(test)]
+                    crate::test_hooks::pause("compaction_between_groups");
+                }
                 schedule.prefer_flush = true;
             } else if allow_flush && queued != 0 {
                 self.flush_one()?;
@@ -1134,6 +1157,10 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "write_tests.rs"]
 mod write_tests;
+
+#[cfg(test)]
+#[path = "maintenance_tests.rs"]
+mod maintenance_tests;
 
 #[cfg(test)]
 #[path = "scan_tests.rs"]
@@ -1302,3 +1329,7 @@ mod open_tests {
         assert!(temporary.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "maintenance_profile.rs"]
+mod maintenance_profile;

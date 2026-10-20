@@ -21,6 +21,8 @@ struct Config {
     cache: usize,
     memtable: usize,
     generations: usize,
+    merge_key_bytes: usize,
+    merge_deletes: bool,
     queries: usize,
     scan_repeat_passes: usize,
     seed: u64,
@@ -43,6 +45,8 @@ impl Config {
             cache: n("cache", 8 * 1024 * 1024) as usize,
             memtable: n("memtable", 4 * 1024 * 1024) as usize,
             generations: n("generations", 4) as usize,
+            merge_key_bytes: n("merge_key_bytes", 8) as usize,
+            merge_deletes: v["merge_deletes"].as_bool().unwrap_or(true),
             queries: n("queries", 20000) as usize,
             scan_repeat_passes: n("scan_repeat_passes", 1) as usize,
             seed: n("seed", 7919),
@@ -70,6 +74,7 @@ impl Config {
             "sorted" | "random" | "overwrite"
         ));
         assert!((1..=16).contains(&c.generations));
+        assert!((8..=1024).contains(&c.merge_key_bytes));
         c
     }
 }
@@ -270,6 +275,12 @@ fn throughput_reads(db: &Arc<Backend>, c: &Config) -> Result<f64> {
     Ok(seconds)
 }
 
+fn merge_key(i: u64, c: &Config) -> Vec<u8> {
+    let mut out = vec![b'x'; c.merge_key_bytes];
+    out[c.merge_key_bytes - 8..].copy_from_slice(&key(i));
+    out
+}
+
 fn prepare_merge(path: &Path, c: &Config) -> Result<()> {
     assert!(!path.exists() && c.fixed);
     let db = Backend::open(path, c)?;
@@ -280,8 +291,12 @@ fn prepare_merge(path: &Path, c: &Config) -> Result<()> {
                 continue;
             }
             entries.push((
-                key(i).to_vec(),
-                if c.churn && generation + 1 == c.generations && i.is_multiple_of(4) {
+                merge_key(i, c),
+                if c.churn
+                    && c.merge_deletes
+                    && generation + 1 == c.generations
+                    && i.is_multiple_of(4)
+                {
                     None
                 } else {
                     Some(value(
@@ -310,8 +325,8 @@ fn prepare_merge(path: &Path, c: &Config) -> Result<()> {
 
 fn verify_merge(db: &Backend, c: &Config) -> Result<()> {
     for i in 0..c.keys {
-        let got = db.get(&key(i))?;
-        if c.churn && i.is_multiple_of(4) {
+        let got = db.get(&merge_key(i, c))?;
+        if c.churn && c.merge_deletes && i.is_multiple_of(4) {
             assert!(got.is_none(), "deleted key {i}");
         } else {
             let expected = value(

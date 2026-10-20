@@ -5,8 +5,12 @@ use crate::{
     Result,
 };
 use std::{collections::BTreeMap, sync::Arc};
+#[path = "compaction_selector.rs"]
+mod selector;
+use selector::Tournament;
 pub(crate) const MAX_INPUTS: usize = 16;
 pub(crate) const INPUT_BUFFER_BUDGET: usize = 512 * 1024;
+const TOURNAMENT_INPUTS: usize = 9;
 
 // Budget encoded input buffers, including reuse slack and legacy offset arrays.
 // Two inputs are always allowed so oversized records cannot prevent progress.
@@ -86,18 +90,30 @@ fn tiered_positions(files: impl Iterator<Item = (u64, u64)>, threshold: usize) -
 pub(crate) struct Merge {
     cursors: Vec<TableCursor>,
     pending: Vec<usize>,
+    tournament: Option<Box<Tournament>>,
     #[cfg(test)]
     finished: bool,
     drop_tombstones: bool,
 }
 impl Merge {
     pub fn new(tables: &[Arc<Table>], drop_tombstones: bool) -> Result<Self> {
+        Self::with_selector(tables, drop_tombstones, tables.len() >= TOURNAMENT_INPUTS)
+    }
+
+    fn with_selector(
+        tables: &[Arc<Table>],
+        drop_tombstones: bool,
+        tournament: bool,
+    ) -> Result<Self> {
+        let cursors = tables
+            .iter()
+            .cloned()
+            .map(TableCursor::new)
+            .collect::<Result<Vec<_>>>()?;
+        let tournament = tournament.then(|| Box::new(Tournament::new(&cursors)));
         Ok(Self {
-            cursors: tables
-                .iter()
-                .cloned()
-                .map(TableCursor::new)
-                .collect::<Result<_>>()?,
+            cursors,
+            tournament,
             pending: Vec::with_capacity(tables.len()),
             #[cfg(test)]
             finished: false,
@@ -110,39 +126,55 @@ impl Merge {
         consume: impl FnOnce(crate::codec::RecordRef<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
         loop {
-            while let Some(i) = self.pending.pop() {
-                self.cursors[i].advance()?;
-            }
-            // Fan-in is bounded by both input memory and a small hard cap.
-            // Comparing borrowed heads
-            // avoids heap keys and materializing values for superseded versions.
-            let mut newest: Option<crate::codec::RecordRef<'_>> = None;
-            for (i, cursor) in self.cursors.iter().enumerate() {
-                if let Some(record) = cursor.current() {
-                    if newest.as_ref().is_none_or(|old| record.key < old.key) {
-                        self.pending.clear();
-                        self.pending.push(i);
-                        newest = Some(record);
-                    } else if let Some(old) = &mut newest {
-                        if record.key == old.key {
-                            self.pending.push(i);
-                            if record.seq > old.seq {
-                                *old = record;
-                            }
-                        }
-                    }
+            let newest = if let Some(tree) = &mut self.tournament {
+                let mut dirty = 0;
+                while let Some(i) = self.pending.pop() {
+                    self.cursors[i].advance()?;
+                    dirty |= tree.update_leaf(i, &self.cursors);
                 }
-            }
+                tree.repair(dirty, &self.cursors);
+                tree.selected(&mut self.pending)
+                    .and_then(|i| self.cursors[i].current())
+            } else {
+                while let Some(i) = self.pending.pop() {
+                    self.cursors[i].advance()?;
+                }
+                Self::select_linear(&self.cursors, &mut self.pending)
+            };
             let Some(newest) = newest else {
                 return Ok(None);
             };
-            // Partial merges must keep deletions that hide records in other SSTs.
-            // Advance these cursors only on the next call: the winner still
-            // borrows its block until it has been serialized.
+            // Partial merges keep deletions hiding records in unselected SSTs.
+            // Advance only on the next call: the winner still borrows its block.
             if newest.value.is_some() || !self.drop_tombstones {
                 return consume(newest).map(Some);
             }
         }
+    }
+
+    #[inline]
+    fn select_linear<'a>(
+        cursors: &'a [TableCursor],
+        pending: &mut Vec<usize>,
+    ) -> Option<crate::codec::RecordRef<'a>> {
+        let mut newest: Option<crate::codec::RecordRef<'_>> = None;
+        for (i, cursor) in cursors.iter().enumerate() {
+            if let Some(record) = cursor.current() {
+                if newest.as_ref().is_none_or(|old| record.key < old.key) {
+                    pending.clear();
+                    pending.push(i);
+                    newest = Some(record);
+                } else if let Some(old) = &mut newest {
+                    if record.key == old.key {
+                        pending.push(i);
+                        if record.seq > old.seq {
+                            *old = record;
+                        }
+                    }
+                }
+            }
+        }
+        newest
     }
     pub fn write_into(mut self, writer: &mut TableWriter) -> Result<()> {
         while self
@@ -394,3 +426,7 @@ mod tests {
 #[cfg(test)]
 #[path = "picker_profile.rs"]
 mod picker_profile;
+
+#[cfg(test)]
+#[path = "compaction_tests.rs"]
+mod compaction_tests;

@@ -82,6 +82,26 @@ jobs:
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Compare bounded maintenance and actual merge publication
+        if: contains(github.event.head_commit.message, '[14-perf]')
+        timeout-minutes: 12
+        run: |
+          cp src/maintenance_profile.rs baseline/src/maintenance_profile.rs
+          if ! grep -q 'mod maintenance_profile;' baseline/src/engine.rs; then
+            printf '\n#[cfg(test)]\n#[path = "maintenance_profile.rs"]\nmod maintenance_profile;\n' >> baseline/src/engine.rs
+          fi
+          python3 benchmarks/rocksdb-compare/maintenance.py maintenance-results
+          python3 benchmarks/rocksdb-compare/merge_matrix.py merge-matrix-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: maintenance-merge-comparison
+          path: |
+            maintenance-results/
+            merge-matrix-results/
+          if-no-files-found: ignore
       - name: Compare selection and existing-key updates
         if: contains(github.event.head_commit.message, '[235-perf]')
         timeout-minutes: 8
