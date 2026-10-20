@@ -33,10 +33,7 @@ fn maintenance_yield_profile() {
             for source in 0..tables {
                 let mut batch = WriteBatch::new();
                 for row in 0..64 {
-                    batch.put(
-                        &(row * tables + source).to_be_bytes(),
-                        &[source as u8; 4096],
-                    );
+                    batch.put((row * tables + source).to_be_bytes(), [source as u8; 4096]);
                 }
                 db.write_batch(batch).unwrap();
                 core.freeze(&mut core.writer.lock()).unwrap();
