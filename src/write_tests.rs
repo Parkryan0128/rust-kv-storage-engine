@@ -224,3 +224,86 @@ fn activity_statistics_match_with_frozen_memory_ssts_and_populated_cache() {
     assert_eq!(a.cache_bytes, s.cache_bytes);
     assert!(a.sst_bytes > 0 && a.cache_bytes > 0 && a.cache_hits > 0);
 }
+
+#[test]
+fn directory_sync_failure_wakes_a_writer_waiting_for_flush_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open_with_options(
+        dir.path(),
+        Options {
+            memtable_size_limit: 128,
+            max_immutable_memtables: 1,
+            compaction_file_threshold: 1000,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let core = &db.inner.core;
+    let guard = core.maintenance.lock();
+    db.put(b"a", &[7; 128]).unwrap();
+    db.put(b"b", &[8; 128]).unwrap();
+    assert_eq!(db.stats().immutable_memtables, 1);
+    let manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (resume_tx, resume_rx) = sync_channel(1);
+    let (result_tx, result_rx) = sync_channel(1);
+    let writer_db = db.clone();
+    let writer = thread::spawn(move || {
+        crate::test_hooks::arm("write_backpressure", entered_tx, resume_rx);
+        let result = writer_db.put(b"must-reject", b"v");
+        result_tx
+            .send(matches!(result, Err(EngineError::Background(_))))
+            .unwrap();
+    });
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+    if entered.is_err() {
+        drop(guard);
+        drop(resume_tx);
+        let _ = writer.join();
+        panic!("writer did not reach backpressure: {entered:?}");
+    }
+    resume_tx.send(()).unwrap();
+    crate::test_hooks::fail_once("sst_before_dir_sync");
+    let error = core.flush_one().unwrap_err();
+    core.poison(&error);
+    let woke = result_rx.recv_timeout(Duration::from_secs(5));
+    core.progress(); // Also release a stuck waiter when diagnosing a notification regression.
+    drop(guard);
+    writer.join().unwrap();
+    assert_eq!(woke, Ok(true));
+    assert_eq!(fs::read(dir.path().join("MANIFEST")).unwrap(), manifest);
+    assert_eq!(
+        storage_files(&dir.path().join("wal"), "wal")
+            .unwrap()
+            .ids
+            .len(),
+        2
+    );
+    drop(db);
+    let db = Engine::open(dir.path()).unwrap();
+    assert_eq!(db.get(b"a").unwrap().as_deref(), Some([7; 128].as_slice()));
+    assert_eq!(db.get(b"b").unwrap().as_deref(), Some([8; 128].as_slice()));
+    assert!(db.get(b"must-reject").unwrap().is_none());
+}
+
+#[test]
+fn failed_startup_directory_sync_leaves_cleanup_candidates_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(dir.path()).unwrap();
+    db.put(b"safe", b"durable").unwrap();
+    db.flush().unwrap();
+    drop(db);
+    let manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
+    let orphan = sst_path(dir.path(), 999);
+    let temporary = dir.path().join("sst/interrupted.tmp");
+    fs::write(&orphan, b"orphan").unwrap();
+    fs::write(&temporary, b"temporary").unwrap();
+    crate::test_hooks::fail_once("open_before_dir_sync");
+    assert!(matches!(Engine::open(dir.path()), Err(EngineError::Io(_))));
+    assert_eq!(fs::read(&orphan).unwrap(), b"orphan");
+    assert_eq!(fs::read(&temporary).unwrap(), b"temporary");
+    assert_eq!(fs::read(dir.path().join("MANIFEST")).unwrap(), manifest);
+    let db = Engine::open(dir.path()).unwrap();
+    assert_eq!(db.get(b"safe").unwrap().unwrap(), "durable");
+    assert!(!orphan.exists() && !temporary.exists());
+}

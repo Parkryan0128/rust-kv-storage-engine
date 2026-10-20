@@ -82,6 +82,24 @@ jobs:
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Compare selection and existing-key updates
+        if: contains(github.event.head_commit.message, '[235-perf]')
+        timeout-minutes: 8
+        run: |
+          cp src/picker_profile.rs baseline/src/picker_profile.rs
+          cp examples/upsert_profile.rs baseline/examples/upsert_profile.rs
+          if ! grep -q 'mod picker_profile;' baseline/src/compaction.rs; then
+            printf '\n#[cfg(test)]\n#[path = "picker_profile.rs"]\nmod picker_profile;\n' >> baseline/src/compaction.rs
+          fi
+          python3 benchmarks/rocksdb-compare/focused.py focused-results
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: focused-235-comparison
+          path: focused-results/
+          if-no-files-found: ignore
       - name: Compare remaining recovery, cache, and active-scan workloads
         if: contains(github.event.head_commit.message, '[remaining-perf]') || contains(github.event.head_commit.message, '[scan-perf]')
         timeout-minutes: 8

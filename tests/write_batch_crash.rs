@@ -66,6 +66,7 @@ fn acknowledged_batches_survive_flush_and_compaction_publication_failures() {
         let mut points = vec![
             "sst_before_sync",
             "sst_after_sync",
+            "sst_before_dir_sync",
             "sst_after_rename",
             "manifest_before_sync",
             "manifest_after_sync",
@@ -79,15 +80,14 @@ fn acknowledged_batches_survive_flush_and_compaction_publication_failures() {
                 "compaction_after_dir_sync",
             ]);
         } else {
-            points.extend(["wal_after_rotation", "flush_before_wal_delete"]);
+            points.extend([
+                "wal_before_dir_sync",
+                "wal_after_rotation",
+                "flush_before_wal_delete",
+            ]);
         }
         for point in points {
             for io_error in [false, true] {
-                // The generic error worker uses a put for WAL failpoints;
-                // rotation is covered here by a crash during compact's flush.
-                if io_error && point == "wal_after_rotation" {
-                    continue;
-                }
                 let dir = tempfile::tempdir().unwrap();
                 let db = Engine::open(dir.path()).unwrap();
                 db.put(b"batch-old", b"old").unwrap();

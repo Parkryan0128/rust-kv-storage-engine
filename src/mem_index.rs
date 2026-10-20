@@ -185,9 +185,9 @@ impl PageGroup {
         })
     }
     #[inline]
-    fn insert(
+    fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
-        key: Vec<u8>,
+        key: K,
         record: Record,
         prefix: u64,
         append: bool,
@@ -200,7 +200,8 @@ impl PageGroup {
         if append
             && self.pages.last().is_some_and(|p| {
                 !p.rows.is_empty()
-                    && (p.rows.len() >= PAGE_RECORDS || p.key_bytes + key.len() > PAGE_KEY_BYTES)
+                    && (p.rows.len() >= PAGE_RECORDS
+                        || p.key_bytes + key.as_ref().len() > PAGE_KEY_BYTES)
             })
         {
             self.pages.push(Arc::new(Page::default()));
@@ -209,18 +210,18 @@ impl PageGroup {
         let index = if append {
             self.pages.len() - 1
         } else {
-            self.page_for(&key, prefix)
+            self.page_for(key.as_ref(), prefix)
         };
         let page = Arc::make_mut(&mut self.pages[index]);
         let position = if append {
             Err(page.rows.len())
         } else {
-            page.position(&key, prefix)
+            page.position(key.as_ref(), prefix)
         };
         match position {
             Ok(i) => (Some(page.replace(i, record)), Some(index)),
             Err(i) => {
-                page.insert_at(i, key, record, prefix);
+                page.insert_at(i, key.into(), record, prefix);
                 self.prefixes[index] = page.prefixes[0];
                 let (mut cursor, mut end) = (index, index + 1);
                 while cursor < end {
@@ -419,12 +420,16 @@ impl MemIndex {
         p.position(key, prefix).ok().map(|i| p.record(i))
     }
     #[inline]
-    pub fn insert(&mut self, key: Vec<u8>, record: Record) -> Option<Record> {
-        let prefix = prefix(&key);
+    pub fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(
+        &mut self,
+        key: K,
+        record: Record,
+    ) -> Option<Record> {
+        let prefix = prefix(key.as_ref());
         let append = self.groups.last().is_none_or(|g| {
             let p = g.pages.last().unwrap();
             let last = *p.prefixes.last().unwrap();
-            last < prefix || (last == prefix && p.rows.last().unwrap().0.as_ref() < key.as_slice())
+            last < prefix || (last == prefix && p.rows.last().unwrap().0.as_ref() < key.as_ref())
         });
         if self.groups.is_empty() {
             self.groups.push(Arc::new(PageGroup::default()));
@@ -433,7 +438,7 @@ impl MemIndex {
         let index = if append {
             self.groups.len() - 1
         } else {
-            self.group_for(&key, prefix)
+            self.group_for(key.as_ref(), prefix)
         };
         let group = Arc::make_mut(&mut self.groups[index]);
         let (previous, page) = group.insert(key, record, prefix, append);
@@ -767,6 +772,83 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn borrowed_upserts_copy_only_new_keys_and_preserve_shared_versions() {
+        struct Input<'a> {
+            key: &'a [u8],
+            copies: &'a std::cell::Cell<usize>,
+        }
+        impl AsRef<[u8]> for Input<'_> {
+            fn as_ref(&self) -> &[u8] {
+                self.key
+            }
+        }
+        impl From<Input<'_>> for Vec<u8> {
+            fn from(input: Input<'_>) -> Self {
+                input.copies.set(input.copies.get() + 1);
+                input.key.to_vec()
+            }
+        }
+        let copies = std::cell::Cell::new(0);
+        let keys = [
+            vec![],
+            vec![0],
+            vec![0, 255, 0],
+            vec![7; 65536],
+            vec![8; 1024 * 1024],
+        ];
+        let mut map = MemIndex::default();
+        let input = |key| Input {
+            key,
+            copies: &copies,
+        };
+        for (i, key) in keys.iter().enumerate() {
+            assert!(map
+                .insert(
+                    input(key),
+                    Record {
+                        seq: i as u64 + 1,
+                        value: Some(Bytes::from_static(b"old")),
+                    }
+                )
+                .is_none());
+        }
+        assert_eq!(copies.get(), keys.len());
+        let before = map.snapshot(all()).unwrap();
+        copies.set(0);
+        for pass in 0..40u64 {
+            for (i, key) in keys.iter().enumerate() {
+                let value = (pass % 3 != 0).then(|| Bytes::from(vec![pass as u8; pass as usize]));
+                let record = Record {
+                    seq: 100 + pass * keys.len() as u64 + i as u64,
+                    value,
+                };
+                assert!(map.insert(input(key), record.clone()).is_some());
+                assert_eq!(map.get(key), Some(&record));
+            }
+        }
+        assert_eq!(
+            copies.get(),
+            0,
+            "replacement must not materialize an owned key"
+        );
+        assert_eq!(map.len(), keys.len());
+        for ((key, old), expected) in before.zip(&keys) {
+            assert_eq!(&key, expected);
+            assert_eq!(old.value.as_deref(), Some(b"old".as_slice()));
+        }
+        let latest = map.snapshot(all()).unwrap().collect::<Vec<_>>();
+        map.insert(
+            input(b"new"),
+            Record {
+                seq: 9999,
+                value: None,
+            },
+        );
+        assert_eq!(copies.get(), 1);
+        assert_eq!(latest.len(), keys.len());
     }
 
     #[test]

@@ -73,6 +73,8 @@ fn main() {
         std::env::set_var("KV_FAIL_ACTION", "error");
         let result = if mode == "compact-error" {
             e.compact()
+        } else if matches!(a[3].as_str(), "wal_before_dir_sync" | "wal_after_rotation") {
+            e.flush()
         } else if a[3].starts_with("wal_") {
             e.put(b"uncertain", b"v")
         } else {

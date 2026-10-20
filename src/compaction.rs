@@ -46,34 +46,41 @@ pub(crate) fn pick(
     threshold: usize,
     style: CompactionStyle,
 ) -> Vec<Arc<Table>> {
-    let files: Vec<_> = tables.iter().map(|t| (t.id, t.file_bytes)).collect();
-    let ids = pick_ids(&files, threshold, style);
-    tables
-        .iter()
-        .filter(|t| ids.contains(&t.id))
-        .cloned()
+    if tables.len() < threshold {
+        return Vec::new();
+    }
+    if style == CompactionStyle::Full {
+        return tables.to_vec();
+    }
+    // Positions preserve the table snapshot's sequence order without searching
+    // every table for every selected ID.
+    tiered_positions(tables.iter().map(|t| (t.id, t.file_bytes)), threshold)
+        .into_iter()
+        .map(|index| tables[index].clone())
         .collect()
 }
 
-fn pick_ids(files: &[(u64, u64)], threshold: usize, style: CompactionStyle) -> Vec<u64> {
-    if files.len() < threshold {
-        return vec![];
+fn tiered_positions(files: impl Iterator<Item = (u64, u64)>, threshold: usize) -> Vec<usize> {
+    let mut buckets: BTreeMap<u32, Vec<(u64, usize)>> = BTreeMap::new();
+    for (position, (id, bytes)) in files.enumerate() {
+        buckets
+            .entry(bytes.max(1).ilog2())
+            .or_default()
+            .push((id, position));
     }
-    if style == CompactionStyle::Full {
-        return files.iter().map(|(id, _)| *id).collect();
-    }
-    let mut buckets: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
-    for &(id, bytes) in files {
-        buckets.entry(bytes.max(1).ilog2()).or_default().push(id);
-    }
-    for mut ids in buckets.into_values() {
-        if ids.len() >= threshold {
-            ids.sort_unstable();
-            ids.truncate(threshold);
-            return ids;
+    for mut candidates in buckets.into_values() {
+        if candidates.len() >= threshold {
+            candidates.sort_unstable_by_key(|&(id, _)| id);
+            candidates.truncate(threshold);
+            let mut positions: Vec<_> = candidates
+                .into_iter()
+                .map(|(_, position)| position)
+                .collect();
+            positions.sort_unstable();
+            return positions;
         }
     }
-    vec![]
+    Vec::new()
 }
 
 pub(crate) struct Merge {
@@ -304,6 +311,59 @@ mod tests {
         assert!(!output.exists());
     }
 
+    fn selected_ids(files: &[(u64, u64)], threshold: usize) -> Vec<u64> {
+        tiered_positions(files.iter().copied(), threshold)
+            .into_iter()
+            .map(|i| files[i].0)
+            .collect()
+    }
+
+    #[test]
+    fn picker_preserves_snapshot_order_and_handles_full_and_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let tables: Vec<_> = [9, 2, 6, 4, 8]
+            .into_iter()
+            .map(|id| {
+                Arc::new(
+                    Table::write(
+                        &dir.path().join(format!("{id}.sst")),
+                        id,
+                        std::iter::once(Ok((
+                            vec![id as u8],
+                            Record {
+                                seq: id,
+                                value: None,
+                            },
+                        ))),
+                        1,
+                        64,
+                        10,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        for style in [CompactionStyle::Full, CompactionStyle::SizeTiered] {
+            assert!(pick(&[], 2, style).is_empty());
+            assert!(pick(&tables, 6, style).is_empty());
+        }
+        let full = pick(&tables, 2, CompactionStyle::Full);
+        assert!(full.iter().zip(&tables).all(|(a, b)| Arc::ptr_eq(a, b)));
+        assert_eq!(full.len(), tables.len());
+        assert_eq!(
+            pick(&tables, 3, CompactionStyle::SizeTiered)
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [2, 6, 4]
+        );
+        let files: Vec<_> = (1..=1024).rev().map(|id| (id, 100)).collect();
+        assert_eq!(
+            selected_ids(&files, 1000),
+            (1..=1000).rev().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn picker_uses_smallest_ready_bucket_and_oldest_ids() {
         let files = [
@@ -316,35 +376,21 @@ mod tests {
             (11, 450),
             (12, 500),
         ];
-        assert_eq!(pick_ids(&files, 3, CompactionStyle::SizeTiered), [2, 4, 6]);
-        assert!(pick_ids(&files, 9, CompactionStyle::SizeTiered).is_empty());
-        assert_eq!(
-            pick_ids(&files, 3, CompactionStyle::Full).len(),
-            files.len()
-        );
+        assert_eq!(selected_ids(&files, 3), [2, 6, 4]);
+        assert!(selected_ids(&files, 9).is_empty());
     }
 
     #[test]
     fn size_classes_handle_boundaries_and_large_files() {
+        assert_eq!(selected_ids(&[(1, 127), (2, 128), (3, 255)], 2), [2, 3]);
         assert_eq!(
-            pick_ids(
-                &[(1, 127), (2, 128), (3, 255)],
-                2,
-                CompactionStyle::SizeTiered
-            ),
-            [2, 3]
-        );
-        assert_eq!(
-            pick_ids(&[(1, 1), (2, 2), (3, 4)], 2, CompactionStyle::SizeTiered),
+            selected_ids(&[(1, 1), (2, 2), (3, 4)], 2),
             Vec::<u64>::new()
         );
-        assert_eq!(
-            pick_ids(
-                &[(1, u64::MAX), (2, u64::MAX - 1)],
-                2,
-                CompactionStyle::SizeTiered
-            ),
-            [1, 2]
-        );
+        assert_eq!(selected_ids(&[(1, u64::MAX), (2, u64::MAX - 1)], 2), [1, 2]);
     }
 }
+
+#[cfg(test)]
+#[path = "picker_profile.rs"]
+mod picker_profile;

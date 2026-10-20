@@ -194,6 +194,7 @@ impl TableWriter {
         self.file.get_ref().sync_all()?;
         fault::hit("sst_after_sync")?;
         fs::rename(path.with_extension("tmp"), path)?;
+        fault::hit("sst_before_dir_sync")?;
         sync_dir(path.parent().unwrap())?;
         fault::hit("sst_after_rename")?;
         // The writer validated ordering/record limits while streaming. Transfer

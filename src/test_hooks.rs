@@ -34,3 +34,20 @@ pub fn pause(name: &str) {
         }
     });
 }
+
+thread_local! {
+    static FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+pub fn fail_once(name: &'static str) {
+    FAILURE.with(|slot| slot.set(Some(name)));
+}
+pub fn fail_if_armed(name: &str) -> std::io::Result<()> {
+    FAILURE.with(|slot| {
+        if slot.get() == Some(name) {
+            slot.set(None);
+            Err(std::io::Error::other(format!("injected failure: {name}")))
+        } else {
+            Ok(())
+        }
+    })
+}

@@ -1142,6 +1142,94 @@ fn reopen_loop(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 
+// Keep the active keys resident so every timed put exercises replacement.
+// The same normal harness is compiled against baseline/current/RocksDB.
+fn overwrite_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let key_bytes = raw["key_bytes"].as_u64().unwrap_or(8) as usize;
+    assert!((8..=65536).contains(&key_bytes));
+    assert!((c.keys as usize + c.queries) * (key_bytes + c.value + 64) < c.memtable);
+    let db = Backend::open(path, c)?;
+    let keys: Vec<_> = (0..c.keys)
+        .map(|i| {
+            let mut key = vec![b'x'; key_bytes];
+            key[key_bytes - 8..].copy_from_slice(&i.to_be_bytes());
+            key
+        })
+        .collect();
+    let initial = vec![0; c.value];
+    let replacement = vec![1; c.value];
+    for key in &keys {
+        db.put(key, &initial)?;
+    }
+    let mut upper = vec![b'x'; key_bytes];
+    upper[key_bytes - 8..].copy_from_slice(&c.keys.to_be_bytes());
+    let snapshot = if raw["snapshot"].as_bool().unwrap_or(false) {
+        Some(db.scan(&keys[0], &upper)?)
+    } else {
+        None
+    };
+    let before = metrics(path)?;
+    let mut rng = c.seed;
+    let mut samples = Vec::with_capacity(c.queries);
+    let mut seen = vec![false; keys.len()];
+    // Precompute the identical trace so only the durable API call is timed.
+    let trace: Vec<_> = (0..c.queries)
+        .map(|_| (random(&mut rng) % c.keys) as usize)
+        .collect();
+    let start = Instant::now();
+    for &i in &trace {
+        let one = Instant::now();
+        db.put(&keys[i], &replacement)?;
+        samples.push(one.elapsed().as_nanos() as u64);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let after = metrics(path)?;
+    let stats = db.stats()?;
+    for &i in &trace {
+        seen[i] = true;
+    }
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            db.get(key)?.as_deref(),
+            Some(if seen[i] {
+                replacement.as_slice()
+            } else {
+                initial.as_slice()
+            })
+        );
+    }
+    if let Some(mut snapshot) = snapshot {
+        for key in &keys {
+            let row = snapshot.next().transpose()?.unwrap();
+            assert_eq!(&row.0, key);
+            assert_eq!(row.1.as_ref(), initial);
+        }
+        assert!(snapshot.next().is_none());
+    }
+    drop(db);
+    let db = Backend::open(path, c)?;
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            db.get(key)?.as_deref(),
+            Some(if seen[i] {
+                replacement.as_slice()
+            } else {
+                initial.as_slice()
+            })
+        );
+    }
+    report(
+        "overwrite-keys",
+        raw,
+        json!({
+            "operations":c.queries,"seconds":seconds,"ops_per_second":c.queries as f64/seconds,
+            "commit_latency":distribution(&mut samples),"before":before,"after":after,"stats":stats,
+            "measurement":"normal release; sync WAL; resident active keys; snapshot optional; validation/reopen outside timer"
+        }),
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4, "MODE DIRECTORY CONFIG_JSON");
@@ -1149,6 +1237,7 @@ fn main() -> Result<()> {
     let raw: Value = serde_json::from_str(&args[3])?;
     let c = Config::parse(&raw);
     match args[1].as_str() {
+        "overwrite-keys" => overwrite_keys(path, &c, &raw)?,
         "tombstone-scan" => tombstone_scan(path, &c, &raw)?,
         "reopen-loop" => reopen_loop(path, &c, &raw)?,
         "prepare-merge" => prepare_merge(path, &c)?,

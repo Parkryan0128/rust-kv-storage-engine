@@ -131,3 +131,13 @@ and latency/verification sampling retain their original trace lengths. See
 [workload methodology](../benchmarks/rocksdb-compare/WORKLOADS.md) for counts and
 the longer production snapshot diagnostics. Criterion joins the write fixture's
 worker before preparing read measurements.
+
+## Selection and existing-key update comparison
+
+The `[235-perf]` comparison step runs `focused.py` with six alternating baseline/current trials for picker-only and volatile existing-key updates, then six rotating baseline/current/RocksDB trials for durable overwrites. Combine the marker with `[paired-perf]` to run the general workload suite as well. It copies identical diagnostic sources into the explicit baseline checkout.
+
+The picker diagnostic measures selection only at 32, 256, and 768 input tables (below threshold, full, and size-tiered selection). These release-libtest rates are not total compaction throughput and have no RocksDB equivalent. The volatile diagnostic uses the normal release library with 8-byte, 1-KiB, and 64-KiB keys, with and without a retained scan.
+
+Durable overwrites use the normal comparison harness with WAL and a sync on every put for all three backends, 256 resident keys, 128-byte values, and an identical precomputed random trace. Key sizes are 8 bytes, 1 KiB, and 64 KiB; one additional 1-KiB case holds a scan across writes. Validation, initial population, and reopen are outside timing. The memtable budget prevents timed flushes in these cases; the existing flush-pressure suite tests that separate behavior. Internal CPU savings need not translate proportionally to durable throughput, because WAL encoding, I/O, and sync remain.
+
+The directory-sync fault hooks cover errors and process termination immediately before SST publication sync and WAL directory sync. Recovery checks cover acknowledged writes/batches, an unchanged manifest on failed SST publication, blocked-writer notification, and startup cleanup ordering. They simulate software-visible errors and process crashes, not loss of device power.

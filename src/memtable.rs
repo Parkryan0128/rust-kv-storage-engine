@@ -33,9 +33,9 @@ impl MemTable {
     pub fn allocated_bytes(&self) -> usize {
         self.data.allocated_bytes()
     }
-    pub fn insert(&mut self, key: Vec<u8>, record: Record) {
-        self.bytes += record.memory_size(&key);
-        let key_len = key.len();
+    pub fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(&mut self, key: K, record: Record) {
+        self.bytes += record.memory_size(key.as_ref());
+        let key_len = key.as_ref().len();
         if let Some(old) = self.data.insert(key, record) {
             self.bytes -= RECORD_CHARGE + key_len + old.value.as_ref().map_or(0, Bytes::len);
         }

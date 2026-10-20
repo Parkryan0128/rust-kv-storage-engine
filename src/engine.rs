@@ -297,6 +297,7 @@ impl Engine {
                 .checked_add(1)
                 .ok_or(EngineError::SequenceExhausted)?;
             active = Some(Wal::create(&wal_path(&dir, id), id)?);
+            fault::hit("wal_before_dir_sync")?;
             sync_open_dir(&dir.join("wal"))?;
         }
         // Validate all referenced tables and WALs before deleting anything.
@@ -736,6 +737,7 @@ thread_local! {
     static OPEN_SYNC_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
 }
 fn sync_open_dir(path: &Path) -> Result<()> {
+    fault::hit("open_before_dir_sync")?;
     #[cfg(test)]
     {
         OPEN_SYNCS.with(|count| count.set(count.get() + 1));
@@ -951,7 +953,7 @@ impl Core {
             // No older on-disk values exist to hide in a volatile engine.
             s.mem.remove(key);
         } else {
-            s.mem.insert(key.to_vec(), record);
+            s.mem.insert(key, record);
         }
         s.sequence = seq;
         Ok(())
@@ -967,6 +969,7 @@ impl Core {
         let disk = self.disk.as_ref().unwrap();
         let id = self.allocate()?;
         let next = Wal::create(&wal_path(&disk.dir, id), id)?;
+        fault::hit("wal_before_dir_sync")?;
         sync_dir(&disk.dir.join("wal"))?;
         fault::hit("wal_after_rotation")?;
         let old = w.replace(next).unwrap();
