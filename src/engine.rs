@@ -217,7 +217,6 @@ impl Engine {
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         options.validate()?;
         let dir = create_db_dir(path.as_ref())?;
-        let lock_missing = !dir.join("LOCK").try_exists()?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -234,11 +233,9 @@ impl Engine {
         let initialized = dir.join("MANIFEST").try_exists()?;
         let wal_created = create_storage_dir(&dir.join("wal"))?;
         let sst_created = create_storage_dir(&dir.join("sst"))?;
-        // A durable manifest proves the normal directory layout was published.
-        // Retry initialization syncs even when an interrupted open left entries.
-        if !initialized || lock_missing || wal_created || sst_created {
-            sync_open_dir(&dir)?;
-        }
+        // A visible manifest may come from a rename interrupted before its
+        // directory sync. Make it durable before recovery can delete old files.
+        sync_open_dir(&dir)?;
         let wal_files = storage_files(&dir.join("wal"), "wal")?;
         let sst_files = storage_files(&dir.join("sst"), "sst")?;
         let manifest = if initialized {
@@ -325,7 +322,9 @@ impl Engine {
                 fs::remove_file(path)?;
                 removed = true;
             }
-            if removed || created || !initialized {
+            // An existing WAL can also be left by an interrupted create before
+            // its directory sync. Re-publish that entry before accepting writes.
+            if sub == "wal" || removed || created || !initialized {
                 sync_open_dir(&dir.join(sub))?;
             }
         }
@@ -734,10 +733,18 @@ fn create_storage_dir(path: &Path) -> Result<bool> {
 #[cfg(test)]
 thread_local! {
     static OPEN_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OPEN_SYNC_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
 }
 fn sync_open_dir(path: &Path) -> Result<()> {
     #[cfg(test)]
-    OPEN_SYNCS.with(|count| count.set(count.get() + 1));
+    {
+        OPEN_SYNCS.with(|count| count.set(count.get() + 1));
+        OPEN_SYNC_LOG.with(|log| {
+            if let Some(paths) = log.borrow_mut().as_mut() {
+                paths.push(path.to_owned());
+            }
+        });
+    }
     sync_dir(path)
 }
 struct StorageFiles {
@@ -1229,20 +1236,20 @@ mod open_tests {
     use super::*;
 
     #[test]
-    fn clean_reopen_skips_directory_syncs_but_cleanup_and_creation_are_synced() {
+    fn reopen_preserves_publication_barriers_and_syncs_sst_only_when_needed() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("nested/db");
         drop(Engine::open(&dir).unwrap());
         OPEN_SYNCS.with(|n| n.set(0));
         drop(Engine::open(&dir).unwrap());
-        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 0);
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 2);
 
         fs::write(dir.join("wal/abandoned.tmp"), b"partial").unwrap();
         fs::write(dir.join("sst/abandoned.tmp"), b"partial").unwrap();
         fs::write(sst_path(&dir, 99), b"orphan").unwrap();
         OPEN_SYNCS.with(|n| n.set(0));
         drop(Engine::open(&dir).unwrap());
-        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 2);
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 3);
         assert!(!dir.join("wal/abandoned.tmp").exists());
         assert!(!dir.join("sst/abandoned.tmp").exists());
         assert!(!sst_path(&dir, 99).exists());
@@ -1250,8 +1257,31 @@ mod open_tests {
         fs::remove_dir(dir.join("sst")).unwrap();
         OPEN_SYNCS.with(|n| n.set(0));
         drop(Engine::open(&dir).unwrap());
-        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 2);
+        assert_eq!(OPEN_SYNCS.with(|n| n.get()), 3);
         assert!(dir.join("sst").is_dir());
+    }
+
+    #[test]
+    fn visible_interrupted_publications_are_synced_before_accepting_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Engine::open(dir.path()).unwrap());
+        // Leave a file-synced manifest rename without syncing its parent.
+        let temporary = dir.path().join("MANIFEST.next");
+        fs::copy(dir.path().join("MANIFEST"), &temporary).unwrap();
+        File::open(&temporary).unwrap().sync_all().unwrap();
+        fs::rename(&temporary, dir.path().join("MANIFEST")).unwrap();
+        // Wal::create syncs the file; its caller normally syncs the directory.
+        // Stop at precisely that boundary, leaving a visible empty WAL.
+        drop(Wal::create(&wal_path(dir.path(), 100), 100).unwrap());
+        OPEN_SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let db = Engine::open(dir.path()).unwrap();
+        let synced = OPEN_SYNC_LOG.with(|log| log.borrow_mut().take().unwrap());
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(synced, [canonical.clone(), canonical.join("wal")]);
+        db.put(b"after-recovery", b"durable").unwrap();
+        drop(db);
+        let db = Engine::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"after-recovery").unwrap().unwrap(), "durable");
     }
 
     #[test]

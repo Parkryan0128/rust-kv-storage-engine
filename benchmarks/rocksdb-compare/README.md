@@ -126,3 +126,10 @@ memory, cache-hit and snapshot-mutation diagnostics against both revisions,
 without rebuilding RocksDB. Use this shorter check to investigate a scan
 regression before repeating the full paired suite. Normal release-libtest runs
 exclude the copied-key test counter; all-features tests enable its assertions.
+
+Reopen optimization reuses the WAL/SST directory inventories and skips an
+unchanged SST directory sync. Root and WAL directory syncs remain mandatory:
+a visible manifest rename or empty WAL may have survived a process interruption
+before its parent directory was synced. Reopen must publish those entries
+before deleting old files or accepting new writes. This is covered by an
+interrupted-publication regression fixture and the existing crash tests.
