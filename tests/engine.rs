@@ -544,11 +544,11 @@ fn deleting_all_keys_reclaims_cached_blocks_and_empty_table_metadata() {
     db.compact().unwrap();
     assert_eq!(db.stats().sst_records, 0);
     assert_eq!(db.stats().cache_bytes, 0);
-    assert_eq!(db.stats().sst_bytes, 88);
+    assert_eq!(db.stats().sst_bytes, 92);
     assert_eq!(held, "value");
     drop(db);
     let db = Engine::open(dir.path()).unwrap();
-    assert_eq!(db.stats().sst_bytes, 88);
+    assert_eq!(db.stats().sst_bytes, 92);
     assert_eq!(db.get(&0u64.to_be_bytes()).unwrap(), None);
 }
 

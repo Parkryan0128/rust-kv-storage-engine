@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_tables_are_pruned_and_reopened_bounds_are_learned_without_eager_io() {
+    fn disjoint_tables_are_pruned_before_and_after_reopen_without_eager_io() {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
             compaction_file_threshold: 1000,
@@ -756,6 +756,9 @@ mod tests {
         drop(db);
         let db = Engine::open_with_options(dir.path(), opts).unwrap();
         assert_eq!(db.stats().block_reads, 0);
+        let first = db.scan(lo.as_slice()..hi.as_slice()).unwrap();
+        assert_eq!(first.sources.len(), 1);
+        drop(first);
         assert_eq!(
             db.scan(lo.as_slice()..hi.as_slice())
                 .unwrap()
@@ -764,6 +767,7 @@ mod tests {
                 .len(),
             3
         );
+        assert_eq!(db.stats().block_reads, 1);
         let scan = db.scan(lo.as_slice()..hi.as_slice()).unwrap();
         assert_eq!(scan.sources.len(), 1);
         assert_eq!(scan.collect::<Result<Vec<_>>>().unwrap().len(), 3);

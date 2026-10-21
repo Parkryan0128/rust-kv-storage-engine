@@ -716,7 +716,8 @@ mod tests {
             .unwrap();
             assert_eq!(actual.file_bytes, expected.file_bytes);
             if count == 0 {
-                assert_eq!(actual.file_bytes, 88);
+                // Version 04 adds the empty maximum-key length to the summary.
+                assert_eq!(actual.file_bytes, 92);
             }
             let cache = BlockCache::new(0);
             let counters = Counters::default();
