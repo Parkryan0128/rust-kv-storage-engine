@@ -32,6 +32,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeat", action="store_true", help="Also time three unchanged compact requests")
+    parser.add_argument("--allow-format-change", action="store_true", help="Compare logical outputs when an SST format change intentionally changes bytes")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -50,6 +51,9 @@ def main():
         "limits": "Shared CI, warm OS cache, bounded single compactions. Different native table layouts and compaction policies across engine/RocksDB. No claim about sustained writes, cold devices or fsync-tail causality.",
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
     }
+    environment["allow_format_change"] = args.allow_format_change
+    if args.allow_format_change:
+        environment["semantics"] = environment["semantics"].replace("Final baseline/current SST files must match byte for byte.", "SST formats may differ; every logical value is verified after compaction and reopen. File digests are retained but byte equality is not required.")
     environment["repeat_compactions"] = args.repeat
     if args.repeat:
         environment["semantics"] += " Also measures three compact calls on unchanged output within the same open, reported separately; IDs may differ, but final SST contents must match."
@@ -112,7 +116,8 @@ def main():
                             print("COMPACTION_RESULT " + json.dumps(measured), flush=True)
                         shutil.rmtree(directory)
                     # Unchanged calls can preserve IDs; compare contents, not filenames.
-                    assert [d[1:] for d in digests["baseline"]] == [d[1:] for d in digests["engine"]], "SST output differs from baseline"
+                    if not args.allow_format_change:
+                        assert [d[1:] for d in digests["baseline"]] == [d[1:] for d in digests["engine"]], "SST output differs from baseline"
     summary = []
     for case, _ in cases:
         for stage in (["compact-merge", "compact-repeat"] if args.repeat else ["compact-merge"]):
@@ -128,7 +133,7 @@ def main():
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
     for row in summary:
         print("COMPACTION_SUMMARY " + json.dumps(row), flush=True)
-    print(f"COMPACTION_COMPLETE records={len(records)} identical_engine_outputs=true", flush=True)
+    print(f"COMPACTION_COMPLETE records={len(records)} identical_engine_outputs={str(not args.allow_format_change).lower()}", flush=True)
 
 
 if __name__ == "__main__":

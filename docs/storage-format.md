@@ -90,7 +90,7 @@ When a miss requires eviction,
 an unshared victim's frame and offset buffers can be reused for the incoming
 block; outstanding readers retain their original immutable block. Frames that
 cannot fit the budget do not evict entries for recycling: legacy blocks use a
-conservative offset-array bound and version 03 includes its index in the frame.
+conservative offset-array bound and versions 03 and 04 include their index in the frame.
 Reused frames follow the checksum and validation rules above. Cache charges include allocated buffer
 capacities and a per-entry allowance; no separate spare-buffer pool is retained.
 
@@ -123,6 +123,14 @@ and groups when their combined occupancy fits the configured merge thresholds.
 Logical deletes remain versioned tombstones until safe to discard.
 After creation, the owned iterator requires no engine state lock for I/O.
 Later writes or maintenance failures do not change an already captured snapshot.
+
+Version 04 SST metadata persists the maximum key under the summary frame CRC.
+Reopened scans and point reads can exclude files entirely below the requested
+key without loading their final data blocks. This adds four length bytes plus
+one maximum key per SST; the metadata key is held in memory after open. Empty
+SSTs store a zero length and have no key. An actual empty key remains valid in a
+nonempty SST. Versions 01–03 retain the lazy tail-read fallback. Metadata bounds
+are checked on open; reading the last block also checks its actual maximum.
 
 Each SST iterator seeks through the index to the lower-bound block, then searches
 within that block. It streams forward up to the upper bound, retaining one encoded
@@ -248,11 +256,11 @@ active WAL containing a batch even though the file magic is unchanged. Keep a
 closed-database backup before upgrading if rollback is needed. Batch support
 does not change SSTable or MANIFEST formats.
 
-Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST03`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
+Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST04`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
 
-The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
+The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64, followed in version 04 by maximum-key length u32 and maximum-key bytes (zero length for an empty SST). Versions 02/03 end their summary after the index-entry count. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
 
-Existing `RKVSST01` and `RKVSST02` SSTables remain readable alongside version `03` files. Flush and compaction write version `03`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read version `03` SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
+Existing `RKVSST01`, `RKVSST02`, and `RKVSST03` SSTables remain readable alongside version `04` files. Flush and compaction write version `04`; WAL and MANIFEST stay at version `01`. Older engine versions cannot read version `04` SSTables, so keep a backup made with all handles closed before upgrading if rollback is needed.
 
 Exact layouts: [records](../src/codec.rs), [WAL](../src/wal.rs), [SSTables](../src/sstable.rs), [manifest](../src/manifest.rs).
 

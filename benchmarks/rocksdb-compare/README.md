@@ -16,7 +16,7 @@ Fixtures are created once per case, before measured processes start:
   the production SST writer and manifest, without millions of WAL/fsync calls.
 - RocksDB's `SstFileWriter` and external-file ingestion create the same logical
   key/value dataset with the same number of disjoint, equally divided files.
-- Each engine uses its production SST format: version 03 for this library.
+- Each engine uses its production SST format: version 04 for this library (versions 01–03 remain readable).
 - Every backend runs at 4, 8 and 16 KiB block sizes, with an 8 MiB block-cache
   budget, ten Bloom bits per key and no compression. Metadata is outside the
   block cache. The library's default block size remains 16 KiB; the benchmark
@@ -140,3 +140,19 @@ dirty copytree output from charging fixture publication to one backend during
 a later timed compaction merely because its open path performs fewer syncs.
 The preparation is identical for baseline, current and RocksDB and excluded
 from the reported child-process throughput.
+
+## First post-open range bounds
+
+`python3 benchmarks/rocksdb-compare/bounds.py bounds-results` compares 4/16
+nonoverlapping SSTs, 128 B/16 KiB values, and gap/above-all/hit ranges. Each
+backend prepares the same logical writes in its native format, because reusing
+version 03 engine files would omit the version 04 metadata under test. Six
+rotated trials report open, the first scan and 2,000 repeats separately, with
+warm OS cache and the data-block cache disabled. Full data verification and
+reopen happen outside timing. This is a first-query I/O diagnostic, not a
+cold-device latency or universal throughput claim.
+
+For compaction across a deliberate storage-format change, pass
+`--allow-format-change` to `compactions.py`. The default still requires identical
+baseline/current SST bytes; the explicit option keeps complete logical/reopen
+verification and output digests while allowing new metadata bytes.

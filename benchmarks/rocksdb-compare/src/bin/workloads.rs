@@ -1,5 +1,7 @@
 #[path = "../workloads_backend.rs"]
 mod backend;
+#[path = "../bounds_workload.rs"]
+mod bounds_workload;
 use backend::Backend;
 use serde_json::{json, Value};
 use std::{
@@ -1269,6 +1271,8 @@ fn main() -> Result<()> {
     let raw: Value = serde_json::from_str(&args[3])?;
     let c = Config::parse(&raw);
     match args[1].as_str() {
+        "prepare-bounds" => bounds_workload::prepare_bounds(path, &c)?,
+        "bounds-read" => bounds_workload::bounds_read(path, &c, &raw)?,
         "overwrite-keys" => overwrite_keys(path, &c, &raw)?,
         "tombstone-scan" => tombstone_scan(path, &c, &raw)?,
         "reopen-loop" => reopen_loop(path, &c, &raw)?,

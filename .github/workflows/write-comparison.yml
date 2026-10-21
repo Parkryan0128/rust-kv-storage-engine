@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: ${{ contains(github.event.head_commit.message, '[replace-perf]') }}
 jobs:
   compare:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]') || contains(github.event.head_commit.message, '[15-perf]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]') || contains(github.event.head_commit.message, '[15-perf]') || contains(github.event.head_commit.message, '[16-perf]')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -74,6 +74,7 @@ jobs:
           cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
           cp benchmarks/rocksdb-compare/src/bin/workloads.rs baseline/benchmarks/rocksdb-compare/src/bin/workloads.rs
           cp benchmarks/rocksdb-compare/src/workloads_backend.rs baseline/benchmarks/rocksdb-compare/src/workloads_backend.rs
+          cp benchmarks/rocksdb-compare/src/bounds_workload.rs baseline/benchmarks/rocksdb-compare/src/bounds_workload.rs
           cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads
           cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads -- -D warnings
@@ -82,6 +83,24 @@ jobs:
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Compare persisted range bounds and format regression guards
+        if: contains(github.event.head_commit.message, '[16-perf]')
+        timeout-minutes: 12
+        run: |
+          python3 benchmarks/rocksdb-compare/bounds.py bounds-results
+          python3 benchmarks/rocksdb-compare/compactions.py compaction-results --allow-format-change
+          python3 benchmarks/rocksdb-compare/workloads.py point-guard-results --baseline --reads-only --profile 1 --scenario uniform-t1-span0
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bounds-format-comparison
+          path: |
+            bounds-results/
+            compaction-results/
+            point-guard-results/
+          if-no-files-found: ignore
       - name: Compare explicit compact requests and complete maintenance drain
         if: contains(github.event.head_commit.message, '[15-perf]')
         timeout-minutes: 12

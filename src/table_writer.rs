@@ -180,6 +180,7 @@ impl TableWriter {
             self.max_seq,
             &self.bloom,
             &self.index,
+            Some(last_key.get().map_or(&[], Vec::as_slice)),
         )?;
         let mut footer = Vec::new();
         footer.extend(MAGIC);
@@ -291,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn published_metadata_matches_reopened_table_and_bounds_are_learned_lazily() {
+    fn published_metadata_and_bounds_match_reopened_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.sst");
         let mut writer = TableWriter::new(&path, 300, 512, 10, false).unwrap();
@@ -321,7 +322,7 @@ mod tests {
         for (a, b) in published.index.iter().zip(&reopened.index) {
             assert_eq!((&a.first, a.offset, a.len), (&b.first, b.offset, b.len));
         }
-        assert!(reopened.last_key.get().is_none());
+        assert_eq!(reopened.last_key.get(), published.last_key.get());
         let cache = BlockCache::new(0);
         let counters = Counters::default();
         for n in 0..300u64 {
@@ -396,7 +397,6 @@ mod tests {
                         )
                         .unwrap();
                 }
-                writer.flush_block().unwrap();
                 if buffered && sizes.iter().sum::<usize>() < OUTPUT_BUFFER_BYTES / 2 {
                     assert_eq!(writer.file.get_ref().metadata().unwrap().len(), 0);
                     assert_eq!(writer.file.buffer().len() as u64, writer.position);
