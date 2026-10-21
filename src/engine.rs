@@ -152,6 +152,9 @@ struct State {
     sequence: u64,
     next_id: u64,
     fatal: Option<String>,
+    // Proof is local to this open and its immutable options. Reopened/legacy
+    // files must undergo a full merge before an unchanged singleton can skip it.
+    compacted_table: Option<u64>,
 }
 struct Disk {
     dir: PathBuf,
@@ -210,6 +213,7 @@ impl Engine {
                 sequence: 0,
                 next_id: 1,
                 fatal: None,
+                compacted_table: None,
             },
         )
         .expect("in-memory engine has no fallible startup")
@@ -340,6 +344,7 @@ impl Engine {
             sequence,
             next_id,
             fatal: None,
+            compacted_table: None,
         };
         Self::build(options, Some(Disk { dir, _lock: lock }), active, state)
     }
@@ -518,16 +523,7 @@ impl Engine {
         if c.disk.is_none() {
             return check(&c.state.read());
         }
-        let goal = {
-            let mut w = c.writer.lock();
-            c.wait_room()?;
-            if let Err(e) = c.freeze(&mut w) {
-                c.poison(&e);
-                return Err(e);
-            }
-            let s = c.state.read();
-            s.immutable.back().map_or(s.manifest.wal_floor, |f| f.id)
-        };
+        let goal = c.flush_goal()?;
         c.wake();
         let mut guard = c.maintenance.lock();
         let result = (|| loop {
@@ -546,18 +542,33 @@ impl Engine {
     }
     /// Flush, then merge all live SSTs.
     pub fn compact(&self) -> Result<()> {
-        self.flush()?;
         let c = &self.inner.core;
         if c.disk.is_none() {
-            return Ok(());
+            return check(&c.state.read());
         }
+        // Capture a finite writer barrier without first draining automatic merges.
+        // Taking maintenance before wait_room would deadlock a full frozen queue.
+        let goal = c.flush_goal()?;
+        #[cfg(test)]
+        crate::test_hooks::pause("compact_after_goal");
+        c.wake();
         let mut guard = c.maintenance.lock();
-        check(&c.state.read())?;
-        // A worker may have started another plan after flush released the lock.
-        // Explicit compaction supersedes it with the current live snapshot.
-        guard.pending.clear();
-        guard.prefer_flush = true;
-        let result = c.compact_all();
+        let result = (|| {
+            check(&c.state.read())?;
+            // Supersede any partially published plan using the live SST snapshot.
+            guard.pending.clear();
+            guard.prefer_flush = true;
+            loop {
+                let s = c.state.read();
+                check(&s)?;
+                if s.manifest.wal_floor >= goal {
+                    break;
+                }
+                drop(s);
+                c.flush_one()?;
+            }
+            c.compact_all()
+        })();
         if let Err(e) = &result {
             c.poison(e);
         }
@@ -955,6 +966,19 @@ impl Core {
         s.sequence = seq;
         Ok(())
     }
+    // No maintenance lock may be held here: rotation may wait for a flush.
+    fn flush_goal(&self) -> Result<u64> {
+        let mut w = self.writer.lock();
+        self.wait_room()?;
+        if let Err(e) = self.freeze(&mut w) {
+            self.poison(&e);
+            return Err(e);
+        }
+        let s = self.state.read();
+        check(&s)?;
+        Ok(s.immutable.back().map_or(s.manifest.wal_floor, |f| f.id))
+    }
+
     fn freeze(&self, w: &mut Option<Wal>) -> Result<()> {
         {
             let s = self.state.read();
@@ -1001,6 +1025,7 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
+            s.compacted_table = None;
             let tables = Arc::make_mut(&mut s.tables);
             tables.push(table);
             tables.sort_unstable_by_key(|table| Reverse(table.max_seq));
@@ -1070,7 +1095,14 @@ impl Core {
         )
     }
     fn compact_all(&self) -> Result<()> {
-        let tables = self.state.read().tables.as_ref().clone();
+        let tables = {
+            let s = self.state.read();
+            check(&s)?;
+            if s.tables.len() == 1 && s.compacted_table == Some(s.tables[0].id) {
+                return Ok(());
+            }
+            s.tables.as_ref().clone()
+        };
         self.compact_tables(tables)
     }
     fn compact_tables(&self, tables: Vec<Arc<Table>>) -> Result<()> {
@@ -1125,6 +1157,7 @@ impl Core {
         {
             let mut s = self.state.write();
             s.manifest = manifest;
+            s.compacted_table = drop_tombstones.then_some(merged.id);
             let live = Arc::make_mut(&mut s.tables);
             live.retain(|t| !selected.contains(&t.id));
             live.push(merged.clone());
@@ -1333,3 +1366,11 @@ mod open_tests {
 #[cfg(test)]
 #[path = "maintenance_profile.rs"]
 mod maintenance_profile;
+
+#[cfg(test)]
+#[path = "compact_request_tests.rs"]
+mod compact_request_tests;
+
+#[cfg(test)]
+#[path = "compact_profile.rs"]
+mod compact_profile;

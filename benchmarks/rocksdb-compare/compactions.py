@@ -31,6 +31,7 @@ def warm(directory):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--repeat", action="store_true", help="Also time three unchanged compact requests")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -49,6 +50,9 @@ def main():
         "limits": "Shared CI, warm OS cache, bounded single compactions. Different native table layouts and compaction policies across engine/RocksDB. No claim about sustained writes, cold devices or fsync-tail causality.",
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
     }
+    environment["repeat_compactions"] = args.repeat
+    if args.repeat:
+        environment["semantics"] += " Also measures three compact calls on unchanged output within the same open, reported separately; IDs may differ, but final SST contents must match."
     records = []
     with tempfile.TemporaryDirectory(prefix="kv-compactions-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
@@ -67,7 +71,7 @@ def main():
 
         fixtures = {}
         for case, settings in cases:
-            config = dict(settings, fixed=True, generations=4, memtable=64 * 1024 * 1024, cache=0)
+            config = dict(settings, fixed=True, generations=4, memtable=64 * 1024 * 1024, cache=0, repeat_compactions=args.repeat)
             fixtures[case] = {}
             for name in ["baseline", "rocksdb"]:
                 directory = root / ("fixture-" + case + name)
@@ -82,7 +86,7 @@ def main():
             for trial in range(6):
                 offset = trial % len(cases)
                 for case, settings in cases[offset:] + cases[:offset]:
-                    config = dict(settings, fixed=True, generations=4, memtable=64 * 1024 * 1024, cache=0)
+                    config = dict(settings, fixed=True, generations=4, memtable=64 * 1024 * 1024, cache=0, repeat_compactions=args.repeat)
                     digests = {}
                     order_offset = trial % len(names)
                     for order, name in enumerate(names[order_offset:] + names[:order_offset], 1):
@@ -93,31 +97,34 @@ def main():
                         warm(directory)
                         stdout = run(name, "compact-merge", directory, config, label)
                         rows = [json.loads(line.removeprefix("WORKLOAD_RESULT ")) for line in stdout.splitlines() if line.startswith("WORKLOAD_RESULT ")]
-                        assert len(rows) == 1 and rows[0]["stage"] == "compact-merge"
-                        row = rows[0]
-                        assert row["config"] == config
-                        assert row["backend"] == ("rocksdb" if name == "rocksdb" else "engine")
-                        row.update(backend=name, case=case, trial=trial+1, order=order)
+                        assert [r["stage"] for r in rows] == (["compact-merge", "compact-repeat"] if args.repeat else ["compact-merge"])
                         if name != "rocksdb":
                             digests[name] = sst_digest(directory)
-                            row["output_sst_digest"] = digests[name]
-                        records.append(row)
-                        output.write(json.dumps(row) + "\n")
-                        output.flush()
-                        print("COMPACTION_RESULT " + json.dumps(row), flush=True)
+                        for measured in rows:
+                            assert measured["config"] == config
+                            assert measured["backend"] == ("rocksdb" if name == "rocksdb" else "engine")
+                            measured.update(backend=name, case=case, trial=trial+1, order=order)
+                            if name != "rocksdb":
+                                measured["output_sst_digest"] = digests[name]
+                            records.append(measured)
+                            output.write(json.dumps(measured) + "\n")
+                            output.flush()
+                            print("COMPACTION_RESULT " + json.dumps(measured), flush=True)
                         shutil.rmtree(directory)
-                    assert digests["baseline"] == digests["engine"], "SST output differs from baseline"
+                    # Unchanged calls can preserve IDs; compare contents, not filenames.
+                    assert [d[1:] for d in digests["baseline"]] == [d[1:] for d in digests["engine"]], "SST output differs from baseline"
     summary = []
     for case, _ in cases:
-        for name in names:
-            rows = [r for r in records if r["case"] == case and r["backend"] == name]
-            times = [r["metrics"]["seconds"] for r in rows]
-            ratios = []
-            for row in rows:
-                base = next(r for r in records if r["case"] == case and r["backend"] == "baseline" and r["trial"] == row["trial"])
-                ratios.append(base["metrics"]["seconds"] / row["metrics"]["seconds"])
-            summary.append({"case": case, "backend": name, "median_seconds": statistics.median(times), "min_seconds": min(times), "max_seconds": max(times), "paired_speed_vs_baseline": ratios,
-                            "median_peak_rss_kib": statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in rows)})
+        for stage in (["compact-merge", "compact-repeat"] if args.repeat else ["compact-merge"]):
+            for name in names:
+                rows = [r for r in records if r["case"] == case and r["backend"] == name and r["stage"] == stage]
+                times = [r["metrics"]["seconds"] for r in rows]
+                ratios = []
+                for row in rows:
+                    base = next(r for r in records if r["case"] == case and r["backend"] == "baseline" and r["trial"] == row["trial"] and r["stage"] == stage)
+                    ratios.append(base["metrics"]["seconds"] / row["metrics"]["seconds"])
+                summary.append({"case": case, "stage": stage, "backend": name, "median_seconds": statistics.median(times), "min_seconds": min(times), "max_seconds": max(times), "paired_speed_vs_baseline": ratios,
+                                "median_peak_rss_kib": statistics.median(r["metrics"]["after"]["peak_rss_kib"] for r in rows)})
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
     for row in summary:
         print("COMPACTION_SUMMARY " + json.dumps(row), flush=True)

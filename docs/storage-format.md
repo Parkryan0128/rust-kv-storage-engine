@@ -162,6 +162,14 @@ Partial merges keep tombstones so old values in other files stay deleted. A full
 
 `flush()` saves earlier writes and waits for eligible compactions. `compact()` also requests a full merge.
 
+Explicit `compact()` flushes the writes before its writer barrier and requests one
+full merge, without first draining redundant automatic merges. An unchanged
+single SST already produced by a full merge during this open is reused, keeping
+its file and cache entries. This proof is cleared on reopen; the first explicit
+compaction then still rewrites the SST with the current options and format.
+New SST publication invalidates the proof.
+
+
 Each merge retains one validated encoded block per input and compares borrowed
 keys and sequence numbers. Only the winning record is copied for output;
 superseded versions and safely discarded tombstones need no owned copies.

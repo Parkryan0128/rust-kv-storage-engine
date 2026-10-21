@@ -952,70 +952,82 @@ mod tests {
 
     #[test]
     fn legacy_sst_can_be_read_and_compacted_with_new_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        drop(Engine::open(dir.path()).unwrap());
-        let path = dir.path().join("sst/00000000000000000002.sst");
-        let mut f = File::create(&path).unwrap();
-        f.write_all(LEGACY_MAGIC).unwrap();
-        let mut index = vec![];
-        let mut bloom = Bloom::new(2, 10);
-        for (key, seq, value) in [
-            (&b"a"[..], 1, Some(Bytes::from_static(b"old"))),
-            (&b"deleted"[..], 2, None),
-        ] {
-            let mut block = vec![];
-            encode_record(key, &Record { seq, value }, &mut block);
-            write_block(&mut f, &mut block, key, &mut index).unwrap();
-            bloom.insert(key);
-        }
-        let offset = f.stream_position().unwrap();
-        let mut meta = vec![];
-        put_u64(&mut meta, 2);
-        put_u64(&mut meta, 2);
-        bloom.encode(&mut meta);
-        put_u32(&mut meta, index.len() as u32);
-        for i in index {
-            put_u32(&mut meta, i.first.len() as u32);
-            meta.extend(i.first);
-            put_u64(&mut meta, i.offset);
-            put_u32(&mut meta, i.len);
-        }
-        let size = write_frame(&mut f, &meta).unwrap();
-        let mut footer = LEGACY_MAGIC.to_vec();
-        put_u64(&mut footer, offset);
-        put_u32(&mut footer, size as u32);
-        let checksum = crc32fast::hash(&footer);
-        put_u32(&mut footer, checksum);
-        f.write_all(&footer).unwrap();
-        f.sync_all().unwrap();
-        drop(f);
-        Manifest {
-            wal_floor: 0,
-            max_seq: 2,
-            tables: vec![2],
-        }
-        .save(dir.path())
-        .unwrap();
+        for singleton_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(Engine::open(dir.path()).unwrap());
+            let path = dir.path().join("sst/00000000000000000002.sst");
+            let mut f = File::create(&path).unwrap();
+            f.write_all(LEGACY_MAGIC).unwrap();
+            let mut index = vec![];
+            let mut bloom = Bloom::new(2, 10);
+            for (key, seq, value) in [
+                (&b"a"[..], 1, Some(Bytes::from_static(b"old"))),
+                (&b"deleted"[..], 2, None),
+            ] {
+                let mut block = vec![];
+                encode_record(key, &Record { seq, value }, &mut block);
+                write_block(&mut f, &mut block, key, &mut index).unwrap();
+                bloom.insert(key);
+            }
+            let offset = f.stream_position().unwrap();
+            let mut meta = vec![];
+            put_u64(&mut meta, 2);
+            put_u64(&mut meta, 2);
+            bloom.encode(&mut meta);
+            put_u32(&mut meta, index.len() as u32);
+            for i in index {
+                put_u32(&mut meta, i.first.len() as u32);
+                meta.extend(i.first);
+                put_u64(&mut meta, i.offset);
+                put_u32(&mut meta, i.len);
+            }
+            let size = write_frame(&mut f, &meta).unwrap();
+            let mut footer = LEGACY_MAGIC.to_vec();
+            put_u64(&mut footer, offset);
+            put_u32(&mut footer, size as u32);
+            let checksum = crc32fast::hash(&footer);
+            put_u32(&mut footer, checksum);
+            f.write_all(&footer).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            Manifest {
+                wal_floor: 0,
+                max_seq: 2,
+                tables: vec![2],
+            }
+            .save(dir.path())
+            .unwrap();
 
-        let db = Engine::open(dir.path()).unwrap();
-        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"old"[..]));
-        assert_eq!(db.get(b"deleted").unwrap(), None);
-        db.put(b"b", b"new").unwrap();
-        db.flush().unwrap();
-        assert_eq!(db.stats().sst_files, 2);
-        assert_eq!(
-            db.scan(..).unwrap().collect::<Result<Vec<_>>>().unwrap(),
-            [
-                (b"a".to_vec(), Bytes::from_static(b"old")),
-                (b"b".to_vec(), Bytes::from_static(b"new"))
-            ]
-        );
-        db.compact().unwrap();
-        drop(db);
-        let db = Engine::open(dir.path()).unwrap();
-        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"old"[..]));
-        assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"new"[..]));
-        assert_eq!(db.get(b"deleted").unwrap(), None);
+            let db = Engine::open(dir.path()).unwrap();
+            assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"old"[..]));
+            assert_eq!(db.get(b"deleted").unwrap(), None);
+            if singleton_first {
+                db.compact().unwrap();
+                assert_eq!(db.stats().sst_records, 1);
+                assert_eq!(db.stats().sequence, 2);
+                let id = db.inspect().unwrap().tables[0].id;
+                let encoded = fs::read(dir.path().join(format!("sst/{id:020}.sst"))).unwrap();
+                assert_eq!(&encoded[..8], MAGIC);
+                db.compact().unwrap();
+                assert_eq!(db.stats().compactions, 1);
+            }
+            db.put(b"b", b"new").unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.stats().sst_files, 2);
+            assert_eq!(
+                db.scan(..).unwrap().collect::<Result<Vec<_>>>().unwrap(),
+                [
+                    (b"a".to_vec(), Bytes::from_static(b"old")),
+                    (b"b".to_vec(), Bytes::from_static(b"new"))
+                ]
+            );
+            db.compact().unwrap();
+            drop(db);
+            let db = Engine::open(dir.path()).unwrap();
+            assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"old"[..]));
+            assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"new"[..]));
+            assert_eq!(db.get(b"deleted").unwrap(), None);
+        }
     }
 
     #[test]

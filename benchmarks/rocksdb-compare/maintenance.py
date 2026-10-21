@@ -4,6 +4,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+profile = sys.argv[2] if len(sys.argv) > 2 else "maintenance_yield_profile"
+prefix, expected_rows = {"maintenance_yield_profile": ("MAINTENANCE", 2),
+                         "compact_request_profile": ("COMPACT_REQUEST", 3)}[profile]
 output = Path(sys.argv[1])
 output.mkdir(parents=True, exist_ok=True)
 binaries = {}
@@ -23,7 +26,7 @@ with (output / "results.jsonl").open("w") as sink:
     for trial in range(1, 7):
         names = ["baseline", "engine"] if trial % 2 else ["engine", "baseline"]
         for name in names:
-            run = subprocess.run([binaries[name], "maintenance_yield_profile",
+            run = subprocess.run([binaries[name], profile,
                                   "--ignored", "--nocapture", "--test-threads=1"],
                                  text=True, capture_output=True, timeout=90)
             (output / f"{trial}-{name}.log").write_text(run.stdout + run.stderr)
@@ -32,12 +35,12 @@ with (output / "results.jsonl").open("w") as sink:
             run.check_returncode()
             count = 0
             for line in run.stdout.splitlines():
-                if "MAINTENANCE_PROFILE " in line:
-                    row = json.loads(line.split("MAINTENANCE_PROFILE ", 1)[1])
+                if prefix + "_PROFILE " in line:
+                    row = json.loads(line.split(prefix + "_PROFILE ", 1)[1])
                     row.update(backend=name, trial=trial, build_mode="release-libtest")
                     sink.write(json.dumps(row) + "\n")
                     sink.flush()
-                    print("MAINTENANCE_RESULT " + json.dumps(row), flush=True)
+                    print(prefix + "_RESULT " + json.dumps(row), flush=True)
                     count += 1
-            assert count == 2, count
-print("MAINTENANCE_COMPLETE records=24", flush=True)
+            assert count == expected_rows, count
+print(f"{prefix}_COMPLETE records={6 * 2 * expected_rows}", flush=True)

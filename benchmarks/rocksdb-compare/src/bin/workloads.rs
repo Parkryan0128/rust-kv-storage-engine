@@ -358,6 +358,22 @@ fn compact_merge(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         json!({"seconds":seconds,"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
     );
     verify_merge(&db, c)?;
+    if raw["repeat_compactions"].as_bool().unwrap_or(false) {
+        let before = metrics(path)?;
+        let stats_before = db.stats()?;
+        let start = Instant::now();
+        for _ in 0..3 {
+            db.compact()?;
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        report(
+            "compact-repeat",
+            raw,
+            json!({"seconds":seconds,"operations":3,"before":before,"after":metrics(path)?,
+                   "stats_before":stats_before,"stats_after":db.stats()?}),
+        );
+        verify_merge(&db, c)?;
+    }
     drop(db);
     let db = Backend::open(path, c)?;
     verify_merge(&db, c)

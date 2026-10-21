@@ -54,6 +54,14 @@ db.flush()?;
 db.compact()?;
 ```
 
+
+Explicit `compact()` flushes the writes before its writer barrier and requests one
+full merge, without first draining redundant automatic merges. An unchanged
+single SST already produced by a full merge during this open is reused, keeping
+its file and cache entries. This proof is cleared on reopen; the first explicit
+compaction then still rewrites the SST with the current options and format.
+New SST publication invalidates the proof.
+
 Persistent writes are synced to the WAL before returning. After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
 
 Commit several puts and deletes atomically with `WriteBatch`:
