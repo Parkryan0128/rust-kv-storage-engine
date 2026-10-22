@@ -1,11 +1,11 @@
 """Random-read-only comparison across equal 4/8/16 KiB block sizes."""
+import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import subprocess
-import sys
 import tempfile
 import zlib
 
@@ -32,9 +32,13 @@ def logged(command, env, path, timeout):
 
 
 def main():
-    output = Path(sys.argv[1] if len(sys.argv) > 1 else "comparison-results")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", type=Path, nargs="?", default=Path("comparison-results"))
+    parser.add_argument("--baseline", action="store_true", help="Include the baseline binary with its native SST fixtures")
+    args = parser.parse_args()
+    output = args.output
     output.mkdir(parents=True, exist_ok=True)
-    names = ("engine", "rocksdb")
+    names = ("baseline", "engine", "rocksdb") if args.baseline else ("engine", "rocksdb")
     binaries = {name: Path("comparison-bin", name).resolve() for name in names}
     smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
     queries = 1000 if smoke else 500_000
@@ -73,16 +77,19 @@ def main():
             "Fixture creation and OS-cache warming are outside measured processes.",
             "Fresh process/block cache per trial; two identical seeded random passes.",
             "Read-only fixed layouts: engine compaction trigger 64; RocksDB read-only open.",
-            "Block-size order rotates twice; backend order alternates across six trials.",
+            "Block-size and backend order rotate across six trials.",
             "RSS excludes fixture creation and OS page cache.",
-            "Engine uses its production V3 SST writer; RocksDB uses its production SST writer.",
-            "V3 full record validation is cached per block within each fresh engine process; every disk read still checks the full frame CRC.",
+            "Each engine revision writes its native SST format; RocksDB uses its production SST writer.",
+            "Both Get APIs return owned values. Older pinned-Get measurements are not directly comparable.",
+            "Full record validation is cached per block within each fresh engine process; every disk read still checks the full frame CRC.",
             "Latency samples time Get only; throughput includes RNG, validation and value release.",
             "Single-client OS-cache-warm hit workload, not physical-disk or write performance.",
             "READ_PROFILE is a separate forced-miss microbenchmark, not an end-to-end CPU profile.",
             "Profile CRC-only time overlaps decode; routing/cache/locks/allocation are excluded.",
         ],
     }
+    if args.baseline:
+        metadata["baseline"] = capture("git", "-C", "baseline", "rev-parse", "HEAD")
     with tempfile.TemporaryDirectory(prefix="kvread-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         metadata["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
@@ -96,52 +103,48 @@ def main():
                 fixtures = {}
                 for block_bytes in block_sizes:
                     label = f"{case}-{block_bytes}"
-                    engine_dir = root / (label + "-engine")
-                    rocks_dir = root / (label + "-rocksdb")
-                    env = dict(os.environ, KV_READ_FIXTURE_DIR=str(engine_dir),
-                               KV_READ_FIXTURE_KEYS=str(keys), KV_READ_FIXTURE_VALUE_BYTES=str(size),
-                               KV_READ_FIXTURE_TABLES=str(tables),
-                               KV_READ_FIXTURE_BLOCK_BYTES=str(block_bytes),
-                               KV_READ_BLOCK_BYTES=str(block_bytes))
-                    fixtures[block_bytes] = (engine_dir, rocks_dir, env)
+                    directories = {name: root / (label + "-" + name) for name in names}
+                    env = dict(os.environ, KV_READ_FIXTURE_KEYS=str(keys),
+                               KV_READ_FIXTURE_VALUE_BYTES=str(size), KV_READ_FIXTURE_TABLES=str(tables),
+                               KV_READ_FIXTURE_BLOCK_BYTES=str(block_bytes), KV_READ_BLOCK_BYTES=str(block_bytes))
+                    fixtures[block_bytes] = (directories, env)
                     print(f"READ_PREPARE {label}", flush=True)
-                    text = logged(
-                        ["cargo", "test", "--locked", "--release", "--lib",
-                         "read_fixture::write_read_benchmark_fixture", "--",
-                         "--ignored", "--exact", "--nocapture", "--test-threads=1"],
-                        env, output / f"{label}-fixture.log", 180,
-                    )
-                    configs = [json.loads(line.split("READ_FIXTURE_CONFIG ", 1)[1])
-                               for line in text.splitlines() if "READ_FIXTURE_CONFIG " in line]
-                    assert len(configs) == 1
-                    config = configs[0]
-                    assert config["block_bytes"] == block_bytes and config["keys"] == keys
-                    assert Path(config["source_root"]).resolve() == Path.cwd().resolve()
-                    print("READ_FIXTURE_CONFIG " + json.dumps(config), flush=True)
-                    subprocess.run(
-                        [str(binaries["rocksdb"]), "prepare", str(rocks_dir),
-                         str(keys), str(size), str(tables)], env=env, check=True, timeout=180,
-                    )
-                    if not smoke:
-                        for name, manifest in [("engine", "Cargo.toml")]:
-                            warm_files(engine_dir)
-                            source = Path(manifest).resolve().parent
-                            target = str(source / "target")
+                    for name in names:
+                        if name == "rocksdb":
+                            subprocess.run(
+                                [str(binaries[name]), "prepare", str(directories[name]),
+                                 str(keys), str(size), str(tables)], env=env, check=True, timeout=180)
+                            continue
+                        manifest = "baseline/Cargo.toml" if name == "baseline" else "Cargo.toml"
+                        source = Path(manifest).resolve().parent
+                        fixture_env = dict(env, KV_READ_FIXTURE_DIR=str(directories[name]))
+                        text = logged(
+                            ["cargo", "test", "--locked", "--release", "--lib", "--manifest-path", manifest,
+                             "read_fixture::write_read_benchmark_fixture", "--",
+                             "--ignored", "--exact", "--nocapture", "--test-threads=1"],
+                            fixture_env, output / f"{label}-{name}-fixture.log", 180)
+                        configs = [json.loads(line.split("READ_FIXTURE_CONFIG ", 1)[1])
+                                   for line in text.splitlines() if "READ_FIXTURE_CONFIG " in line]
+                        assert len(configs) == 1
+                        config = configs[0]
+                        assert config["block_bytes"] == block_bytes and config["keys"] == keys
+                        assert Path(config["source_root"]).resolve() == source
+                        print("READ_FIXTURE_CONFIG " + json.dumps(dict(config, backend=name)), flush=True)
+                        if not smoke:
+                            warm_files(directories[name])
                             text = logged(
                                 ["cargo", "test", "--locked", "--release", "--lib",
-                                 "--manifest-path", manifest, "--target-dir", target,
+                                 "--manifest-path", manifest, "--target-dir", str(source / "target"),
                                  "sstable::read_profile::profile_random_read_stages", "--",
                                  "--ignored", "--exact", "--nocapture", "--test-threads=1"],
-                                env, output / f"{label}-{name}-profile.log", 180,
-                            )
+                                fixture_env, output / f"{label}-{name}-profile.log", 180)
                             reports = [json.loads(line.split("READ_PROFILE ", 1)[1])
                                        for line in text.splitlines() if "READ_PROFILE " in line]
                             assert len(reports) == 1
                             report = reports[0]
                             assert report["keys"] == keys and report["block_bytes"] == block_bytes
                             assert Path(report["source_root"]).resolve() == source
-                            assert report["decoder_source_crc32"] == zlib.crc32(
-                                (source / "src/codec.rs").read_bytes())
+                            assert report["decoder_source_crc32"] == zlib.crc32((source / "src/codec.rs").read_bytes())
                             report["engine"] = name
                             profile_file.write(json.dumps(report) + "\n")
                             profile_file.flush()
@@ -153,9 +156,9 @@ def main():
                     order = names[rotation:] + names[:rotation]
                     seed = 0xACE123 + trial * 104729
                     for block_bytes in blocks:
-                        engine_dir, rocks_dir, env = fixtures[block_bytes]
+                        directories, env = fixtures[block_bytes]
                         for position, name in enumerate(order, 1):
-                            directory = rocks_dir if name == "rocksdb" else engine_dir
+                            directory = directories[name]
                             warm_files(directory)
                             label = f"{case}-{block_bytes}-{trial}-{name}"
                             print(f"READ_CASE {label}", flush=True)

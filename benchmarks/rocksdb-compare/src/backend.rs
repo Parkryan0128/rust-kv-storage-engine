@@ -68,8 +68,8 @@ impl Backend {
         })
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
-        Ok(self.db.get_pinned_opt(key, &self.read)?)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get_opt(key, &self.read)?)
     }
 
     pub fn stats(&self) -> Result<Value> {

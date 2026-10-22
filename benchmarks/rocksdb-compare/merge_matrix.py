@@ -26,6 +26,7 @@ from workloads import warm
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--allow-format-change", action="store_true", help="Verify logical outputs while retaining digests across SST format versions")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -44,6 +45,9 @@ def main():
         "limits": "Shared CI, warm OS cache, bounded single compactions. Different native table layouts and compaction policies across engine/RocksDB. No claim about sustained writes, cold devices or fsync-tail causality.",
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
     }
+    environment["allow_format_change"] = args.allow_format_change
+    if args.allow_format_change:
+        environment["semantics"] = environment["semantics"].replace("Final baseline/current SST files must match byte for byte.", "SST formats may differ; all logical values are verified after compaction and reopen. File digests are retained.")
     records = []
     with tempfile.TemporaryDirectory(prefix="kv-merge-matrix-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
@@ -104,7 +108,8 @@ def main():
                         output.flush()
                         print("MERGE_MATRIX_RESULT " + json.dumps(row), flush=True)
                         shutil.rmtree(directory)
-                    assert digests["baseline"] == digests["engine"], "SST output differs from baseline"
+                    if not args.allow_format_change:
+                        assert digests["baseline"] == digests["engine"], "SST output differs from baseline"
     summary = []
     for case, _ in cases:
         for name in names:
@@ -119,7 +124,7 @@ def main():
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
     for row in summary:
         print("MERGE_MATRIX_SUMMARY " + json.dumps(row), flush=True)
-    print(f"MERGE_MATRIX_COMPLETE records={len(records)} identical_engine_outputs=true", flush=True)
+    print(f"MERGE_MATRIX_COMPLETE records={len(records)} identical_engine_outputs={str(not args.allow_format_change).lower()}", flush=True)
 
 
 if __name__ == "__main__":

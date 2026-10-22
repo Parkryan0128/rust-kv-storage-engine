@@ -78,7 +78,7 @@ This fixed-layout, OS-cache-warm, single-client hit workload differs from the
 previous organically generated write/compaction workload. The old baseline was
 removed because it cannot read version 03 fixtures; do not directly subtract old
 benchmark numbers. Results do not establish cold-device, concurrent, missing-key,
-write, range-scan or durability performance. RocksDB uses pinned Get; the engine
+write, range-scan or durability performance. Earlier runs used RocksDB pinned Get; the engine
 returns independently owned values.
 
 Before measured trials, a separate ignored test samples 10,000 random uncached
@@ -156,3 +156,21 @@ For compaction across a deliberate storage-format change, pass
 `--allow-format-change` to `compactions.py`. The default still requires identical
 baseline/current SST bytes; the explicit option keeps complete logical/reopen
 verification and output digests while allowing new metadata bytes.
+
+
+## Complete comparison
+
+The opt-in `full-comparison` workflow runs every public workload profile, large
+random reads, native-format first ranges, durable writes, recovery, snapshots,
+cache pressure, memory scans, compaction matrices and internal diagnostics on one
+host. Use workflow_dispatch with an exact baseline SHA or a main commit carrying
+`[full-comparison] [baseline:<40-character SHA>]`. Production library code is
+not modified by this workflow. Internal profiles have no RocksDB equivalent.
+
+`run.py --baseline` includes all three revisions with independently generated
+native SST fixtures. The large random-read harness now uses **owned Get values
+on both backends**, so old pinned-Get rates are not directly comparable. It
+still includes validation in throughput; the general workloads suite measures
+verification separately. Merge matrices require an explicit
+`--allow-format-change` to relax file-byte equality across format versions;
+complete logical checks after compact and reopen remain mandatory.
