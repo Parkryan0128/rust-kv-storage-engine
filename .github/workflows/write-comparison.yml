@@ -59,6 +59,7 @@ jobs:
           ref: ${{ steps.baseline.outputs.ref }}
           path: baseline
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
       - name: Verify engine before benchmarking
         run: |
           cargo test --locked --release
@@ -67,7 +68,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: benchmarks/rocksdb-compare/target
-          key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+          key: rocksdb-compare-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
       - name: Build identical harnesses against baseline, current, and RocksDB
         run: |
           mkdir -p comparison-bin

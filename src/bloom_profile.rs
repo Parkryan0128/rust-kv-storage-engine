@@ -6,7 +6,7 @@ use std::{hint::black_box, time::Instant};
 #[test]
 #[ignore = "bounded hash diagnostic; run explicitly in release"]
 fn prefix_hash_profile() {
-    for len in [8usize, 32, 136, 1024] {
+    for len in [8usize, 32, 64, 136, 1024] {
         for common in [false, true] {
             let mut state = 7u64;
             let mut keys: Vec<Vec<u8>> = (0u64..8192)

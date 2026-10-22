@@ -32,7 +32,9 @@ fn finish_hash(mut h: u64) -> u64 {
 // Short keys bypass the cache, and arbitrary key order is still supported.
 pub(crate) struct PrefixHasher {
     prefix: [u8; 128],
-    len: usize,
+    len: u8,
+    misses: u8,
+    cooldown: u8,
     state: u64,
 }
 
@@ -41,6 +43,8 @@ impl Default for PrefixHasher {
         Self {
             prefix: [0; 128],
             len: 0,
+            misses: 0,
+            cooldown: 0,
             state: HASH_SEED,
         }
     }
@@ -48,16 +52,29 @@ impl Default for PrefixHasher {
 
 impl PrefixHasher {
     pub fn hash(&mut self, key: &[u8]) -> u64 {
-        if key.len() < 32 {
+        if key.len() < 64 {
+            return hash(key);
+        }
+        // Unrelated prefixes should not pay for a comparison and a copy on
+        // every key. Sample again after a bounded run of ordinary hashes.
+        if self.cooldown != 0 {
+            self.cooldown -= 1;
             return hash(key);
         }
         // Leave the usual numeric suffix out of the reusable prefix.
         let len = (key.len() - 8).min(self.prefix.len());
         let (prefix, suffix) = key.split_at(len);
-        if self.len != len || &self.prefix[..len] != prefix {
+        if usize::from(self.len) != len || &self.prefix[..len] != prefix {
             self.state = extend_hash(HASH_SEED, prefix);
             self.prefix[..len].copy_from_slice(prefix);
-            self.len = len;
+            self.len = len as u8;
+            self.misses += 1;
+            if self.misses == 2 {
+                self.misses = 0;
+                self.cooldown = 32;
+            }
+        } else {
+            self.misses = 0;
         }
         finish_hash(extend_hash(self.state, suffix))
     }
@@ -144,7 +161,9 @@ mod tests {
         let mut cached = PrefixHasher::default();
         let mut state = 7u64;
         for round in 0..8 {
-            for len in [0, 1, 8, 31, 32, 33, 127, 128, 135, 136, 137, 1024] {
+            for len in [
+                0, 1, 8, 31, 32, 33, 63, 64, 65, 127, 128, 135, 136, 137, 1024,
+            ] {
                 let mut key = vec![round; len];
                 for _ in 0..16 {
                     assert_eq!(cached.hash(&key), reference(&key));
@@ -165,6 +184,10 @@ mod tests {
             key.extend(n.to_be_bytes());
             assert_eq!(cached.hash(&key), reference(&key));
         }
+        // Prefix reuse resumes after unrelated keys trigger the cooldown.
+        assert_eq!(cached.len, 128);
+        assert_eq!(cached.cooldown, 0);
+        assert_eq!(cached.misses, 0);
     }
 
     #[test]
