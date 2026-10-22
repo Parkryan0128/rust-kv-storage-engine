@@ -22,7 +22,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 3
       CXXFLAGS: '-g0'
-      KV_BENCH_DIR: ${{ runner.temp }}
+      KV_BENCH_DIR: /tmp
     steps:
       - uses: actions/checkout@v4
       - name: Resolve baseline
