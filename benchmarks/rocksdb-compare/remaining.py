@@ -15,6 +15,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--trials", type=int, choices=range(1, 31), default=6)
     parser.add_argument("--scan-focus", action="store_true", help="Scan scaling plus memory lookup, writes and recovery guards")
+    parser.add_argument("--case", action="append", dest="cases", help="Run only these named cases (repeatable)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -64,6 +65,12 @@ def main():
             ("memory-get20k", "memory-get", dict(common, queries=200000), None),
             ("memory-get100k", "memory-get", dict(common, keys=100000, queries=200000), None),
         ])
+    if args.cases:
+        selected = set(args.cases)
+        unknown = selected - {case[0] for case in cases}
+        if unknown:
+            parser.error("Unknown cases: " + ", ".join(sorted(unknown)))
+        cases = [case for case in cases if case[0] in selected]
     records = []
     with tempfile.TemporaryDirectory(prefix="kv-remaining-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)

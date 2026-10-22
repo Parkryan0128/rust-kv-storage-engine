@@ -5,17 +5,64 @@ pub(crate) struct Bloom {
     probes: u32,
 }
 // Bloom format depends on this hash; bump the version if it changes.
+const HASH_SEED: u64 = 0xcbf29ce484222325;
+
 pub(crate) fn hash(key: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    finish_hash(extend_hash(HASH_SEED, key))
+}
+
+#[inline]
+fn extend_hash(mut h: u64, key: &[u8]) -> u64 {
     for b in key {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
+    h
+}
+
+#[inline]
+fn finish_hash(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
     h ^= h >> 33;
     h
 }
+// Sorted SST keys often share a long prefix. Keep only a bounded prefix and
+// its unfinished FNV state; the persisted hash remains exactly the same.
+// Short keys bypass the cache, and arbitrary key order is still supported.
+pub(crate) struct PrefixHasher {
+    prefix: [u8; 128],
+    len: usize,
+    state: u64,
+}
+
+impl Default for PrefixHasher {
+    fn default() -> Self {
+        Self {
+            prefix: [0; 128],
+            len: 0,
+            state: HASH_SEED,
+        }
+    }
+}
+
+impl PrefixHasher {
+    pub fn hash(&mut self, key: &[u8]) -> u64 {
+        if key.len() < 32 {
+            return hash(key);
+        }
+        // Leave the usual numeric suffix out of the reusable prefix.
+        let len = (key.len() - 8).min(self.prefix.len());
+        let (prefix, suffix) = key.split_at(len);
+        if self.len != len || &self.prefix[..len] != prefix {
+            self.state = extend_hash(HASH_SEED, prefix);
+            self.prefix[..len].copy_from_slice(prefix);
+            self.len = len;
+        }
+        finish_hash(extend_hash(self.state, suffix))
+    }
+}
+
 fn delta(hash: u64) -> u64 {
     hash.rotate_left(31).wrapping_mul(0xc4ceb9fe1a85ec53) | 1
 }
@@ -33,6 +80,7 @@ impl Bloom {
         let needed = Self::byte_len(count, bits_per_key);
         (count == 0 && needed < self.bits.len()) || needed < self.bits.len() / 2
     }
+    #[cfg(test)]
     pub fn insert(&mut self, key: &[u8]) {
         self.insert_hash(hash(key));
     }
@@ -81,6 +129,44 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefix_hash_preserves_format_across_lengths_prefix_changes_and_binary_keys() {
+        // Independent reference for the original persisted hash algorithm.
+        fn reference(key: &[u8]) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            for &byte in key {
+                h = (h ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51afd7ed558ccd);
+            h ^ (h >> 33)
+        }
+        let mut cached = PrefixHasher::default();
+        let mut state = 7u64;
+        for round in 0..8 {
+            for len in [0, 1, 8, 31, 32, 33, 127, 128, 135, 136, 137, 1024] {
+                let mut key = vec![round; len];
+                for _ in 0..16 {
+                    assert_eq!(cached.hash(&key), reference(&key));
+                    assert_eq!(hash(&key), reference(&key));
+                    // Change either the suffix or any part of the cached prefix.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if !key.is_empty() {
+                        key[state as usize % len] ^= (state >> 32) as u8;
+                    }
+                }
+            }
+        }
+        // Thousands of adjacent keys reuse a full 128-byte prefix.
+        for n in 0u64..4096 {
+            let mut key = vec![255; 128];
+            key.extend(n.to_be_bytes());
+            assert_eq!(cached.hash(&key), reference(&key));
+        }
+    }
+
     #[test]
     fn retained_hashes_preserve_persisted_bits_and_binary_keys() {
         let keys: &[&[u8]] = &[b"", b"a", b"b", b"a\0", &[0, 255, 128], b"long-key"];
@@ -135,3 +221,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bloom_profile.rs"]
+mod profile;

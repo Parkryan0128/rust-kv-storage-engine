@@ -177,17 +177,24 @@ impl Merge {
         let mut newest: Option<crate::codec::RecordRef<'_>> = None;
         for (i, cursor) in cursors.iter().enumerate() {
             if let Some(record) = cursor.current() {
-                if newest.as_ref().is_none_or(|old| record.key < old.key) {
-                    pending.clear();
-                    pending.push(i);
-                    newest = Some(record);
-                } else if let Some(old) = &mut newest {
-                    if record.key == old.key {
+                let order = newest
+                    .as_ref()
+                    .map_or(std::cmp::Ordering::Less, |old| record.key.cmp(old.key));
+                match order {
+                    std::cmp::Ordering::Less => {
+                        pending.clear();
                         pending.push(i);
-                        if record.seq > old.seq {
-                            *old = record;
+                        newest = Some(record);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        pending.push(i);
+                        if let Some(old) = &mut newest {
+                            if record.seq > old.seq {
+                                *old = record;
+                            }
                         }
                     }
+                    std::cmp::Ordering::Greater => {}
                 }
             }
         }

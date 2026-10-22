@@ -11,6 +11,7 @@ pub(crate) struct TableWriter {
     file: BufWriter<File>,
     index: Vec<Index>,
     bloom: Bloom,
+    bloom_hasher: crate::bloom::PrefixHasher,
     // A bounded compaction-only shortcut. None uses output readback if needed.
     bloom_hashes: Option<Vec<u64>>,
     block: Vec<u8>,
@@ -43,6 +44,7 @@ impl TableWriter {
             file,
             index: Vec::new(),
             bloom: Bloom::new(estimate, bloom_bits),
+            bloom_hasher: crate::bloom::PrefixHasher::default(),
             bloom_hashes: retain_hashes.then(Vec::new),
             block: vec![0; HEADER],
             offsets: Vec::new(),
@@ -84,7 +86,7 @@ impl TableWriter {
         if self.offsets.is_empty() {
             self.first = key.to_vec();
         }
-        let hash = crate::bloom::hash(key);
+        let hash = self.bloom_hasher.hash(key);
         self.bloom.insert_hash(hash);
         if let Some(hashes) = &mut self.bloom_hashes {
             if hashes.len() == MAX_BLOOM_HASHES {
@@ -168,7 +170,8 @@ impl TableWriter {
                         b: indexed_records(frame_payload(&self.block)?)?,
                     };
                     while !c.b.is_empty() {
-                        self.bloom.insert(decode_record_ref(&mut c)?.key);
+                        let hash = self.bloom_hasher.hash(decode_record_ref(&mut c)?.key);
+                        self.bloom.insert_hash(hash);
                     }
                 }
             }
@@ -370,6 +373,49 @@ mod tests {
                 outputs.push(fs::read(path).unwrap());
             }
             assert_eq!(outputs[0], outputs[1], "count={count}");
+        }
+    }
+
+    #[test]
+    fn long_prefix_hashes_survive_bloom_rebuild_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [MAX_BLOOM_HASHES, MAX_BLOOM_HASHES + 1] {
+            let mut expected = Bloom::new(count as u64, 10);
+            let keys: Vec<_> = (0..count as u64)
+                .map(|n| {
+                    let mut key = vec![(n / 4096) as u8; 128];
+                    key.extend(n.to_be_bytes());
+                    expected.insert(&key);
+                    key
+                })
+                .collect();
+            let mut expected_bits = Vec::new();
+            expected.encode(&mut expected_bits);
+            let mut outputs = Vec::new();
+            for retain in [false, true] {
+                let path = dir.path().join(format!("prefix-{count}-{retain}.sst"));
+                let mut writer =
+                    TableWriter::new(&path, count as u64 * 4, 4096, 10, retain).unwrap();
+                for (n, key) in keys.iter().enumerate() {
+                    writer.push(key, n as u64 + 1, Some(&[42; 32])).unwrap();
+                }
+                assert!(writer.bloom.needs_rebuild(count as u64, 10));
+                writer.finish(&path, 1, 10).unwrap();
+                let reopened = Table::open(&path, 1).unwrap();
+                let mut actual_bits = Vec::new();
+                reopened.bloom.encode(&mut actual_bits);
+                assert_eq!(actual_bits, expected_bits);
+                let cache = BlockCache::new(0);
+                let counters = Counters::default();
+                for key in &keys {
+                    assert_eq!(
+                        reopened.get(key, &cache, &counters).unwrap().unwrap().value,
+                        Some(bytes::Bytes::from_static(&[42; 32]))
+                    );
+                }
+                outputs.push(fs::read(&path).unwrap());
+            }
+            assert_eq!(outputs[0], outputs[1]);
         }
     }
 

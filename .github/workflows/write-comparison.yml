@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: ${{ contains(github.event.head_commit.message, '[replace-perf]') }}
 jobs:
   compare:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]') || contains(github.event.head_commit.message, '[15-perf]') || contains(github.event.head_commit.message, '[16-perf]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-perf]') || contains(github.event.head_commit.message, '[compact-perf]') || contains(github.event.head_commit.message, '[cleanup-perf]') || contains(github.event.head_commit.message, '[paired-perf]') || contains(github.event.head_commit.message, '[followup-perf]') || contains(github.event.head_commit.message, '[scan-perf]') || contains(github.event.head_commit.message, '[15-perf]') || contains(github.event.head_commit.message, '[16-perf]') || contains(github.event.head_commit.message, '[18-perf]')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -83,6 +83,25 @@ jobs:
           cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks -- -D warnings
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+      - name: Compare prefix hashing and merge publication
+        if: contains(github.event.head_commit.message, '[18-perf]')
+        timeout-minutes: 12
+        run: |
+          mkdir -p prefix-results
+          set -o pipefail
+          cargo test --locked --release --lib prefix_hash_profile -- --ignored --nocapture --test-threads=1 | tee prefix-results/hash-profile.log
+          python3 benchmarks/rocksdb-compare/merge_matrix.py prefix-results/merge-matrix
+          python3 benchmarks/rocksdb-compare/compactions.py prefix-results/compactions --repeat
+          python3 benchmarks/rocksdb-compare/workloads.py prefix-results/point-guard --baseline --reads-only --profile 1 --scenario uniform-t1-span0
+          python3 benchmarks/rocksdb-compare/remaining.py prefix-results/remaining --case mixed-pressure-4m --case keys-common128-disk --case keys-variable-disk
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prefix-merge-comparison
+          path: prefix-results/
+          if-no-files-found: ignore
       - name: Compare persisted range bounds and format regression guards
         if: contains(github.event.head_commit.message, '[16-perf]')
         timeout-minutes: 12
