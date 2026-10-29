@@ -65,7 +65,9 @@ values are copied. Shared values survive cache eviction and engine shutdown
 without retaining files or the database lock. Retaining a short slice of a
 large value can retain that large value, as with other shared `Bytes`; converting
 a shared value into mutable storage requires a copy. Caller-held values are
-outside the cache capacity. Cache accounting includes
+outside the cache capacity. The bytes dependency requires at least 1.10.1,
+including the [owned-to-Vec release fix](https://github.com/tokio-rs/bytes/pull/773);
+CI checks that minimum in addition to the locked version. Cache accounting includes
 the allocated frame/index capacities and an allowance for cache bookkeeping;
 it is not a hard bound on process RSS. Table inspection reads one encoded block
 at a time and copies only the preview's first 128 bytes of each key/value.

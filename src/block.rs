@@ -774,4 +774,23 @@ mod tests {
             assert_eq!(result.value.as_deref(), Some(large.as_slice()));
         }
     }
+    #[test]
+    fn converting_shared_large_value_into_vec_releases_its_owner() {
+        let value = vec![27; SHARE_LARGE_VALUE_AT];
+        for indexed in [false, true] {
+            let block = Arc::new(shared_test_block(&[(b"a", 1, Some(&value))], indexed));
+            let weak = Arc::downgrade(&block);
+            let bytes = block
+                .lookup_shared_large(b"a")
+                .unwrap()
+                .unwrap()
+                .value
+                .unwrap();
+            drop(block);
+            assert!(weak.upgrade().is_some());
+            let owned: Vec<u8> = bytes.into();
+            assert!(weak.upgrade().is_none());
+            assert_eq!(owned, value);
+        }
+    }
 }

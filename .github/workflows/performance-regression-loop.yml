@@ -13,7 +13,7 @@ permissions:
   contents: read
 concurrency:
   # Unrequested pushes must not replace a queued requested comparison.
-  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}
+  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}${{ contains(github.event.head_commit.message, '[large-frame-guard]') && '-large-frame' || '' }}
   cancel-in-progress: false
 jobs:
   compare:
@@ -154,6 +154,9 @@ jobs:
       - name: Large owned values with and without caching and retained after eviction
         if: ${{ contains(github.event.head_commit.message, '[large-value-guard]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/large-values --trials 12 --case oversized-2m --case oversized-2m-no-cache --case retained-large-0 --case retained-large-1048576
+      - name: Multi-record large blocks retain ordinary lookup behavior
+        if: ${{ contains(github.event.head_commit.message, '[large-frame-guard]') }}
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/large-frames --trials 12 --case large-frame-128-0 --case large-frame-128-8388608 --case large-frame-32768-0 --case large-frame-32768-8388608
       - name: Variable and common-prefix memory keys
         if: ${{ contains(github.event.head_commit.message, '[memory-key-guard]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-keys --trials 12 --case keys-variable-memory --case keys-common128-memory

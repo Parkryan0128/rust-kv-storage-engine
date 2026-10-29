@@ -265,3 +265,7 @@ plus 64 distinct 256 KiB values retained past eviction and database shutdown
 with zero/1 MiB cache. Resource snapshots precede untimed value verification;
 fixture preparation runs in a separate process. Retained values are owned
 Bytes on all backends, though the engine may share a bounded immutable block.
+
+[large-frame-guard] exercises multi-record 128 KiB blocks with 128-byte/32 KiB
+values, both with zero and 8 MiB cache, using 12 trials. It has a separate
+comparison queue so it cannot replace a pending original-baseline validation.

@@ -94,6 +94,12 @@ def main():
             value=262144, queries=64, span=1, cache=cache), "prepare")
           for cache in [0, 1048576]],
     ]
+    large_guards.extend([
+        (f"large-frame-{value}-{cache}", "read", dict(common, keys=keys,
+            value=value, queries=5000, span=1, block=131072, cache=cache), "prepare")
+        for keys, value in [(20000, 128), (256, 32768)]
+        for cache in [0, 8388608]
+    ])
     for case in large_guards:
         if args.cases and case[0] in args.cases:
             cases.append(case)

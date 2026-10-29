@@ -10,7 +10,8 @@ fault-injection = []
 write-profiling = []
 
 [dependencies]
-bytes = "1"
+# from_owner and the fix for dropping its owner when converting into Vec.
+bytes = "1.10.1"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 crc32fast = "1"
