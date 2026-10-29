@@ -55,8 +55,17 @@ impl WriteBatch {
         self.entries.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn encoded_len(&self) -> Result<usize> {
+        self.validated_encoded_len(|_| Ok(()))
+    }
+
+    pub(crate) fn validated_encoded_len(
+        &self,
+        mut validate: impl FnMut(&Entry) -> Result<()>,
+    ) -> Result<usize> {
         self.entries.iter().try_fold(BATCH_HEADER, |size, entry| {
+            validate(entry)?;
             size.checked_add(17)
                 .and_then(|n| n.checked_add(entry.key.len()))
                 .and_then(|n| n.checked_add(entry.value.as_ref().map_or(0, Bytes::len)))

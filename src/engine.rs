@@ -857,19 +857,23 @@ impl Core {
     // The caller holds the writer barrier, so no other write can consume these
     // sequence numbers. Reject exhaustion before waiting or rotating the WAL.
     fn prepare_write(&self, w: &mut Option<Wal>, operations: u64) -> Result<u64> {
-        let end = {
+        let (end, rotate) = {
             let s = self.state.read();
             check(&s)?;
-            s.sequence
+            let end = s
+                .sequence
                 .checked_add(operations)
-                .ok_or(EngineError::SequenceExhausted)?
+                .ok_or(EngineError::SequenceExhausted)?;
+            // The writer barrier excludes another writer or rotation. Read the
+            // rotation charge with the sequence instead of locking state twice.
+            let rotate = self.disk.is_some()
+                && (s.mem.bytes >= self.options.memtable_size_limit
+                    || w.as_ref()
+                        .is_some_and(|w| w.bytes >= self.options.memtable_size_limit as u64));
+            (end, rotate)
         };
         // Rotate first so a rotation error cannot fail an already-applied write.
-        if self.disk.is_some()
-            && (self.state.read().mem.bytes >= self.options.memtable_size_limit
-                || w.as_ref()
-                    .is_some_and(|w| w.bytes >= self.options.memtable_size_limit as u64))
-        {
+        if rotate {
             // A full frozen queue does not prevent filling the current buffer.
             // Only rotation needs another slot; the writer barrier serializes it.
             self.wait_room()?;
@@ -887,12 +891,12 @@ impl Core {
         if batch.is_empty() {
             return check(&self.state.read());
         }
-        let size = write_timed!(Validate, {
-            for entry in &batch.entries {
-                self.validate_entry(&entry.key, entry.value.as_deref())?;
-            }
-            batch.encoded_len()?
-        });
+        let size = write_timed!(
+            Validate,
+            batch.validated_encoded_len(|entry| {
+                self.validate_entry(&entry.key, entry.value.as_deref())
+            })
+        )?;
         let mut w = write_timed!(WriterLock, self.writer.lock());
         let end = write_timed!(Prepare, self.prepare_write(&mut w, batch.len() as u64))?;
         let start = end - batch.len() as u64;

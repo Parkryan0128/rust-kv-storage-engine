@@ -145,18 +145,27 @@ impl ReadBlock {
 
     pub fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
         if self.index_start != 0 {
-            let (mut left, mut right) = (0, self.record_count());
-            while left < right {
-                let middle = left + (right - left) / 2;
-                match self.key_at(middle)?.cmp(key) {
-                    std::cmp::Ordering::Less => left = middle + 1,
-                    std::cmp::Ordering::Greater => right = middle,
-                    std::cmp::Ordering::Equal => {
-                        return Ok(Some(self.record_at(middle)?.to_owned()))
-                    }
-                }
+            let mut size = self.record_count();
+            if size == 0 {
+                return Ok(None);
             }
-            return Ok(None);
+            // Keep the iteration count independent of the comparison outcome.
+            // This gives the optimizer a conditional-select search step instead
+            // of two unpredictable branches for each random key. Every offset
+            // and selected record still passes the checked decoder.
+            let mut left = 0;
+            while size > 1 {
+                let half = size / 2;
+                let middle = left + half;
+                let greater = self.key_at(middle)? > key;
+                left = if greater { left } else { middle };
+                size -= half;
+            }
+            return if self.key_at(left)? == key {
+                Ok(Some(self.record_at(left)?.to_owned()))
+            } else {
+                Ok(None)
+            };
         }
         let index = self
             .offsets
@@ -354,6 +363,76 @@ mod tests {
         }
         put_u32(&mut payload, offsets.len() as u32);
         framed(&payload)
+    }
+
+    #[test]
+    fn indexed_lookup_matches_ordered_model_at_every_search_boundary() {
+        for include_empty in [false, true] {
+            for count in [
+                1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+                255, 256, 257,
+            ] {
+                // Prefixes, embedded zeros and non-power-of-two directory lengths.
+                let mut model = std::collections::BTreeMap::new();
+                model.insert(
+                    if include_empty {
+                        Vec::new()
+                    } else {
+                        b"first".to_vec()
+                    },
+                    (1, Some(vec![])),
+                );
+                for n in 1..count {
+                    let mut key = b"shared-prefix/".to_vec();
+                    key.extend_from_slice(&(n as u32 * 2).to_be_bytes());
+                    if n % 3 == 0 {
+                        key.push(0);
+                    }
+                    model.insert(
+                        key,
+                        (n as u64 + 1, (n % 5 != 0).then(|| vec![n as u8; n % 31])),
+                    );
+                }
+                let rows: Vec<_> = model
+                    .iter()
+                    .map(|(k, (seq, v))| (k.as_slice(), *seq, v.as_deref()))
+                    .collect();
+                let (block, _) = ReadBlock::decode_indexed(
+                    indexed_frame(&rows),
+                    rows[0].0,
+                    None,
+                    count as u64,
+                    0,
+                )
+                .unwrap();
+                let mut probes = vec![vec![0], vec![255], b"shared-prefix/".to_vec()];
+                for key in model.keys() {
+                    probes.push(key.clone());
+                    let mut after = key.clone();
+                    after.push(0);
+                    probes.push(after);
+                    if !key.is_empty() {
+                        probes.push(key[..key.len() - 1].to_vec());
+                    }
+                }
+                for n in 0..=count {
+                    let mut key = b"shared-prefix/".to_vec();
+                    key.extend_from_slice(&(n as u32 * 2 + 1).to_be_bytes());
+                    probes.push(key);
+                }
+                for key in probes {
+                    let actual = block.lookup(&key).unwrap();
+                    let expected = model.get(&key).map(|(seq, v)| Record {
+                        seq: *seq,
+                        value: v.as_deref().map(Bytes::copy_from_slice),
+                    });
+                    assert_eq!(
+                        actual, expected,
+                        "count={count}, include_empty={include_empty}, key={key:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -37,6 +37,7 @@ struct Config {
     throughput: bool,
     wal_pattern: String,
     wal_individual: bool,
+    recover_to_memtable: bool,
 }
 impl Config {
     fn parse(v: &Value) -> Self {
@@ -62,6 +63,7 @@ impl Config {
             workload: v["workload"].as_str().unwrap_or("uniform").to_owned(),
             wal_pattern: v["wal_pattern"].as_str().unwrap_or("sorted").to_owned(),
             wal_individual: v["wal_individual"].as_bool().unwrap_or(false),
+            recover_to_memtable: v["recover_to_memtable"].as_bool().unwrap_or(false),
         };
         assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 4 * 1024 * 1024);
         assert!(
@@ -681,12 +683,20 @@ fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     let start = Instant::now();
     let db = Backend::open(path, c)?;
     let seconds = start.elapsed().as_secs_f64();
+    let stats = db.stats()?;
+    if c.recover_to_memtable {
+        assert_eq!(
+            stats["sst_files"].as_u64(),
+            Some(0),
+            "matched recovery endpoint must retain replayed data in memory"
+        );
+    }
     report(
         "recover",
         raw,
         json!({"seconds":seconds,"operations":c.keys,
         "ops_per_second":c.keys as f64/seconds,"before":before,
-        "after":metrics(path)?,"stats":db.stats()?}),
+        "after":metrics(path)?,"stats":stats}),
     );
     let distinct = if c.wal_pattern == "overwrite" {
         (c.keys / 10).max(1)

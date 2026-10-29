@@ -68,6 +68,12 @@ impl Backend {
     pub fn open(path: &Path, c: &Config) -> Result<Self> {
         use rocksdb::{BlockBasedOptions, Cache, DBCompressionType, Options, WriteOptions, DB};
         let mut o = Options::default();
+        if c.recover_to_memtable {
+            // Parse before installing cache/table resources. RocksDB 0.25 has
+            // no dedicated setter; this preserves the WAL for another crash
+            // while matching the engine's in-memory recovery endpoint.
+            o = o.get_options_from_string("avoid_flush_during_recovery=true")?;
+        }
         o.create_if_missing(true);
         o.set_compression_type(DBCompressionType::None);
         o.set_bottommost_compression_type(DBCompressionType::None);

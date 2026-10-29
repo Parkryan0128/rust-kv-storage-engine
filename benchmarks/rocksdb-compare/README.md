@@ -190,11 +190,11 @@ complete logical checks after compact and reopen remain mandatory.
 
 ### Reproducing optimization regressions
 
-`performance-regression-loop` compares an exact baseline SHA with the current engine and RocksDB, retaining the snapshot/range guards and using 12 trials for every durable-write case and four WAL recovery patterns. Its random-read run adds `--engine-control`: the identical current executable and immutable SST fixture are read in another process in the rotated order. Compare this A/A variation before attributing a small difference to a source change. Twelve trials balance the four backend positions and three block sizes. WAL sync and integrity checks are unchanged.
+`performance-regression-loop` compares an exact baseline SHA with the current engine and RocksDB, retaining the snapshot/range guards and using 12 trials for every durable-write case and seven WAL recovery patterns. Its random-read run adds `--engine-control`: the identical current executable and immutable SST fixture are read in another process in the rotated order. Compare this A/A variation before attributing a small difference to a source change. Twelve trials balance the four backend positions and three block sizes. WAL sync and integrity checks are unchanged.
 
 The recovery guards include single-operation WriteBatch frames, random key order, overwrites, and 256-operation frames. Small validated WAL frames share a bounded replay buffer (256 records / 64 KiB logical charge), sorted by key and sequence only when the input is not already ordered. Large batches still stream directly. This affects unpublished recovery state only; live writes and WAL commit order are unchanged.
 
-The memory-page optimization keeps key ownership directly in each page, alongside the independent value base, so normal lookup/routing does not traverse the value base to reach keys. Production overwrites return only the prior payload charge; they do not clone an old shared value solely for accounting. The internal volatile-write profiles guard both snapshot-retained and ordinary writes.
+Memory pages keep a shared immutable key array inside the shared value base, so copy-on-write value deltas do not acquire an extra key reference on each page clone. Production overwrites return only the prior payload charge; they do not clone an old shared value solely for accounting. The internal volatile-write profiles guard both snapshot-retained and ordinary writes.
 
 Recovery coverage distinguishes a single operation in `write_batch` from the
 public `put` WAL frame. The regression loop also replays 100,000 shuffled keys
@@ -208,3 +208,12 @@ These samples surround the wall-time loop and include a slightly wider diagnosti
 window. They do not replace elapsed throughput or include background-thread CPU.
 The environment records whether kernel schedstats are enabled; missing counters
 remain null and disabled runqueue accounting must not be interpreted as no wait.
+
+Recovery comparisons explicitly set `recover_to_memtable=true` on all seven WAL
+cases. RocksDB uses `avoid_flush_during_recovery=true`, and each backend asserts
+zero SST files after the measured open. This compares the same endpoint: replayed
+data available in memory with its durable WAL retained. Sync commits, checksums
+and memtable budgets are unchanged. Historical runs without this config used
+RocksDB's default flush-on-recovery policy, so those RocksDB ratios also include
+SST creation and must not be presented as a pure WAL replay speed difference.
+See [RocksDB WAL recovery options](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log).
