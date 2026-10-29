@@ -122,6 +122,7 @@ impl Bloom {
     pub fn contains(&self, key: &[u8]) -> bool {
         self.contains_hash(hash(key))
     }
+    #[inline]
     pub fn contains_hash(&self, mut h: u64) -> bool {
         let delta = delta(h);
         for _ in 0..self.probes {
