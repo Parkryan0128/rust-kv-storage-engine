@@ -198,17 +198,18 @@ impl TableWriter {
                         .read_exact_at(&mut self.block, i.offset)?;
                     let next = self.index.get(n + 1).map(|entry| entry.first.as_slice());
                     let bytes = std::mem::take(&mut self.block);
+                    let validated = i.validated.load(Ordering::Relaxed);
                     let (block, _) = if self.prefix_encoded {
                         ReadBlock::decode_prefix_indexed(
                             bytes,
                             &i.first,
                             next,
                             self.max_seq,
-                            0,
+                            validated,
                             self.expanded_frame_limit,
                         )?
                     } else {
-                        ReadBlock::decode_indexed(bytes, &i.first, next, self.max_seq, 0)?
+                        ReadBlock::decode_indexed(bytes, &i.first, next, self.max_seq, validated)?
                     };
                     block.visit_key_hashes(&mut self.bloom_hasher, |hash| {
                         self.bloom.insert_hash(hash)

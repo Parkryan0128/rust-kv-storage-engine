@@ -24,7 +24,7 @@ impl Tournament {
             leaves: cursors.len().next_power_of_two(),
             stale: false,
         };
-        out.rebuild::<true>(cursors);
+        out.rebuild(cursors);
         out
     }
 
@@ -36,12 +36,12 @@ impl Tournament {
         self.stale = true;
     }
 
-    pub fn rebuild<const PREFIX: bool>(&mut self, cursors: &[TableCursor]) {
+    pub fn rebuild(&mut self, cursors: &[TableCursor]) {
         for i in 0..cursors.len() {
             self.update_leaf(i, cursors);
         }
         for node in (1..self.leaves).rev() {
-            self.combine::<PREFIX>(node, cursors);
+            self.combine(node, cursors);
         }
         self.stale = false;
     }
@@ -64,17 +64,17 @@ impl Tournament {
         dirty
     }
 
-    pub fn repair<const PREFIX: bool>(&mut self, mut dirty: u32, cursors: &[TableCursor]) {
+    pub fn repair(&mut self, mut dirty: u32, cursors: &[TableCursor]) {
         // Repair each ancestor once even when every source advances together.
         // This bounds duplicate-heavy updates to at most N-1 key comparisons.
         while dirty != 0 {
             let node = (u32::BITS - 1 - dirty.leading_zeros()) as usize;
             dirty &= !(1 << node);
-            self.combine::<PREFIX>(node, cursors);
+            self.combine(node, cursors);
         }
     }
 
-    fn combine<const PREFIX: bool>(&mut self, node: usize, cursors: &[TableCursor]) {
+    fn combine(&mut self, node: usize, cursors: &[TableCursor]) {
         let left = self.nodes[node * 2];
         let right = self.nodes[node * 2 + 1];
         self.nodes[node] = if left.equal == 0 {
@@ -82,8 +82,8 @@ impl Tournament {
         } else if right.equal == 0 {
             left
         } else {
-            let a = cursors[left.winner].current_for::<PREFIX>().unwrap();
-            let b = cursors[right.winner].current_for::<PREFIX>().unwrap();
+            let a = cursors[left.winner].current().unwrap();
+            let b = cursors[right.winner].current().unwrap();
             match a.key.cmp(b.key) {
                 Ordering::Less => left,
                 Ordering::Greater => right,

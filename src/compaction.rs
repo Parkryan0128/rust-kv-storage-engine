@@ -148,9 +148,9 @@ impl Merge {
                     Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
                 } else {
                     if rebuild {
-                        tree.rebuild::<PREFIX>(&self.cursors);
+                        tree.rebuild(&self.cursors);
                     } else {
-                        tree.repair::<PREFIX>(dirty, &self.cursors);
+                        tree.repair(dirty, &self.cursors);
                     }
                     tree.selected(&mut self.pending)
                         .and_then(|i| self.cursors[i].current_for::<PREFIX>())

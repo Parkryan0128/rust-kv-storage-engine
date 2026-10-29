@@ -62,9 +62,9 @@ pub(crate) fn encode_prefix_frame(
     Ok(true)
 }
 
-// Expand once on admission; existing cached lookup and cursor representations
-// remain unchanged. Validate the complete encoded frame before allocating from
-// its counts, and cap expansion by the checksummed table summary and MAX_FRAME.
+// Independent test oracle: reconstruct ordinary records from prefix frames.
+// Production readers keep these frames encoded and reconstruct cursor keys only.
+// Validate counts before allocation and bound expansion by the table summary.
 #[cfg(test)]
 fn expand_prefix_frame(bytes: Vec<u8>, maximum: usize) -> Result<Vec<u8>> {
     if bytes.len() > maximum {
