@@ -859,7 +859,9 @@ impl MemIndex {
         let candidates = &self.groups[start..];
         // Prove the end once instead of visiting every group boundary. The
         // exact slice length also lets collection allocate its directory once.
-        let end = if range.allows_end(candidates.last().unwrap().first_key()) {
+        let end = if matches!(range.end, Bound::Unbounded)
+            || range.allows_end(candidates.last().unwrap().first_key())
+        {
             candidates.len()
         } else {
             candidates.partition_point(|g| range.allows_end(g.first_key()))
