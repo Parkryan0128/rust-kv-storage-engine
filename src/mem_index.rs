@@ -956,6 +956,27 @@ impl MemScan {
     pub(crate) fn next_live(&mut self) -> Option<(Vec<u8>, Bytes)> {
         loop {
             let page = self.current.as_ref()?;
+            if self.page_in_range && page.updates.is_empty() {
+                // This immutable page needs neither per-row range checks nor
+                // delta lookups. Skip deletions directly in its base records.
+                let live = page.records[self.row..self.page_end]
+                    .iter()
+                    .enumerate()
+                    .find_map(|(offset, record)| {
+                        record.value.as_ref().map(|value| (offset, value))
+                    });
+                if let Some((offset, value)) = live {
+                    let row = self.row + offset;
+                    let out = (crate::scan::copy_scan_key(&page.rows[row]), value.clone());
+                    self.row = row + 1;
+                    if self.row == self.page_end {
+                        self.finish_page();
+                    }
+                    return Some(out);
+                }
+                self.finish_page();
+                continue;
+            }
             if !self.page_in_range && !self.range.allows_end(&page.rows[self.row]) {
                 self.current = None;
                 self.groups.clear();
@@ -1007,6 +1028,70 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn live_cursor_skips_empty_pages_without_hiding_snapshot_deltas() {
+        let mut map = MemIndex::default();
+        for n in 0..2048u64 {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: n + 1,
+                    value: [0, 511, 1024, 2047]
+                        .contains(&n)
+                        .then(|| Bytes::copy_from_slice(&n.to_be_bytes())),
+                },
+            );
+        }
+        let mut old = map.snapshot(all()).unwrap();
+        for (n, live) in [
+            (15u64, true),
+            (511, false),
+            (512, true),
+            (1024, false),
+            (1666, true),
+        ] {
+            map.insert(
+                n.to_be_bytes().to_vec(),
+                Record {
+                    seq: 2049 + n,
+                    value: live.then(|| Bytes::copy_from_slice(&n.to_be_bytes())),
+                },
+            );
+        }
+        assert!(map
+            .groups
+            .iter()
+            .flat_map(|group| &group.pages)
+            .any(|page| !page.updates.is_empty()));
+        for (lo, hi) in [(0u64, 2048u64), (1, 511), (511, 513), (1024, 1700)] {
+            let lower = lo.to_be_bytes();
+            let upper = hi.to_be_bytes();
+            let range = Arc::new(KeyRange::new(lower.as_slice()..upper.as_slice()).unwrap());
+            let mut scan = map.snapshot(range).unwrap();
+            let actual: Vec<_> = std::iter::from_fn(|| scan.next_live()).collect();
+            let expected: Vec<_> = [0u64, 15, 512, 1666, 2047]
+                .into_iter()
+                .filter(|n| *n >= lo && *n < hi)
+                .map(|n| {
+                    (
+                        n.to_be_bytes().to_vec(),
+                        Bytes::copy_from_slice(&n.to_be_bytes()),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected);
+            assert!(scan.next_live().is_none());
+            assert!(scan.current.is_none() && scan.groups.is_empty());
+        }
+        let actual: Vec<_> = std::iter::from_fn(|| old.next_live())
+            .map(|(key, value)| {
+                assert_eq!(key.as_slice(), value.as_ref());
+                u64::from_be_bytes(key.try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(actual, [0, 511, 1024, 2047]);
     }
 
     #[test]
