@@ -228,6 +228,16 @@ mod tests {
                 let decoded = Bloom::decode(&mut Cursor { b: &encoded }).unwrap();
                 for key in 0..1024u64 {
                     let h = hash(&key.to_be_bytes());
+                    // Compare both positive and negative probes with the
+                    // original format algorithm, independently of reduction.
+                    let step = delta(h);
+                    let mut probe = h;
+                    let expected = (0..probes).all(|_| {
+                        let bit = (probe % (reference.len() as u64 * 8)) as usize;
+                        probe = probe.wrapping_add(step);
+                        reference[bit / 8] & (1 << (bit % 8)) != 0
+                    });
+                    assert_eq!(bloom.contains_hash(h), expected);
                     assert_eq!(decoded.contains_hash(h), bloom.contains_hash(h));
                     if key < 512 {
                         assert!(decoded.contains_hash(h));
