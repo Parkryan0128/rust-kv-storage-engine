@@ -88,10 +88,7 @@ impl PrefixHasher {
 // Immutable per-table acceleration for long keys. The prefix bytes already
 // belong to the first index key; only their unfinished hash state is retained.
 // Every lookup verifies the prefix, so unrelated keys use the original hash.
-pub(crate) struct ReadPrefixHash {
-    len: u8,
-    state: u64,
-}
+pub(crate) struct ReadPrefixHash(u64);
 impl ReadPrefixHash {
     pub fn new(first: &[u8]) -> Self {
         let len = if first.len() >= 64 {
@@ -99,15 +96,16 @@ impl ReadPrefixHash {
         } else {
             0
         };
-        Self {
-            len: len as u8,
-            state: extend_hash(HASH_SEED, &first[..len]),
-        }
+        Self(extend_hash(HASH_SEED, &first[..len]))
     }
+    // Called only for long query keys from the Get path. Keep prefix checks
+    // and the table-state load outside ordinary short-key hashing code.
+    #[inline(never)]
     pub fn hash(&self, key: &[u8], first: &[u8]) -> u64 {
-        if self.len != 0 {
-            if let Some(suffix) = key.strip_prefix(&first[..usize::from(self.len)]) {
-                return finish_hash(extend_hash(self.state, suffix));
+        if first.len() >= 64 {
+            let len = (first.len() - 8).min(128);
+            if let Some(suffix) = key.strip_prefix(&first[..len]) {
+                return finish_hash(extend_hash(self.0, suffix));
             }
         }
         hash(key)

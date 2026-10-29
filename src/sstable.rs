@@ -350,9 +350,13 @@ impl Table {
         {
             return Ok(None);
         }
-        if !self.bloom.contains_hash(
-            *hash.get_or_insert_with(|| self.read_prefix_hash.hash(key, &self.index[0].first)),
-        ) {
+        if !self.bloom.contains_hash(*hash.get_or_insert_with(|| {
+            if key.len() < 64 {
+                crate::bloom::hash(key)
+            } else {
+                self.read_prefix_hash.hash(key, &self.index[0].first)
+            }
+        })) {
             counters.bloom_negatives.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
