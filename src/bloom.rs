@@ -335,5 +335,5 @@ mod tests {
 mod profile;
 
 #[cfg(test)]
-#[path = "bloom_profile.rs"]
-mod profile;
+#[path = "bloom_reduction_profile.rs"]
+mod reduction_profile;

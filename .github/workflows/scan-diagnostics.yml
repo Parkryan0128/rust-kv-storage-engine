@@ -54,7 +54,7 @@ jobs:
           git rev-parse HEAD > bloom-diagnostics/commit.txt
           rustc --version > bloom-diagnostics/rust.txt
           lscpu > bloom-diagnostics/cpu.txt
-          cargo test --locked --release --lib bloom::profile::profile_bloom_reduction -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bloom-diagnostics/results.log
+          cargo test --locked --release --lib bloom::reduction_profile::profile_bloom_reduction -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bloom-diagnostics/results.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -1,80 +1,51 @@
-//! Same-process arithmetic diagnostic; not end-to-end Get throughput.
-use super::*;
+use super::{hash, PrefixHasher};
 use std::{hint::black_box, time::Instant};
 
-fn modulo_contains(bloom: &Bloom, mut hash: u64) -> bool {
-    let step = delta(hash);
-    let bits = bloom.bits.len() as u64 * 8;
-    for _ in 0..bloom.probes {
-        let bit = (hash % bits) as usize;
-        if bloom.bits[bit / 8] & (1 << (bit % 8)) == 0 {
-            return false;
-        }
-        hash = hash.wrapping_add(step);
-    }
-    true
-}
-
+// CPU-only diagnostic for repeated-prefix wins and unrelated-key overhead.
+// End-to-end SST publication is measured separately by merge_matrix.py.
 #[test]
-#[ignore = "same-process Bloom reduction diagnostic; run explicitly in release mode"]
-fn profile_bloom_reduction() {
-    type Probe = fn(&Bloom, u64) -> bool;
-    for count in [4096u64, 100_000, 200_000] {
-        let mut bloom = Bloom::new(black_box(count), 10);
-        for key in 0..count {
-            bloom.insert_hash(hash(&key.to_be_bytes()));
-        }
-        for present in [true, false] {
-            let mut rng = 7919u64;
-            let queries: Vec<_> = (0..8192)
-                .map(|_| {
-                    rng ^= rng << 13;
-                    rng ^= rng >> 7;
-                    rng ^= rng << 17;
-                    let key = rng % count + if present { 0 } else { count };
-                    hash(&key.to_be_bytes())
+#[ignore = "bounded hash diagnostic; run explicitly in release"]
+fn prefix_hash_profile() {
+    for len in [8usize, 32, 64, 136, 1024] {
+        for common in [false, true] {
+            let mut state = 7u64;
+            let mut keys: Vec<Vec<u8>> = (0u64..8192)
+                .map(|n| {
+                    let mut key = vec![42; len];
+                    if !common {
+                        for byte in &mut key {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            *byte = state as u8;
+                        }
+                    }
+                    key[len - 8..].copy_from_slice(&n.to_be_bytes());
+                    key
                 })
                 .collect();
-            let expected: u64 = queries
-                .iter()
-                .map(|&hash| {
-                    let reference = modulo_contains(&bloom, hash);
-                    assert_eq!(bloom.contains_hash(hash), reference);
-                    if present {
-                        assert!(reference);
-                    }
-                    u64::from(reference)
-                })
-                .sum();
-            let methods: [(&str, Probe); 2] = [
-                ("reciprocal", Bloom::contains_hash),
-                ("modulo", modulo_contains),
-            ];
-            for trial in 1..=6 {
-                for position in 0..2 {
-                    let (name, probe) = methods[(trial + position) % 2];
-                    // Identical opaque function-pointer calls on both sides.
-                    // Hashing, corpus construction and verification are outside.
-                    let probe = black_box(probe);
-                    for &hash in &queries {
-                        black_box(probe(black_box(&bloom), hash));
-                    }
-                    let repeats = 128;
-                    let mut positives = 0u64;
+            keys.sort_unstable();
+            let expected: u64 = keys.iter().map(|key| hash(key)).fold(0, u64::wrapping_add);
+            for trial in 0..6 {
+                for cached in [trial % 2 == 0, trial % 2 != 0] {
+                    let mut hasher = PrefixHasher::default();
                     let start = Instant::now();
-                    for _ in 0..repeats {
-                        for &hash in &queries {
-                            positives += u64::from(probe(black_box(&bloom), hash));
+                    let mut sum = 0u64;
+                    for _ in 0..16 {
+                        for key in &keys {
+                            let key = black_box(key.as_slice());
+                            sum =
+                                sum.wrapping_add(if cached { hasher.hash(key) } else { hash(key) });
                         }
                     }
                     let seconds = start.elapsed().as_secs_f64();
-                    assert_eq!(black_box(positives), expected * repeats);
+                    assert_eq!(black_box(sum), expected.wrapping_mul(16));
                     println!(
-                        "BLOOM_PROFILE {}",
-                        serde_json::json!({"count":count,"present":present,
-                        "method":name,"trial":trial,"order":position+1,
-                        "operations":queries.len() as u64*repeats,"seconds":seconds,
-                        "notes":"Warm prehashed corpus; same Bloom bytes and struct layout; opaque function-call overhead on both methods. Not total Get throughput or a RocksDB comparison."})
+                        "PREFIX_HASH_PROFILE {}",
+                        serde_json::json!({
+                            "key_bytes":len, "common_prefix":common, "cached":cached,
+                            "trial":trial+1, "seconds":seconds, "operations":keys.len()*16
+                        })
                     );
                 }
             }
