@@ -316,11 +316,61 @@ mod tests {
         let encoded_size = encoded.len();
         let (block, _) =
             ReadBlock::decode_prefix_indexed(encoded, &first, None, 2, 0, full.len()).unwrap();
-        let mut cursor = BlockCursor::new(block, 0).unwrap();
+        let mut cursor = BlockCursor::new(block, 0, Vec::new()).unwrap();
         assert_eq!(cursor.current().unwrap().key, first);
         cursor.advance().unwrap();
         assert_eq!(cursor.current().unwrap().key, last);
         assert!(cursor.prefix_key.capacity() <= encoded_size - HEADER);
+    }
+
+    #[test]
+    fn cursor_reuses_keys_across_prefixes_and_releases_oversized_or_plain_scratch() {
+        let mut key_buffer = Vec::new();
+        let mut previous_address = None;
+        for byte in [b'x', b'y', b'z'] {
+            let (mut full, mut first, mut last, mut offsets) = fixture();
+            for offset in &offsets {
+                let key_start = HEADER + *offset as usize + 17;
+                full[key_start..key_start + 128].fill(byte);
+            }
+            first[..128].fill(byte);
+            last[..128].fill(byte);
+            let header = frame_header(&full[HEADER..]).unwrap();
+            full[..HEADER].copy_from_slice(&header);
+            let (plain, _) = ReadBlock::decode_indexed(full.clone(), &first, None, 73, 0).unwrap();
+            let mut encoded = Vec::new();
+            assert!(encode_prefix_frame(&full, &first, &last, &mut offsets, &mut encoded).unwrap());
+            let limit = encoded.len() - HEADER;
+            let (native, _) =
+                ReadBlock::decode_prefix_indexed(encoded.clone(), &first, None, 73, 0, full.len())
+                    .unwrap();
+            let mut cursor = BlockCursor::new(native, 0, key_buffer).unwrap();
+            if let Some(address) = previous_address {
+                assert_eq!(cursor.prefix_key.as_ptr(), address);
+            }
+            previous_address = Some(cursor.prefix_key.as_ptr());
+            for index in 0..plain.record_count() {
+                let got = cursor.current().unwrap();
+                let expected = plain.record_at(index).unwrap();
+                assert_eq!(got.key, expected.key);
+                assert_eq!(got.to_owned(), expected.to_owned());
+                cursor.advance().unwrap();
+            }
+            assert!(cursor.current().is_none());
+            let (_, reused) = BlockCursor::recycle(Some(cursor));
+            assert!(reused.capacity() <= limit);
+            key_buffer = reused;
+            // An earlier large block must not pin its key allocation here.
+            let (native, _) =
+                ReadBlock::decode_prefix_indexed(encoded, &first, None, 73, 0, full.len()).unwrap();
+            let oversized = BlockCursor::new(native, 0, Vec::with_capacity(limit * 4)).unwrap();
+            assert!(oversized.prefix_key.capacity() <= limit);
+        }
+        let (full, first, _, _) = fixture();
+        let (plain, _) = ReadBlock::decode_indexed(full, &first, None, 73, 0).unwrap();
+        let cursor = BlockCursor::new(plain, 0, key_buffer).unwrap();
+        assert_eq!(cursor.prefix_key.capacity(), 0);
+        assert_eq!(cursor.current().unwrap().key, first);
     }
 
     #[test]
@@ -378,7 +428,7 @@ mod tests {
         for (row, hash) in native_hashes.into_iter().enumerate() {
             assert_eq!(hash, crate::bloom::hash(plain.key_at(row).unwrap()));
         }
-        let mut cursor = BlockCursor::new(native, 3).unwrap();
+        let mut cursor = BlockCursor::new(native, 3, Vec::new()).unwrap();
         for n in 3..plain.record_count() {
             let row = cursor.current().unwrap();
             assert_eq!(row.key, plain.key_at(n).unwrap());

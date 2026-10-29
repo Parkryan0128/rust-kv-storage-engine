@@ -44,11 +44,9 @@ impl TableCursor {
             self.block = None;
             return Ok(());
         }
-        let block = self.table.read_stream_block(
-            self.next_block,
-            self.block.take().map(BlockCursor::into_block),
-        )?;
-        self.block = Some(BlockCursor::new(block, 0)?);
+        let (reusable, prefix_key) = BlockCursor::recycle(self.block.take());
+        let block = self.table.read_stream_block(self.next_block, reusable)?;
+        self.block = Some(BlockCursor::new(block, 0, prefix_key)?);
         self.next_block += 1;
         Ok(())
     }

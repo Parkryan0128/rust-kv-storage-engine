@@ -339,7 +339,14 @@ struct RecordPosition {
     has_value: bool,
 }
 impl BlockCursor {
-    pub fn new(block: ReadBlock, index: usize) -> Result<Self> {
+    pub fn new(block: ReadBlock, index: usize, mut prefix_key: Vec<u8>) -> Result<Self> {
+        prefix_key.clear();
+        if prefix_key.capacity() != 0
+            && (block.record_start == HEADER || prefix_key.capacity() > block.bytes.len() - HEADER)
+        {
+            // Do not pin a prior large key or carry prefix scratch into plain blocks.
+            prefix_key = Vec::new();
+        }
         let offset = if index == block.record_count() {
             None
         } else {
@@ -353,7 +360,7 @@ impl BlockCursor {
         let mut out = Self {
             block,
             head: None,
-            prefix_key: Vec::new(),
+            prefix_key,
         };
         if let Some(offset) = offset {
             out.decode_at(offset)?;
@@ -440,8 +447,11 @@ impl BlockCursor {
     pub fn buffer_addresses(&self) -> (*const u8, *const u32) {
         self.block.buffer_addresses()
     }
-    pub fn into_block(self) -> ReadBlock {
-        self.block
+    pub fn recycle(previous: Option<Self>) -> (Option<ReadBlock>, Vec<u8>) {
+        match previous {
+            Some(cursor) => (Some(cursor.block), cursor.prefix_key),
+            None => (None, Vec::new()),
+        }
     }
     #[cfg(test)]
     pub fn frame_capacity(&self) -> usize {
@@ -625,7 +635,7 @@ mod tests {
                 }
             };
             for begin in 0..=records.len() {
-                let mut cursor = BlockCursor::new(make(), begin).unwrap();
+                let mut cursor = BlockCursor::new(make(), begin, Vec::new()).unwrap();
                 for &(key, seq, value) in &records[begin..] {
                     for _ in 0..4 {
                         let head = cursor.current().unwrap();
@@ -637,8 +647,8 @@ mod tests {
                 cursor.advance().unwrap();
                 assert!(cursor.current().is_none());
             }
-            assert!(BlockCursor::new(make(), records.len() + 1).is_err());
-            let mut cursor = BlockCursor::new(make(), 0).unwrap();
+            assert!(BlockCursor::new(make(), records.len() + 1, Vec::new()).is_err());
+            let mut cursor = BlockCursor::new(make(), 0, Vec::new()).unwrap();
             let next = cursor.head.as_ref().unwrap().end;
             cursor.block.bytes[next + 8] = 2;
             assert!(cursor.advance().is_err());

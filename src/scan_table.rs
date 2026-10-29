@@ -76,10 +76,8 @@ impl TableScan {
             counters.reads.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             crate::test_hooks::pause("scan_before_block_read");
-            let block = self.table.read_stream_block(
-                self.next_block,
-                self.block.take().map(BlockCursor::into_block),
-            )?;
+            let (reusable, prefix_key) = BlockCursor::recycle(self.block.take());
+            let block = self.table.read_stream_block(self.next_block, reusable)?;
             // Decoding validates every key against the next block's first key.
             // If that boundary is allowed, this whole block is in range. The
             // final block has a validated maximum after read_stream_block.
@@ -112,7 +110,7 @@ impl TableScan {
                 self.seek = false;
             }
             self.next_block += 1;
-            self.block = Some(BlockCursor::new(block, record)?);
+            self.block = Some(BlockCursor::new(block, record, prefix_key)?);
         }
         self.done = true;
         self.block = None;
