@@ -172,17 +172,31 @@ impl Scan {
         tables: &[Arc<Table>],
         range: Arc<KeyRange>,
     ) -> Self {
-        let mut sources = Vec::with_capacity(memory.len());
+        // A single SST is common after compaction. Reserve exactly its one
+        // source rather than letting Vec's first growth allocate several large
+        // cursors. Check overlap once; an empty range still allocates nothing.
+        let single = if let [table] = tables {
+            table.overlaps(&range).then_some(table)
+        } else {
+            None
+        };
+        let mut sources = Vec::with_capacity(memory.len() + usize::from(single.is_some()));
         sources.extend(memory.into_iter().map(|iter| Source::Memory {
             iter,
             started: false,
         }));
-        sources.extend(
-            tables
-                .iter()
-                .filter(|table| table.overlaps(&range))
-                .map(|table| Source::Table(table.scan(range.clone()))),
-        );
+        if tables.len() == 1 {
+            if let Some(table) = single {
+                sources.push(Source::Table(table.scan(range.clone())));
+            }
+        } else {
+            sources.extend(
+                tables
+                    .iter()
+                    .filter(|table| table.overlaps(&range))
+                    .map(|table| Source::Table(table.scan(range.clone()))),
+            );
+        }
         // Bounds and memory snapshots already prove there are no sources.
         // Avoid retaining an engine and initializing a merge on first next().
         if sources.is_empty() {
