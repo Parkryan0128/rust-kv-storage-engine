@@ -146,13 +146,14 @@ impl Source {
 /// value; deleted keys are omitted. Disk I/O is lazy and errors appear as items.
 /// After the first error or exhaustion, all subsequent calls return `None`.
 ///
-/// The iterator retains the database lock, overlapping immutable memory page groups and
+/// Until exhausted, the iterator retains the database lock, overlapping immutable memory page groups and
 /// selected SST handles. Consumed sources release their handles early. Compaction may unlink those SSTs,
 /// but their disk space cannot be reclaimed while a scan still holds them.
 /// SST buffering is one encoded block per source. Small disk/mixed merges borrow
 /// their heads; larger merges additionally retain one candidate key per source.
 /// Scans bypass the point-read cache. Collecting the iterator allocates the full
 /// result in the caller. Later writes and batches do not change this snapshot.
+/// A range proved empty when created is already exhausted and retains no lock.
 #[must_use = "scans read SST data only when iterated"]
 pub struct Scan {
     engine: Option<Engine>,

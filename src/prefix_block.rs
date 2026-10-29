@@ -502,4 +502,75 @@ mod tests {
             assert!(expand_prefix_frame(damaged, bytes.len()).is_err());
         }
     }
+
+    #[test]
+    fn native_prefix_revalidates_semantic_damage_with_recomputed_crc() {
+        let (bytes, first, last, mut offsets) = fixture();
+        let mut encoded = Vec::new();
+        encode_prefix_frame(&bytes, &first, &last, &mut offsets, &mut encoded).unwrap();
+        let (_, fingerprint) =
+            ReadBlock::decode_prefix_indexed(encoded.clone(), &first, None, 73, 0, bytes.len())
+                .unwrap();
+        let prefix_len =
+            u32::from_le_bytes(encoded[HEADER + 4..HEADER + 8].try_into().unwrap()) as usize;
+        let records = HEADER + 8 + prefix_len;
+        let directory = encoded.len() - 4 - offsets.len() * 4;
+        let mut mutations = Vec::new();
+        for (at, replacement) in [
+            (records, 0u64.to_le_bytes().to_vec()),
+            (records, 74u64.to_le_bytes().to_vec()),
+            (records + 8, vec![2]),
+            (records + 9, u32::MAX.to_le_bytes().to_vec()),
+            (records + 13, 1u32.to_le_bytes().to_vec()),
+            (records + 17, vec![1]),
+            (records + offsets[1] as usize + 17, vec![255]),
+            (directory, 1u32.to_le_bytes().to_vec()),
+            (encoded.len() - 8, u32::MAX.to_le_bytes().to_vec()),
+            (HEADER, 1u32.to_le_bytes().to_vec()),
+        ] {
+            let mut damaged = encoded.clone();
+            damaged[at..at + replacement.len()].copy_from_slice(&replacement);
+            mutations.push(damaged);
+        }
+        for len in [HEADER + 8, records, directory, encoded.len() - 1] {
+            mutations.push(encoded[..len].to_vec());
+        }
+        for mut damaged in mutations {
+            // A valid checksum must not substitute for structural validation.
+            // Exercise both a cold read and the old writer/read fingerprint.
+            let header = frame_header(&damaged[HEADER..]).unwrap();
+            damaged[..HEADER].copy_from_slice(&header);
+            assert!(expand_prefix_frame(damaged.clone(), bytes.len())
+                .and_then(|full| ReadBlock::decode_indexed(full, &first, None, 73, 0))
+                .is_err());
+            for previous in [0, fingerprint] {
+                assert!(ReadBlock::decode_prefix_indexed(
+                    damaged.clone(),
+                    &first,
+                    None,
+                    73,
+                    previous,
+                    bytes.len(),
+                )
+                .is_err());
+            }
+        }
+        // Index bounds and the table sequence limit are independently enforced.
+        assert!(
+            ReadBlock::decode_prefix_indexed(encoded.clone(), &last, None, 73, 0, bytes.len(),)
+                .is_err()
+        );
+        assert!(ReadBlock::decode_prefix_indexed(
+            encoded.clone(),
+            &first,
+            Some(&last),
+            73,
+            0,
+            bytes.len(),
+        )
+        .is_err());
+        assert!(
+            ReadBlock::decode_prefix_indexed(encoded, &first, None, 72, 0, bytes.len(),).is_err()
+        );
+    }
 }
