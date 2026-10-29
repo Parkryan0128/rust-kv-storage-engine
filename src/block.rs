@@ -338,23 +338,6 @@ struct RecordPosition {
     seq: u64,
     has_value: bool,
 }
-// Plain blocks never reconstruct keys. Keep this allocation/growth path out of
-// their per-record decoder so the ordinary cursor can stay small and inline.
-#[inline(never)]
-fn update_prefix_key(key: &mut Vec<u8>, prefix: &[u8], suffix: &[u8], maximum: usize) {
-    key.truncate(prefix.len());
-    let key_len = prefix.len() + suffix.len();
-    if key.capacity() < key_len {
-        // A complete key fits within the encoded payload; cap spare capacity
-        // there to preserve the compaction cursor's published memory charge.
-        key.reserve_exact(key_len.next_power_of_two().min(maximum) - key.len());
-    }
-    if key.is_empty() {
-        key.extend_from_slice(prefix);
-    }
-    key.extend_from_slice(suffix);
-}
-
 impl BlockCursor {
     pub fn new(block: ReadBlock, index: usize) -> Result<Self> {
         let offset = if index == block.record_count() {
@@ -393,12 +376,25 @@ impl BlockCursor {
         let mut c = Cursor { b: bytes };
         let record = decode_record_ref(&mut c)?;
         if self.block.record_start != HEADER {
-            update_prefix_key(
-                &mut self.prefix_key,
-                &self.block.bytes[HEADER + 8..self.block.record_start],
-                record.key,
-                self.block.bytes.len() - HEADER,
-            );
+            let prefix_len = self.block.record_start - HEADER - 8;
+            // This block never changes. Preserve its common prefix and replace
+            // only the variable suffix as the cursor advances.
+            self.prefix_key.truncate(prefix_len);
+            let key_len = prefix_len + record.key.len();
+            if self.prefix_key.capacity() < key_len {
+                // The encoded payload already contains the entire shared prefix
+                // and this suffix. A complete key fits within that payload, so
+                // no expanded-block allocation allowance is needed.
+                let maximum = self.block.bytes.len() - HEADER;
+                self.prefix_key.reserve_exact(
+                    key_len.next_power_of_two().min(maximum) - self.prefix_key.len(),
+                );
+            }
+            if self.prefix_key.is_empty() {
+                self.prefix_key
+                    .extend_from_slice(&self.block.bytes[HEADER + 8..self.block.record_start]);
+            }
+            self.prefix_key.extend_from_slice(record.key);
         }
         let key_start = offset + 17;
         let key_end = key_start + record.key.len();
