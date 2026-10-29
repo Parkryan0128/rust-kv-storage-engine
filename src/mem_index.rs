@@ -630,8 +630,9 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
-        let page_end = MemScan::page_end(current.as_ref().unwrap(), &range);
-        if page_end < current.as_ref().unwrap().records.len() {
+        let page_end = current.as_ref().unwrap().records.len();
+        let page_in_range = range.allows_end(current.as_ref().unwrap().rows.last().unwrap());
+        if !page_in_range {
             // A range wholly inside one page needs no synthetic group or
             // directory allocation; the current page is the complete snapshot.
             return Some(MemScan {
@@ -640,6 +641,7 @@ impl MemIndex {
                 page: 0,
                 row,
                 page_end,
+                page_in_range,
                 range,
             });
         }
@@ -681,6 +683,7 @@ impl MemIndex {
             page,
             row,
             page_end,
+            page_in_range,
             range,
         })
     }
@@ -691,29 +694,16 @@ pub(crate) struct MemScan {
     current: Option<Arc<Page>>,
     page: usize,
     row: usize,
-    // Exclusive end within this immutable page. Resolve bounds once per page,
-    // so skipped tombstones never fetch a key or repeat a byte comparison.
+    // Cache the physical end and whether this whole page is inside the range.
+    // Partial boundary pages retain the cheap per-row check: pre-seeking their
+    // upper bound costs more than consuming only a few rows.
     page_end: usize,
+    page_in_range: bool,
     range: Arc<KeyRange>,
 }
 impl MemScan {
-    fn page_end(page: &Page, range: &KeyRange) -> usize {
-        if range.allows_end(page.rows.last().unwrap()) {
-            return page.records.len();
-        }
-        match &range.end {
-            Bound::Included(end) => page
-                .rows
-                .partition_point(|key| key.as_ref() <= end.as_slice()),
-            Bound::Excluded(end) => page
-                .rows
-                .partition_point(|key| key.as_ref() < end.as_slice()),
-            Bound::Unbounded => page.records.len(),
-        }
-    }
     fn finish_page(&mut self) {
-        let page = self.current.as_ref().unwrap();
-        if self.page_end < page.records.len() || self.groups.is_empty() {
+        if !self.page_in_range || self.groups.is_empty() {
             self.current = None;
             self.groups.clear();
             return;
@@ -726,17 +716,15 @@ impl MemScan {
         }
         self.current = self.groups.front().map(|g| g.pages[self.page].clone());
         if let Some(page) = &self.current {
-            self.page_end = Self::page_end(page, &self.range);
-            if self.page_end == 0 {
-                self.current = None;
-                self.groups.clear();
-            }
+            self.page_end = page.records.len();
+            self.page_in_range = self.range.allows_end(page.rows.last().unwrap());
         }
     }
-    // All current rows are already known to satisfy the snapshot bounds.
+    // Full pages need no per-row bound comparison; the last partial page does.
     pub(crate) fn current(&self) -> Option<(&Bytes, &Record)> {
         let page = self.current.as_ref()?;
-        Some((&page.rows[self.row], page.record(self.row)))
+        let key = &page.rows[self.row];
+        (self.page_in_range || self.range.allows_end(key)).then(|| (key, page.record(self.row)))
     }
     pub(crate) fn advance(&mut self) {
         if self.current.is_none() {
@@ -751,6 +739,11 @@ impl MemScan {
     pub(crate) fn next_live(&mut self) -> Option<(Vec<u8>, Bytes)> {
         loop {
             let page = self.current.as_ref()?;
+            if !self.page_in_range && !self.range.allows_end(&page.rows[self.row]) {
+                self.current = None;
+                self.groups.clear();
+                return None;
+            }
             let out = page.record(self.row).value.as_ref().map(|value| {
                 (
                     crate::scan::copy_scan_key(&page.rows[self.row]),
@@ -771,7 +764,13 @@ impl Iterator for MemScan {
     type Item = (Vec<u8>, Record);
     fn next(&mut self) -> Option<Self::Item> {
         let page = self.current.as_ref()?;
-        let out = (page.rows[self.row].to_vec(), page.record(self.row).clone());
+        let key = &page.rows[self.row];
+        if !self.page_in_range && !self.range.allows_end(key) {
+            self.current = None;
+            self.groups.clear();
+            return None;
+        }
+        let out = (key.to_vec(), page.record(self.row).clone());
         self.row += 1;
         if self.row == self.page_end {
             self.finish_page();
