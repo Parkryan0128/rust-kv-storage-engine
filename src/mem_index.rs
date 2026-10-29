@@ -99,27 +99,31 @@ struct PageKeys {
 }
 impl PageKeys {
     fn observe_key(&mut self, key: &[u8]) {
-        if key.len() < 16 {
+        // Inserting cannot create a common prefix once an existing page has
+        // lost it. Avoid inspecting keys or rewriting zero on that hot path.
+        if self.shared_prefix == 0 {
+            if self.rows.is_empty() && key.len() >= 16 {
+                self.shared_prefix = key.len().min(128);
+            }
+            return;
+        }
+        let limit = self.shared_prefix.min(key.len());
+        if limit < 16 {
             self.shared_prefix = 0;
             return;
         }
-        if self.rows.is_empty() {
-            self.shared_prefix = key.len().min(128);
-        } else if self.shared_prefix != 0 {
-            let limit = self.shared_prefix.min(key.len());
-            let first = &self.rows[0][..limit];
-            self.shared_prefix = if first == &key[..limit] {
-                limit
-            } else {
-                first
-                    .iter()
-                    .zip(&key[..limit])
-                    .position(|(a, b)| a != b)
-                    .unwrap()
-            };
-            if self.shared_prefix < 16 {
-                self.shared_prefix = 0;
-            }
+        let first = &self.rows[0][..limit];
+        self.shared_prefix = if first == &key[..limit] {
+            limit
+        } else {
+            first
+                .iter()
+                .zip(&key[..limit])
+                .position(|(a, b)| a != b)
+                .unwrap()
+        };
+        if self.shared_prefix < 16 {
+            self.shared_prefix = 0;
         }
     }
     fn position(&self, key: &[u8], prefix: u64) -> std::result::Result<usize, usize> {
