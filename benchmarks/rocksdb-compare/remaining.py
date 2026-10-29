@@ -188,7 +188,8 @@ def main():
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
                 "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
             expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release", "retained-large"]})
-            assert [r["stage"] for r in rows] == expected[mode]
+            stages = ["shaped-ranges"] if mode == "shaped-keys" and config.get("range_queries") else expected[mode]
+            assert [r["stage"] for r in rows] == stages
             return rows
         fixtures = {}
         for label, mode, config, preparation in cases:
