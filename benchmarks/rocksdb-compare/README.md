@@ -229,3 +229,5 @@ control. Keep cache-resident, long-key and cache-pressure cases alongside large
 random reads: a fixed-step indexed lookup experiment preserved correctness but
 regressed cached Get throughput, so production retains early equality exit.
 The boundary/model regression tests remain in place.
+
+`cargo test --locked --release --lib bloom::profile::profile_bloom_reduction -- --ignored --exact --nocapture --test-threads=1` compares reciprocal and original modulo probes in one process. A `[bloom-diag]` push marker runs it through `scan-diagnostics`. Six alternating trials use the same prehashed corpus, filter bytes and struct layout; this isolates reduction arithmetic, includes equal function-call overhead, and does not replace end-to-end Get measurements or test the old struct layout.

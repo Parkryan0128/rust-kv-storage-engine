@@ -193,7 +193,7 @@ To run the growing-database test on a chosen local disk, set `KV_STRESS_DIR` to 
 KV_STRESS_DIR=/mnt/test-disk/kv-scratch cargo test --locked --release --test stress million_distinct_keys -- --ignored --nocapture
 ```
 
-The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. The million-key and extended stress CI jobs run only when the workflow is manually dispatched.
+The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. The dedicated million-key CI job runs on manual dispatch. The extended job runs both large acceptance tests on manual dispatch or an explicit `[extended-stress]` main-branch commit marker.
 
 Check formatting and lints:
 
@@ -227,12 +227,15 @@ and comparison with a filtered `BTreeMap` through batches, flushes and reopens.
 
 ## Benchmarks
 
-The RocksDB comparison workflow is manual-only; ordinary pushes run correctness
-checks without executing performance benchmarks or the extended stress tests.
+RocksDB comparisons and extended acceptance tests are opt-in. Ordinary pushes
+run correctness checks; explicit commit markers or manual dispatch request the
+longer jobs. The [comparison guide](benchmarks/rocksdb-compare/README.md) describes
+`[full-comparison]`, `[performance-regression-loop]`, and exact baseline markers.
 
 A separate [bounded workload suite](benchmarks/rocksdb-compare/WORKLOADS.md) covers
 misses, hot keys, concurrent readers, ranges, durable batches and compaction, with
-memory/disk metrics and four paired repetitions against RocksDB. Its workflow is
+memory/disk metrics. Default runs use four repetitions against RocksDB, or six
+when an explicit engine baseline is included. Its workflow is
 opt-in through manual dispatch or a `[perf-check]` main-branch commit message.
 
 Run the Criterion benchmarks:

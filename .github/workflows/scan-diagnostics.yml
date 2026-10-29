@@ -40,3 +40,23 @@ jobs:
         with:
           name: scan-diagnostics
           path: scan-diagnostics-results/
+  bloom:
+    if: contains(github.event.head_commit.message, '[bloom-diag]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare exact Bloom reductions in the same process
+        shell: bash
+        run: |
+          mkdir -p bloom-diagnostics
+          git rev-parse HEAD > bloom-diagnostics/commit.txt
+          rustc --version > bloom-diagnostics/rust.txt
+          lscpu > bloom-diagnostics/cpu.txt
+          cargo test --locked --release --lib bloom::profile::profile_bloom_reduction -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bloom-diagnostics/results.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bloom-diagnostics
+          path: bloom-diagnostics/

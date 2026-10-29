@@ -333,3 +333,7 @@ mod tests {
 #[cfg(test)]
 #[path = "bloom_profile.rs"]
 mod profile;
+
+#[cfg(test)]
+#[path = "bloom_profile.rs"]
+mod profile;
