@@ -574,13 +574,17 @@ fn replay_locality_selects_chunk_size_without_changing_latest_values() {
         model.insert(bytes, record);
     }
     assert!(table.data.page_count() > REPLAY_RECORDS / 2);
-    for pass in 0..2 {
+    for pass in 0..3 {
         let mut pending = ReplayBuffer::default();
         let count = REPLAY_RECORDS as u64 + 1;
         for n in 0..count {
-            let key = ((n * 7919) % if pass == 0 { 997 } else { keys })
-                .to_be_bytes()
-                .to_vec();
+            let number = if pass == 2 && n % (REPLAY_STREAM_THRESHOLD as u64) < 8 {
+                // Later scatter must remain correct even when the sample misses it.
+                n % REPLAY_STREAM_THRESHOLD as u64
+            } else {
+                (n * 7919) % if pass == 0 { 997 } else { keys }
+            };
+            let key = number.to_be_bytes().to_vec();
             let record = Record {
                 seq: keys + 1 + pass * count + n,
                 value: (n % 7 != 0).then(|| Bytes::from(vec![n as u8; (n % 71) as usize])),
@@ -588,8 +592,11 @@ fn replay_locality_selects_chunk_size_without_changing_latest_values() {
             model.insert(key.clone(), record.clone());
             pending.push((key, record), &mut table);
             if n == REPLAY_STREAM_THRESHOLD as u64 - 1 {
-                if pass == 0 {
-                    assert!(pending.entries.is_empty(), "hotspot keeps small chunks");
+                if pass != 1 {
+                    assert!(
+                        pending.entries.is_empty(),
+                        "narrow sample keeps small chunks"
+                    );
                 } else {
                     assert_eq!(pending.entries.len(), REPLAY_STREAM_THRESHOLD);
                     assert!(!pending.sorted, "scattered chunk uses the wider window");

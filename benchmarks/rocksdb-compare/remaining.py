@@ -73,6 +73,15 @@ def main():
     if args.cases and "wal-large-hotspot" in args.cases:
         cases.append(("wal-large-hotspot", "recover",
                       dict(common, keys=200000, batch=32, wal_pattern="hotspot"), "prepare-wal"))
+    value_guards = [
+        ("wal-random-1k", 10000, 1024, "random", 32),
+        ("wal-random-16k", 2000, 16384, "random", 32),
+        ("wal-sorted-16k", 2000, 16384, "sorted", 256),
+    ]
+    for label, keys, value, pattern, batch in value_guards:
+        if args.cases and label in args.cases:
+            cases.append((label, "recover", dict(common, keys=keys, value=value,
+                          wal_pattern=pattern, batch=batch), "prepare-wal"))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

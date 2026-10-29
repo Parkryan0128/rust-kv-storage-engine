@@ -87,11 +87,11 @@ jobs:
           from pathlib import Path
           output = Path("focused-results/read-codegen")
           output.mkdir(parents=True, exist_ok=True)
-          targets = ("bloom::Bloom::contains_hash", "sstable::Table::get_hashed", "engine::Engine::get")
+          targets = ("contains_hash", "get_hashed")
           for name in ["baseline", "engine"]:
               binary = Path("comparison-bin/workloads-" + name)
               symbols = subprocess.check_output(["nm", "-S", "-C", str(binary)], text=True)
-              (output / (name + "-symbols.txt")).write_text("\n".join(line for line in symbols.splitlines() if any(t in line for t in targets)))
+              (output / (name + "-symbols.txt")).write_text(symbols)
               assembly = subprocess.check_output(["objdump", "-d", "-C", str(binary)], text=True)
               selected, keep = [], False
               for line in assembly.splitlines():
@@ -142,6 +142,9 @@ jobs:
       - name: Large-index clustered overwrite guard
         if: ${{ contains(github.event.head_commit.message, '[recovery-hotspot]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery-hotspot --trials 12 --case wal-large-hotspot
+      - name: Recovery with larger values
+        if: ${{ contains(github.event.head_commit.message, '[recovery-value-guard]') }}
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery-values --trials 12 --case wal-random-1k --case wal-random-16k --case wal-sorted-16k
       - name: Preserve completed write and recovery checkpoint
         uses: actions/upload-artifact@v4
         with:

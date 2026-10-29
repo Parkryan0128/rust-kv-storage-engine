@@ -307,7 +307,9 @@ impl ReplayBuffer {
     }
     // A larger window only helps scattered writes that cannot share pages in
     // the small chunk. Ordered and concentrated writes keep the original bound.
-    // This is a locality hint, not a promise about future keys or sequence order.
+    // A bounded sample keeps the hint cheaper than the sort it may avoid.
+    // Missing later scatter keeps small chunks; correctness never assumes
+    // the rest of the chunk or future keys follow the sampled distribution.
     fn needs_wider_window(&self, table: &MemTable) -> bool {
         let threshold = REPLAY_STREAM_THRESHOLD / 2;
         if self.sorted || table.data.page_count() <= threshold {
@@ -315,7 +317,7 @@ impl ReplayBuffer {
         }
         let first = self.entries[0].0.as_slice();
         let (mut lower, mut upper) = (first, first);
-        for (key, _) in &self.entries[1..] {
+        for (key, _) in self.entries.iter().take(8).skip(1) {
             lower = lower.min(key.as_slice());
             upper = upper.max(key.as_slice());
         }
