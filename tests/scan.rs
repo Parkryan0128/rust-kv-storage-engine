@@ -453,3 +453,32 @@ fn concurrent_scans_never_observe_half_a_batch() {
     }
     writer.join().unwrap();
 }
+
+#[test]
+fn bounds_proven_empty_scans_release_the_lock_and_remain_empty() {
+    for mode in 0..4 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(dir.path()).unwrap();
+        if mode != 0 {
+            db.put(b"a", b"old").unwrap();
+        }
+        if mode >= 2 {
+            db.flush().unwrap();
+        }
+        let db = if mode == 3 {
+            drop(db);
+            Engine::open(dir.path()).unwrap()
+        } else {
+            db
+        };
+        let before = db.stats().block_reads;
+        let mut empty = db.scan(b"z".as_slice()..).unwrap();
+        assert_eq!(db.stats().block_reads, before);
+        drop(db);
+        let reopened = Engine::open(dir.path()).unwrap();
+        reopened.put(b"z", b"new").unwrap();
+        assert!(empty.next().is_none());
+        assert!(empty.next().is_none());
+        assert_eq!(reopened.get(b"z").unwrap().unwrap().as_ref(), b"new");
+    }
+}

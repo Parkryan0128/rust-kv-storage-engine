@@ -166,7 +166,7 @@ pub struct Scan {
 
 impl Scan {
     pub(crate) fn new(
-        engine: Engine,
+        engine: &Engine,
         memory: Vec<MemScan>,
         tables: &[Arc<Table>],
         range: Arc<KeyRange>,
@@ -182,12 +182,17 @@ impl Scan {
                 .filter(|table| table.overlaps(&range))
                 .map(|table| Source::Table(table.scan(range.clone()))),
         );
+        // Bounds and memory snapshots already prove there are no sources.
+        // Avoid retaining an engine and initializing a merge on first next().
+        if sources.is_empty() {
+            return Self::empty();
+        }
         let borrowed_merge = sources.len() <= BORROWED_MERGE_SOURCES
             && sources
                 .iter()
                 .any(|source| matches!(source, Source::Table(_)));
         Self {
-            engine: Some(engine),
+            engine: Some(engine.clone()),
             borrowed_merge,
             live_sources: sources.len(),
             sources,
@@ -467,10 +472,10 @@ mod tests {
                 upper.extend((end as u64).to_be_bytes());
                 let range = Arc::new(KeyRange::new(lo.as_slice()..upper.as_slice()).unwrap());
                 let mut scan = if disk {
-                    Scan::new(Engine::new(), vec![], std::slice::from_ref(&table), range)
+                    Scan::new(&Engine::new(), vec![], std::slice::from_ref(&table), range)
                 } else {
                     Scan::new(
-                        Engine::new(),
+                        &Engine::new(),
                         vec![memory.snapshot(range.clone()).unwrap()],
                         &[],
                         range,
@@ -616,7 +621,7 @@ mod tests {
             let range = Arc::new(KeyRange::new(..).unwrap());
             for force_heap in [false, true] {
                 let mut scan = Scan::new(
-                    Engine::new(),
+                    &Engine::new(),
                     vec![memory.snapshot(range.clone()).unwrap()],
                     &tables,
                     range.clone(),
@@ -669,7 +674,7 @@ mod tests {
         }
         let range = Arc::new(KeyRange::new(..).unwrap());
         let mut scan = Scan::new(
-            Engine::new(),
+            &Engine::new(),
             vec![
                 older.snapshot(range.clone()).unwrap(),
                 newer.snapshot(range.clone()).unwrap(),

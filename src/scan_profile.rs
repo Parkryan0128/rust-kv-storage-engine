@@ -53,7 +53,7 @@ fn merge_policy_profile() {
                 let engine = Engine::new();
                 let range = Arc::new(KeyRange::new(..).unwrap());
                 let make_scan = |borrowed| {
-                    let mut scan = Scan::new(engine.clone(), vec![], &tables, range.clone());
+                    let mut scan = Scan::new(&engine, vec![], &tables, range.clone());
                     scan.borrowed_merge = borrowed;
                     scan
                 };

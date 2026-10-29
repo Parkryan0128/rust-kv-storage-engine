@@ -512,7 +512,7 @@ impl Engine {
         drop(s);
         #[cfg(test)]
         crate::test_hooks::pause("scan_before_frozen_merge");
-        Ok(Scan::new(self.clone(), memory, &tables, range))
+        Ok(Scan::new(self, memory, &tables, range))
     }
 
     pub(crate) fn scan_counters(&self) -> &Counters {
