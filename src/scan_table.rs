@@ -8,7 +8,6 @@ pub(crate) struct TableScan {
     next_block: usize,
     block: Option<BlockCursor>,
     seek: bool,
-    supports_prefix: bool,
     block_in_range: bool,
     done: bool,
 }
@@ -38,7 +37,6 @@ impl Table {
             next_block,
             block: None,
             seek: true,
-            supports_prefix: self.expanded_frame_limit.is_some(),
             block_in_range: false,
             done: false,
         }
@@ -57,8 +55,7 @@ impl TableScan {
     ) -> Result<Option<T>> {
         // Versions 01–04 cannot contain shared-prefix blocks. Specialize their
         // row loop so prefix reconstruction does not enlarge the plain decoder.
-        // The immutable format proof is captured once when the scan is created.
-        if self.supports_prefix {
+        if self.table.expanded_frame_limit.is_some() {
             self.advance_for::<true, T>(counters, consume)
         } else {
             self.advance_for::<false, T>(counters, consume)
