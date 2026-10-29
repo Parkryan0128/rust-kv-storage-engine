@@ -180,10 +180,28 @@ impl PageData {
 const PAGE_UPDATES: usize = 16;
 // Rows are bounded by PAGE_RECORDS. The bitmap removes the usize stored
 // beside every delta record and gives membership without a binary search.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct PageUpdates {
     rows: [u64; PAGE_RECORDS / 64],
     records: Vec<Record>,
+}
+impl Clone for PageUpdates {
+    fn clone(&self) -> Self {
+        // A shared page is cloned because it is about to be changed. Vec::clone
+        // otherwise leaves capacity == len, making the very next insertion
+        // allocate and move the same records again.
+        let capacity = if self.records.is_empty() {
+            0
+        } else {
+            (self.records.len() + 1).next_power_of_two().min(32)
+        };
+        let mut records = Vec::with_capacity(capacity);
+        records.extend(self.records.iter().cloned());
+        Self {
+            rows: self.rows,
+            records,
+        }
+    }
 }
 impl PageUpdates {
     fn is_empty(&self) -> bool {
@@ -1180,6 +1198,26 @@ mod tests {
         );
         assert_eq!(copies.get(), 1);
         assert_eq!(latest.len(), keys.len());
+    }
+
+    #[test]
+    fn snapshot_delta_clone_keeps_room_for_the_next_distinct_update() {
+        let mut updates = PageUpdates::default();
+        for row in 0..31 {
+            let mut cloned = updates.clone();
+            if row != 0 {
+                let buffer = cloned.records.as_ptr();
+                cloned.insert(row, row, record(row as u64 + 1));
+                assert_eq!(buffer, cloned.records.as_ptr());
+            } else {
+                cloned.insert(row, row, record(1));
+            }
+            assert!(cloned.records.capacity() <= 32);
+            for previous in 0..row {
+                assert_eq!(cloned.get(previous), updates.get(previous));
+            }
+            updates = cloned;
+        }
     }
 
     #[test]
