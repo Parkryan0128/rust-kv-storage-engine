@@ -57,7 +57,7 @@ fn prefix_tables_preserve_bounds_versions_and_deletions_across_reopen() {
             db.write_batch(batch).unwrap();
             historical.push((db.scan(..).unwrap(), expected(&model)));
             db.flush().unwrap();
-            assert!(common::files(dir.path(), "sst")
+            assert!(common::files(&dir.path().join("sst"), "sst")
                 .iter()
                 .any(|p| { std::fs::read(p).unwrap().starts_with(b"RKVSST05") }));
             if generation % 2 != 0 {
@@ -182,7 +182,9 @@ fn prefix_publication_crashes_preserve_acknowledged_batches() {
                         db.flush().unwrap();
                     }
                 }
-                assert!(common::files(dir.path(), "sst")
+                let files = common::files(&dir.path().join("sst"), "sst");
+                assert_eq!(files.len(), if compact { 3 } else { 2 });
+                assert!(files
                     .iter()
                     .all(|p| { std::fs::read(p).unwrap().starts_with(b"RKVSST05") }));
                 drop(db);
