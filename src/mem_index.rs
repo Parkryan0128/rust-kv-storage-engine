@@ -20,12 +20,7 @@ fn prefix(key: &[u8]) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-fn preceding(
-    prefixes: &[u64],
-    needle: u64,
-    before: impl Fn(usize) -> bool,
-    shared: impl Fn() -> Option<usize>,
-) -> usize {
+fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> usize {
     if prefixes.len() <= 1 {
         return 0;
     }
@@ -33,11 +28,6 @@ fn preceding(
     let last = right.saturating_sub(1);
     if right == 0 || prefixes[last] != needle || before(last) {
         return last;
-    }
-    // Unique numeric prefixes already returned above. Keep the extra proof
-    // work exclusively in the collision path, away from ordinary short keys.
-    if let Some(index) = shared() {
-        return index;
     }
     // With a shared prefix the lower bound is already known. Keep complete
     // key comparisons for ordering; the prefix is only a routing hint.
@@ -56,34 +46,6 @@ fn preceding(
         }
     }
     left.saturating_sub(1)
-}
-
-// Sorted endpoints prove that every separator has the same prefix. Check that
-// proof once instead of rereading it in each binary-search comparison.
-fn preceding_shared<'a>(
-    key: &[u8],
-    shared: usize,
-    count: usize,
-    key_at: impl Fn(usize) -> &'a [u8],
-) -> Option<usize> {
-    if shared < 16 || count < 8 {
-        return None;
-    }
-    let common = key.get(..shared)?;
-    if !key_at(0).starts_with(common) || !key_at(count - 1).starts_with(common) {
-        return None;
-    }
-    let suffix = &key[shared..];
-    let (mut left, mut right) = (0, count);
-    while left < right {
-        let middle = left + (right - left) / 2;
-        if &key_at(middle)[shared..] <= suffix {
-            left = middle + 1;
-        } else {
-            right = middle;
-        }
-    }
-    Some(left.saturating_sub(1))
 }
 
 // Replacing values never changes key order or routing. Share those arrays
@@ -434,16 +396,9 @@ impl PageGroup {
         &self.pages[0].rows[0]
     }
     fn page_for(&self, key: &[u8], prefix: u64) -> usize {
-        preceding(
-            &self.prefixes,
-            prefix,
-            |i| self.pages[i].rows[0].as_ref() <= key,
-            || {
-                preceding_shared(key, self.pages[0].shared_prefix, self.pages.len(), |i| {
-                    &self.pages[i].rows[0]
-                })
-            },
-        )
+        preceding(&self.prefixes, prefix, |i| {
+            self.pages[i].rows[0].as_ref() <= key
+        })
     }
     #[inline]
     fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(
@@ -541,19 +496,9 @@ pub(crate) struct MemIndex {
 }
 impl MemIndex {
     fn group_for(&self, key: &[u8], prefix: u64) -> usize {
-        preceding(
-            &self.prefixes,
-            prefix,
-            |i| self.groups[i].first_key() <= key,
-            || {
-                preceding_shared(
-                    key,
-                    self.groups[0].pages[0].shared_prefix,
-                    self.groups.len(),
-                    |i| self.groups[i].first_key(),
-                )
-            },
-        )
+        preceding(&self.prefixes, prefix, |i| {
+            self.groups[i].first_key() <= key
+        })
     }
     pub fn len(&self) -> usize {
         self.len
@@ -1127,74 +1072,6 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
-    }
-
-    #[test]
-    fn ordinary_routing_does_not_evaluate_common_prefix_proof() {
-        let prefixes = [10u64, 20, 30];
-        for (needle, expected) in [(0, 0), (10, 0), (19, 0), (20, 1), (29, 1), (30, 2), (99, 2)] {
-            assert_eq!(
-                preceding(
-                    &prefixes,
-                    needle,
-                    |i| prefixes[i] <= needle,
-                    || panic!("ordinary routing requested prefix proof")
-                ),
-                expected
-            );
-        }
-        assert_eq!(
-            preceding(
-                &[10],
-                10,
-                |_| panic!("one separator comparison"),
-                || panic!("one separator proof")
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn shared_prefix_routing_matches_complete_ordering_and_falls_back() {
-        let key = |n: u64| {
-            let mut result = vec![b'x'; 128];
-            result.extend_from_slice(&n.to_be_bytes());
-            result
-        };
-        let rows: Vec<_> = (0..16).map(|n| key(n * 2)).collect();
-        for n in 0..34 {
-            let query = key(n);
-            let expected = rows.partition_point(|row| row <= &query).saturating_sub(1);
-            assert_eq!(
-                preceding_shared(&query, 128, rows.len(), |i| &rows[i]),
-                Some(expected)
-            );
-        }
-        for query in [
-            Vec::new(),
-            vec![b'x'; 127],
-            vec![b'w'; 136],
-            vec![b'y'; 136],
-        ] {
-            assert_eq!(
-                preceding_shared(&query, 128, rows.len(), |i| &rows[i]),
-                None
-            );
-        }
-        assert_eq!(preceding_shared(&key(8), 0, rows.len(), |i| &rows[i]), None);
-        assert_eq!(preceding_shared(&key(8), 128, 7, |i| &rows[i]), None);
-        let mut changed = rows.clone();
-        changed[15] = vec![b'y'; 136];
-        assert_eq!(
-            preceding_shared(&key(8), 128, changed.len(), |i| &changed[i]),
-            None
-        );
-        changed[15] = rows[15].clone();
-        changed[0] = vec![b'x'; 64];
-        assert_eq!(
-            preceding_shared(&key(8), 128, changed.len(), |i| &changed[i]),
-            None
-        );
     }
 
     #[test]
