@@ -110,18 +110,16 @@ enum Source {
 }
 
 impl Source {
-    fn head_for<const PREFIX: bool>(&self) -> Option<(&[u8], u64)> {
+    fn head(&self) -> Option<(&[u8], u64)> {
         match self {
             Self::Memory { iter, .. } => iter
                 .current()
                 .map(|(key, record)| (key.as_ref(), record.seq)),
-            Self::Table(iter) => iter
-                .current_for::<PREFIX>()
-                .map(|record| (record.key, record.seq)),
+            Self::Table(iter) => iter.current().map(|record| (record.key, record.seq)),
             Self::Exhausted => None,
         }
     }
-    fn owned_live_head_for<const PREFIX: bool>(&self) -> Option<(Vec<u8>, Bytes)> {
+    fn owned_live_head(&self) -> Option<(Vec<u8>, Bytes)> {
         match self {
             Self::Memory { iter, .. } => {
                 let (key, record) = iter.current()?;
@@ -131,7 +129,7 @@ impl Source {
                     .map(|value| (key.to_vec(), value.clone()))
             }
             Self::Table(iter) => {
-                let record = iter.current_for::<PREFIX>()?;
+                let record = iter.current()?;
                 record
                     .to_owned()
                     .value
@@ -164,7 +162,6 @@ pub struct Scan {
     pending: Vec<usize>,
     initialized: bool,
     borrowed_merge: bool,
-    prefix_merge: bool,
     live_sources: usize,
 }
 
@@ -175,34 +172,29 @@ impl Scan {
         tables: &[Arc<Table>],
         range: Arc<KeyRange>,
     ) -> Self {
-        let memory_count = memory.len();
-        let mut sources = Vec::with_capacity(memory_count);
+        let mut sources = Vec::with_capacity(memory.len());
         sources.extend(memory.into_iter().map(|iter| Source::Memory {
             iter,
             started: false,
         }));
-        let mut prefix_merge = false;
         sources.extend(
             tables
                 .iter()
                 .filter(|table| table.overlaps(&range))
-                .map(|table| {
-                    let scan = table.scan(range.clone());
-                    prefix_merge |= scan.has_prefix_blocks();
-                    Source::Table(scan)
-                }),
+                .map(|table| Source::Table(table.scan(range.clone()))),
         );
         // Bounds and memory snapshots already prove there are no sources.
         // Avoid retaining an engine and initializing a merge on first next().
         if sources.is_empty() {
             return Self::empty();
         }
-        let borrowed_merge =
-            sources.len() <= BORROWED_MERGE_SOURCES && sources.len() > memory_count;
+        let borrowed_merge = sources.len() <= BORROWED_MERGE_SOURCES
+            && sources
+                .iter()
+                .any(|source| matches!(source, Source::Table(_)));
         Self {
             engine: Some(engine.clone()),
             borrowed_merge,
-            prefix_merge,
             live_sources: sources.len(),
             sources,
             heap: BinaryHeap::new(),
@@ -215,7 +207,6 @@ impl Scan {
         Self {
             engine: None,
             borrowed_merge: false,
-            prefix_merge: false,
             sources: Vec::new(),
             heap: BinaryHeap::new(),
             pending: Vec::new(),
@@ -284,11 +275,7 @@ impl Scan {
             }
         }
         if self.borrowed_merge {
-            return if self.prefix_merge {
-                self.read_borrowed::<true>()
-            } else {
-                self.read_borrowed::<false>()
-            };
+            return self.read_borrowed();
         }
         if !self.initialized {
             for index in 0..self.sources.len() {
@@ -337,7 +324,7 @@ impl Scan {
 
     // No key allocation for losing versions or deletions. The linear walk is
     // bounded; large fan-in and memory-only merges keep the existing heap.
-    fn advance_borrowed<const PREFIX: bool>(&mut self, index: usize) -> Result<()> {
+    fn advance_borrowed(&mut self, index: usize) -> Result<()> {
         let live = match &mut self.sources[index] {
             Source::Memory { iter, started } => {
                 if *started {
@@ -347,7 +334,7 @@ impl Scan {
                 iter.current().is_some()
             }
             Source::Table(iter) => iter
-                .advance_for::<PREFIX, _>(self.engine.as_ref().unwrap().scan_counters(), |_| ())?
+                .advance(self.engine.as_ref().unwrap().scan_counters(), |_| ())?
                 .is_some(),
             Source::Exhausted => return Ok(()),
         };
@@ -358,20 +345,20 @@ impl Scan {
         Ok(())
     }
 
-    fn read_borrowed<const PREFIX: bool>(&mut self) -> Result<Option<(Vec<u8>, Bytes)>> {
+    fn read_borrowed(&mut self) -> Result<Option<(Vec<u8>, Bytes)>> {
         if !self.initialized {
             for index in 0..self.sources.len() {
-                self.advance_borrowed::<PREFIX>(index)?;
+                self.advance_borrowed(index)?;
             }
             self.initialized = true;
         }
         loop {
             while let Some(index) = self.pending.pop() {
-                self.advance_borrowed::<PREFIX>(index)?;
+                self.advance_borrowed(index)?;
             }
             let mut best: Option<(&[u8], usize, u64)> = None;
             for (index, source) in self.sources.iter().enumerate() {
-                let Some((key, seq)) = source.head_for::<PREFIX>() else {
+                let Some((key, seq)) = source.head() else {
                     continue;
                 };
                 match best {
@@ -396,7 +383,7 @@ impl Scan {
             let Some((_, winner, _)) = best else {
                 return Ok(None);
             };
-            if let Some(item) = self.sources[winner].owned_live_head_for::<PREFIX>() {
+            if let Some(item) = self.sources[winner].owned_live_head() {
                 if self.live_sources == 1 {
                     self.keep_only(winner);
                 }
@@ -450,6 +437,87 @@ impl FusedIterator for Scan {}
 mod tests {
     use super::*;
     use crate::Options;
+
+    #[test]
+    fn borrowed_and_heap_merges_preserve_mixed_plain_and_prefix_versions() {
+        use crate::memtable::Record;
+        let dir = tempfile::tempdir().unwrap();
+        let key = |n: u64| {
+            let mut key = vec![b'x'; 128];
+            key.extend_from_slice(&n.to_be_bytes());
+            key
+        };
+        let plain = Arc::new(
+            Table::write(
+                &dir.path().join("plain.sst"),
+                1,
+                [b"a".to_vec(), key(10), b"z".to_vec()]
+                    .into_iter()
+                    .map(|key| {
+                        Ok((
+                            key,
+                            Record {
+                                seq: 5,
+                                value: Some(Bytes::from_static(b"older")),
+                            },
+                        ))
+                    }),
+                3,
+                4096,
+                10,
+            )
+            .unwrap(),
+        );
+        let prefix = Arc::new(
+            Table::write(
+                &dir.path().join("prefix.sst"),
+                2,
+                (0..100u64).map(|n| {
+                    Ok((
+                        key(n),
+                        Record {
+                            seq: n + 10,
+                            value: (n != 10).then(|| Bytes::copy_from_slice(&n.to_be_bytes())),
+                        },
+                    ))
+                }),
+                100,
+                4096,
+                10,
+            )
+            .unwrap(),
+        );
+        let range = Arc::new(KeyRange::new(..).unwrap());
+        assert_eq!(
+            &std::fs::read(dir.path().join("plain.sst")).unwrap()[..8],
+            b"RKVSST04"
+        );
+        assert_eq!(
+            &std::fs::read(dir.path().join("prefix.sst")).unwrap()[..8],
+            b"RKVSST05"
+        );
+        let mut expected = vec![(b"a".to_vec(), Bytes::from_static(b"older"))];
+        expected.extend(
+            (0..100u64)
+                .filter(|n| *n != 10)
+                .map(|n| (key(n), Bytes::copy_from_slice(&n.to_be_bytes()))),
+        );
+        expected.push((b"z".to_vec(), Bytes::from_static(b"older")));
+        for force_heap in [false, true] {
+            let mut scan = Scan::new(
+                &Engine::new(),
+                vec![],
+                &[plain.clone(), prefix.clone()],
+                range.clone(),
+            );
+            assert!(scan.borrowed_merge);
+            if force_heap {
+                scan.borrowed_merge = false;
+            }
+            assert_eq!(scan.by_ref().collect::<Result<Vec<_>>>().unwrap(), expected);
+            assert!(scan.next().is_none());
+        }
+    }
 
     #[test]
     fn single_source_copies_only_live_keys_across_pages_and_bounds() {
