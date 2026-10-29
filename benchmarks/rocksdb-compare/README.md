@@ -278,3 +278,17 @@ The engine ignores the RocksDB-only policy setting; repeated engine measurements
 provide a same-host control. Historical full-matrix defaults remain unchanged.
 Large-value cache-only Get/return/drop ratios must not be presented as the speed
 of consuming those bytes or as an untuned-versus-best-tuned RocksDB comparison.
+
+
+### Identical-source build control
+
+The identical-executable random-read control measures run-to-run variation, but
+not differences between separately linked builds. To investigate a small or
+host-dependent regression, compare a documentation-only revision against its
+parent with `[performance-regression-loop] [recovery-only] [cached-read-guard]
+[range-read-guard] [baseline:<parent-sha>]`. Verify identical production Rust
+sources, manifests, lockfiles, and copied harness sources before interpreting
+this control. Preserve both executable hashes and the same rotated trial order.
+An identical-source difference is not an optimization gain and must not be
+subtracted mechanically from another run; use it to decide whether a source
+change needs a more controlled experiment.
