@@ -165,8 +165,11 @@ impl PageData {
             }
         }
     }
-    fn fold(&mut self, updates: &mut Vec<(usize, Record)>) {
-        for (row, record) in updates.drain(..) {
+    fn fold(&mut self, updates: &mut PageUpdates) {
+        if updates.is_empty() {
+            return;
+        }
+        for (row, record) in updates.drain() {
             self.replace(row, record);
         }
     }
@@ -175,10 +178,71 @@ impl PageData {
 // A snapshot update copies only a bounded delta and one base handle. Keys and
 // unchanged values stay in the immutable base until a structural edit or fold.
 const PAGE_UPDATES: usize = 16;
+// Rows are bounded by PAGE_RECORDS. The bitmap removes the usize stored
+// beside every delta record and gives membership without a binary search.
+#[derive(Clone, Default)]
+struct PageUpdates {
+    rows: [u64; PAGE_RECORDS / 64],
+    records: Vec<Record>,
+}
+impl PageUpdates {
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+    fn position(&self, row: usize) -> std::result::Result<usize, usize> {
+        debug_assert!(row < PAGE_RECORDS);
+        let word = row / 64;
+        let bit = 1u64 << (row % 64);
+        let index = self.rows[..word]
+            .iter()
+            .map(|v| v.count_ones() as usize)
+            .sum::<usize>()
+            + (self.rows[word] & (bit - 1)).count_ones() as usize;
+        if self.rows[word] & bit != 0 {
+            Ok(index)
+        } else {
+            Err(index)
+        }
+    }
+    fn get(&self, row: usize) -> Option<&Record> {
+        // Most reads miss the sparse delta. Do not compute its rank then.
+        if self.rows[row / 64] & (1u64 << (row % 64)) == 0 {
+            return None;
+        }
+        Some(&self.records[self.position(row).unwrap()])
+    }
+    fn insert(&mut self, index: usize, row: usize, record: Record) {
+        self.records.insert(index, record);
+        self.rows[row / 64] |= 1u64 << (row % 64);
+    }
+    fn drain(&mut self) -> impl Iterator<Item = (usize, Record)> + '_ {
+        let rows = std::mem::take(&mut self.rows);
+        rows.into_iter()
+            .enumerate()
+            .flat_map(|(word, mut bits)| {
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let row = word * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(row)
+                })
+            })
+            .zip(self.records.drain(..))
+    }
+    fn capacity_bytes(&self) -> usize {
+        self.records.capacity() * std::mem::size_of::<Record>()
+    }
+}
+
 #[derive(Clone, Default)]
 struct Page {
     base: Arc<PageData>,
-    updates: Vec<(usize, Record)>,
+    updates: PageUpdates,
 }
 impl std::ops::Deref for Page {
     type Target = PageData;
@@ -190,8 +254,8 @@ impl Page {
     #[inline]
     fn record(&self, row: usize) -> &Record {
         if !self.updates.is_empty() {
-            if let Ok(i) = self.updates.binary_search_by_key(&row, |(i, _)| *i) {
-                return &self.updates[i].1;
+            if let Some(record) = self.updates.get(row) {
+                return record;
             }
         }
         &self.records[row]
@@ -200,7 +264,8 @@ impl Page {
         if !self.updates.is_empty() && Arc::get_mut(&mut self.base).is_none() {
             // Copy unchanged handles once and move delta records directly into place.
             // Sorted deltas merge linearly; no per-row binary search or obsolete value clone.
-            let mut updates = std::mem::take(&mut self.updates).into_iter().peekable();
+            let mut delta = std::mem::take(&mut self.updates);
+            let mut updates = delta.drain().peekable();
             let mut value_bytes = self.value_bytes;
             let records = self
                 .records
@@ -233,15 +298,15 @@ impl Page {
             base.fold(&mut self.updates);
             return base.replace(row, record);
         }
-        match self.updates.binary_search_by_key(&row, |(i, _)| *i) {
+        match self.updates.position(row) {
             Ok(i) => {
-                let previous_bytes = self.updates[i].1.value.as_ref().map_or(0, Bytes::len);
-                self.updates[i].1 = record;
+                let previous_bytes = self.updates.records[i].value.as_ref().map_or(0, Bytes::len);
+                self.updates.records[i] = record;
                 previous_bytes
             }
             Err(i) if self.updates.len() < (self.rows.len() / 8).clamp(PAGE_UPDATES, 32) => {
                 let old = self.records[row].value.as_ref().map_or(0, Bytes::len);
-                self.updates.insert(i, (row, record));
+                self.updates.insert(i, row, record);
                 old
             }
             Err(_) => self.materialize().replace(row, record),
@@ -258,8 +323,8 @@ impl Page {
             + self.records.capacity() * std::mem::size_of::<Record>()
             + self.prefixes.capacity() * std::mem::size_of::<u64>()
             + self.key_bytes + self.value_bytes
-            + self.updates.capacity() * std::mem::size_of::<(usize, Record)>()
-            + self.updates.iter().map(|(_, r)| r.value.as_ref().map_or(0, Bytes::len)).sum::<usize>()
+            + self.updates.capacity_bytes()
+            + self.updates.records.iter().map(|r| r.value.as_ref().map_or(0, Bytes::len)).sum::<usize>()
     }
     fn overfull(&self) -> bool {
         self.rows.len() > 1 && (self.rows.len() > PAGE_RECORDS || self.key_bytes > PAGE_KEY_BYTES)
@@ -351,7 +416,7 @@ impl PageGroup {
                                     records,
                                     value_bytes,
                                 }),
-                                updates: Vec::new(),
+                                updates: PageUpdates::default(),
                             }),
                         );
                         end += 1;
@@ -1115,6 +1180,41 @@ mod tests {
         );
         assert_eq!(copies.get(), 1);
         assert_eq!(latest.len(), keys.len());
+    }
+
+    #[test]
+    fn delta_bitmap_rank_and_drain_cover_all_word_boundaries() {
+        let mut updates = PageUpdates::default();
+        let mut expected = std::collections::BTreeMap::new();
+        for row in [255, 64, 0, 127, 128, 63, 192, 191, 1, 65, 129, 193, 254] {
+            let record = record(row as u64 + 1);
+            let index = updates.position(row).unwrap_err();
+            updates.insert(index, row, record.clone());
+            expected.insert(row, record);
+            for candidate in 0..PAGE_RECORDS {
+                assert_eq!(updates.get(candidate), expected.get(&candidate));
+                let rank = expected.keys().take_while(|&&key| key < candidate).count();
+                assert_eq!(
+                    updates.position(candidate),
+                    if expected.contains_key(&candidate) {
+                        Ok(rank)
+                    } else {
+                        Err(rank)
+                    }
+                );
+            }
+        }
+        let saved = updates.clone();
+        assert_eq!(
+            updates.drain().collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        assert!(updates.is_empty());
+        assert_eq!(updates.rows, [0; 4]);
+        assert_eq!(saved.get(255), Some(&record(256)));
+        updates.insert(0, 64, record(999));
+        assert_eq!(updates.get(64), Some(&record(999)));
+        assert_eq!(updates.get(255), None);
     }
 
     #[test]
