@@ -53,12 +53,26 @@ impl TableScan {
         counters: &Counters,
         consume: impl FnOnce(RecordRef<'_>) -> T,
     ) -> Result<Option<T>> {
+        // Versions 01–04 cannot contain shared-prefix blocks. Specialize their
+        // row loop so prefix reconstruction does not enlarge the plain decoder.
+        if self.table.expanded_frame_limit.is_some() {
+            self.advance_for::<true, T>(counters, consume)
+        } else {
+            self.advance_for::<false, T>(counters, consume)
+        }
+    }
+
+    fn advance_for<const PREFIX: bool, T>(
+        &mut self,
+        counters: &Counters,
+        consume: impl FnOnce(RecordRef<'_>) -> T,
+    ) -> Result<Option<T>> {
         if let Some(block) = &mut self.block {
-            block.advance()?;
+            block.advance_for::<PREFIX>()?;
         }
         while !self.done {
             if let Some(block) = &self.block {
-                if let Some(record) = block.current() {
+                if let Some(record) = block.current_for::<PREFIX>() {
                     if !self.block_in_range && !self.range.allows_end(record.key) {
                         self.done = true;
                         self.block = None;
@@ -110,7 +124,7 @@ impl TableScan {
                 self.seek = false;
             }
             self.next_block += 1;
-            self.block = Some(BlockCursor::new(block, record, prefix_key)?);
+            self.block = Some(BlockCursor::new_for::<PREFIX>(block, record, prefix_key)?);
         }
         self.done = true;
         self.block = None;
