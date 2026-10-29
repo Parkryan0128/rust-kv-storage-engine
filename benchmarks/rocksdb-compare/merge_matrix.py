@@ -27,6 +27,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--allow-format-change", action="store_true", help="Verify logical outputs while retaining digests across SST format versions")
+    parser.add_argument("--trials", type=int, choices=range(1, 31), default=6)
+    parser.add_argument("--case", action="append", dest="selected_cases", help="Select existing named cases (repeatable)")
+    parser.add_argument("--trace-syscalls", action="store_true", help="Separate diagnostic: trace write/sync wall time, including setup/reopen")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -36,15 +39,26 @@ def main():
               merge_deletes=shape == "deletes"))
              for n in [2, 4, 8, 9, 16] for key_bytes in [8, 136]
              for shape in ["distinct", "overlap", "deletes"]]
+    if args.selected_cases:
+        selected = set(args.selected_cases)
+        available = {name for name, _ in cases}
+        if selected - available:
+            parser.error(f"Unknown cases: {sorted(selected - available)}")
+        cases = [case for case in cases if case[0] in selected]
     environment = {
         "commit": capture("git", "rev-parse", "HEAD"),
         "baseline": capture("git", "-C", "baseline", "rev-parse", "HEAD"),
         "platform": platform.platform(), "cpu": capture("lscpu"),
-        "rust": capture("rustc", "--version"), "trials": 6,
+        "rust": capture("rustc", "--version"), "trials": args.trials,
+        "selected_cases": [name for name, _ in cases],
+        "syscall_profile": args.trace_syscalls,
         "semantics": "Each trial gets a pristine fixture copy and warm OS cache. Baseline/current use identical SST bytes prepared by baseline; RocksDB uses the same logical write history. 2/4/8/9/16 flushed generations, 8/136-byte common-prefix keys, distinct/overlap/deletion histories, 32768 distinct keys or 8192 keys per overlapping generation, automatic compaction disabled, no compression. All keys verified after compact and reopen outside timing. Final baseline/current SST files must match byte for byte.",
         "limits": "Shared CI, warm OS cache, bounded single compactions. Different native table layouts and compaction policies across engine/RocksDB. No claim about sustained writes, cold devices or fsync-tail causality.",
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
     }
+    if args.trace_syscalls:
+        environment["trace_version"] = capture("strace", "--version")
+        environment["limits"] += " Instrumented write/sync syscall wall times include open, compaction and verification/reopen. They are not exact API phase percentages or normal throughput rankings."
     environment["allow_format_change"] = args.allow_format_change
     if args.allow_format_change:
         environment["semantics"] = environment["semantics"].replace("Final baseline/current SST files must match byte for byte.", "SST formats may differ; all logical values are verified after compaction and reopen. File digests are retained.")
@@ -57,7 +71,12 @@ def main():
         print("MERGE_MATRIX_ENV " + json.dumps(environment), flush=True)
 
         def run(name, mode, directory, config, label):
-            done = subprocess.run([str(binaries[name]), mode, str(directory), json.dumps(config)], text=True, capture_output=True, timeout=90)
+            command = [str(binaries[name]), mode, str(directory), json.dumps(config)]
+            if args.trace_syscalls and mode == "compact-merge":
+                command = ["strace", "-f", "-qq", "-w", "-c", "-e",
+                           "trace=write,writev,pwrite64,fsync,fdatasync", "-o",
+                           str(args.output / (label + "-syscalls.txt"))] + command
+            done = subprocess.run(command, text=True, capture_output=True, timeout=90)
             (args.output / (label + ".log")).write_text(done.stdout + done.stderr)
             if done.returncode:
                 print(done.stdout + done.stderr, flush=True)
@@ -81,7 +100,7 @@ def main():
             fixtures[case]["engine"] = fixtures[case]["baseline"]
 
         with (args.output / "results.jsonl").open("w") as output:
-            for trial in range(6):
+            for trial in range(args.trials):
                 offset = trial % len(cases)
                 for case, settings in cases[offset:] + cases[:offset]:
                     config = dict(settings, fixed=True, memtable=64 * 1024 * 1024, cache=0)

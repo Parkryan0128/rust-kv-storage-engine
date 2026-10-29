@@ -371,3 +371,12 @@ regressions before attributing them to production code.
 `run.py --case 1000000-128-5 --block-bytes 8192` and
 `bounds.py --case 16files-128b-above` select only those existing cases. Both
 options are opt-in; the complete comparison’s default matrix is unchanged.
+
+
+`[merge-control]` repeats selected 8/9-input short-key and 2/4/16-input long-key
+compactions for 24 trials against both the original and separately built
+identical-source references. An additional three-trial `strace -w -c` run
+reports write/sync syscall wall time. Those traces include process open and
+verification/reopen, perturb execution, and are kept separate from normal API
+rankings. `merge_matrix.py --case ... --trials ...` selects existing conditions;
+default full-matrix counts remain unchanged.
