@@ -190,12 +190,14 @@ jobs:
       - name: Native prefix compaction fan-in with 16 KiB blocks
         if: ${{ contains(github.event.head_commit.message, '[prefix-budget-guard]') }}
         run: python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/merge-prefix-budget --trials 24 --case n8-k8-distinct-16k --case n8-k136-distinct-16k --case n16-k8-distinct-16k --case n16-k136-distinct-16k
-      - name: Large range acquisition and retained-snapshot CPU guard
+      - name: Large range acquisition guard
         if: ${{ contains(github.event.head_commit.message, '[snapshot-range-guard]') }}
         timeout-minutes: 12
-        run: |
-          python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-large-range --trials 12 --case memory-early10-1m
-          python3 benchmarks/rocksdb-compare/snapshot_scaling.py focused-results/snapshot-cpu
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-large-range --trials 12 --case memory-early10-1m
+      - name: Retained-snapshot CPU when not already covered by scaling
+        if: ${{ contains(github.event.head_commit.message, '[snapshot-range-guard]') && !contains(github.event.head_commit.message, '[snapshot-scaling-guard]') }}
+        timeout-minutes: 12
+        run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py focused-results/snapshot-cpu
       - name: Native prefix ranges and unchanged short-key range guards
         if: ${{ contains(github.event.head_commit.message, '[prefix-range-guard]') }}
         run: |
