@@ -15,6 +15,18 @@ fn modulo_contains(bloom: &Bloom, mut hash: u64) -> bool {
     true
 }
 
+fn reciprocal_contains(bloom: &Bloom, mut hash: u64) -> bool {
+    let step = delta(hash);
+    for _ in 0..bloom.probes {
+        let bit = bloom.bit_position(hash);
+        if bloom.bits[bit / 8] & (1 << (hash & 7)) == 0 {
+            return false;
+        }
+        hash = hash.wrapping_add(step);
+    }
+    true
+}
+
 #[test]
 #[ignore = "same-process Bloom reduction diagnostic; run explicitly in release mode"]
 fn profile_bloom_reduction() {
@@ -40,6 +52,7 @@ fn profile_bloom_reduction() {
                 .map(|&hash| {
                     let reference = modulo_contains(&bloom, hash);
                     assert_eq!(bloom.contains_hash(hash), reference);
+                    assert_eq!(reciprocal_contains(&bloom, hash), reference);
                     if present {
                         assert!(reference);
                     }
@@ -47,7 +60,7 @@ fn profile_bloom_reduction() {
                 })
                 .sum();
             let methods: [(&str, Probe); 2] = [
-                ("reciprocal", Bloom::contains_hash),
+                ("reciprocal", reciprocal_contains),
                 ("modulo", modulo_contains),
             ];
             for trial in 1..=6 {

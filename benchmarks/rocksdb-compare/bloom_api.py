@@ -20,15 +20,21 @@ source = Path('src/bloom.rs')
 production = source.read_text()
 legacy = Path('baseline/src/bloom.rs').read_text()
 manifest = 'benchmarks/rocksdb-compare/Cargo.toml'
-names = ['original', 'production', 'modulo', 'legacy-bloom']
-binaries = {n: binary_dir / ('workloads-' + n) for n in names}
 start = production.index('    pub fn contains_hash(')
 end = production.index('    #[inline]\n    fn bit_position(', start)
 body = production[start:end]
-old = 'let bit = self.bit_position(h);'
+expressions = {'reciprocal': 'let bit = self.bit_position(h);',
+               'modulo': 'let bit = (h % u64::from(self.bit_count)) as usize;'}
+active = [name for name, expression in expressions.items() if expression in body]
+assert len(active) == 1
+production_method = active[0]
+candidate_method = 'modulo' if production_method == 'reciprocal' else 'reciprocal'
+old = expressions[production_method]
 assert body.count(old) == 1
-modulo = production[:start] + body.replace(old, 'let bit = (h % u64::from(self.bit_count)) as usize;') + production[end:]
-variants = dict(production=production, modulo=modulo, **{'legacy-bloom': legacy})
+candidate = production[:start] + body.replace(old, expressions[candidate_method]) + production[end:]
+names = ['original', 'production', candidate_method, 'legacy-bloom']
+binaries = {n: binary_dir / ('workloads-' + n) for n in names}
+variants = {'production': production, candidate_method: candidate, 'legacy-bloom': legacy}
 evidence = {}
 
 # Every binary uses the same current public-API harness and dependencies.
@@ -62,7 +68,7 @@ profiles = [
 ]
 environment = dict(commit=capture('git', 'rev-parse', 'HEAD'), baseline=capture('git', '-C', 'baseline', 'rev-parse', 'HEAD'),
                    platform=platform.platform(), cpu=capture('lscpu'), rust=capture('rustc', '--version'),
-                   trials=12, variants=evidence,
+                   trials=12, variants=evidence, production_method=production_method, candidate_method=candidate_method,
                    binaries={n:hashlib.sha256(p.read_bytes()).hexdigest() for n,p in binaries.items()},
                    notes='Runner-only candidates; no production edit. Same baseline fixture bytes, current harness, owned Get, warm OS cache, 12 balanced process orders; first and repeat engine-cache passes. Not a RocksDB comparison.')
 assert environment['baseline'] == 'c0299ec14e60a249fb9628f1888c5740c655432b'

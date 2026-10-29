@@ -128,7 +128,10 @@ impl Bloom {
     pub fn contains_hash(&self, mut h: u64) -> bool {
         let delta = delta(h);
         for _ in 0..self.probes {
-            let bit = self.bit_position(h);
+            // Keep the read probe compact: reciprocal reduction wins isolated
+            // arithmetic tests but regresses cache-resident public Get calls.
+            // Insertions retain it; both paths preserve persisted positions.
+            let bit = (h % u64::from(self.bit_count)) as usize;
             if self.bits[bit / 8] & (1 << (h & 7)) == 0 {
                 return false;
             }
