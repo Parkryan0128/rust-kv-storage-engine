@@ -48,5 +48,5 @@ with (output / "results.jsonl").open("w") as sink:
                     sink.write(json.dumps(row) + "\n")
                     sink.flush()
                     count += 1
-            assert count == 20, (name, trial, count)
+            assert count == 50, (name, trial, count)
 print("RECOVERY_COMPLETE", flush=True)

@@ -406,7 +406,7 @@ fn mixed_small_batch_replay_preserves_duplicates_tombstones_and_torn_atomic_tail
             previous_seq = seq;
             prefix = bytes.len();
         }
-        // Cross both the coalesced 256-record boundary and streaming 257.
+        // Cross both the exact 256-record boundary and a partial next chunk.
         // Keep the final torn frame at the exact coalescing boundary.
         let count = if frame == 24 {
             256

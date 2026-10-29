@@ -65,7 +65,18 @@ fn profile_recovery_stages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("profile.wal");
     let passes = 8;
-    for (batch, random) in [(256, false), (256, true), (32, true), (1, false)] {
+    for (batch, random) in [
+        (256, false),
+        (256, true),
+        (32, true),
+        (1, false),
+        (257, false),
+        (257, true),
+        (1024, false),
+        (1024, true),
+        (4096, false),
+        (4096, true),
+    ] {
         let keys = if batch == 1 { 10_000 } else { 20_000 };
         let (bytes, payloads) = fixture(keys, batch, random);
         std::fs::write(&path, &bytes).unwrap();
@@ -131,7 +142,7 @@ fn profile_recovery_stages() {
                 serde_json::json!({
                     "batch":batch,"random":random,"keys":keys,"passes":passes,"stage":stage,
                     "operations":keys * passes,"seconds":seconds,
-                    "notes":"Release libtest diagnostic. File replay uses warm OS cache; frame-only reads use memory. Phase paths allocate differently, overlap, and must not be added or treated as production percentages. Table verification/drop is outside timers. Small-batch replay helper excludes production coalescing."
+                    "notes":"Release libtest diagnostic. File replay uses warm OS cache; frame-only reads use memory. Phase paths allocate differently, overlap, and must not be added or treated as production percentages. Table verification/drop is outside timers. Replay helper excludes production coalescing."
                 })
             );
         }

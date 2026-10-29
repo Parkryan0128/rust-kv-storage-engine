@@ -85,19 +85,13 @@ impl Wal {
                     pending.push(entry, &mut table);
                 } else {
                     // Validate the complete atomic frame before staging any of
-                    // its operations. Page-sized batches share the bounded replay
-                    // buffer with legacy writes; larger batches keep streaming.
+                    // its operations. Replay every frame in bounded chunks;
+                    // large batches do not require a batch-sized owned copy.
                     let (count, records, end_seq) = validate_batch(&buffer, *last_seq)?;
                     let mut cursor = Cursor { b: records };
-                    let entries = (0..count)
-                        .map(|_| decode_record(&mut cursor).expect("validated WAL batch"));
-                    if count > REPLAY_RECORDS {
-                        pending.flush(&mut table);
-                        table.apply(entries, false);
-                    } else {
-                        for entry in entries {
-                            pending.push(entry, &mut table);
-                        }
+                    for _ in 0..count {
+                        let entry = decode_record(&mut cursor).expect("validated WAL batch");
+                        pending.push(entry, &mut table);
                     }
                     *last_seq = end_seq;
                 }
