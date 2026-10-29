@@ -20,7 +20,12 @@ fn prefix(key: &[u8]) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> usize {
+fn preceding(
+    prefixes: &[u64],
+    needle: u64,
+    before: impl Fn(usize) -> bool,
+    shared: impl Fn() -> Option<usize>,
+) -> usize {
     if prefixes.len() <= 1 {
         return 0;
     }
@@ -28,6 +33,11 @@ fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> u
     let last = right.saturating_sub(1);
     if right == 0 || prefixes[last] != needle || before(last) {
         return last;
+    }
+    // Unique numeric prefixes already returned above. Keep the extra proof
+    // work exclusively in the collision path, away from ordinary short keys.
+    if let Some(index) = shared() {
+        return index;
     }
     // With a shared prefix the lower bound is already known. Keep complete
     // key comparisons for ordering; the prefix is only a routing hint.
@@ -113,11 +123,6 @@ impl PageKeys {
         }
     }
     fn position(&self, key: &[u8], prefix: u64) -> std::result::Result<usize, usize> {
-        let shared = self.shared_prefix;
-        if shared != 0 && self.rows.len() > 1 && key.starts_with(&self.rows[0][..shared]) {
-            let suffix = &key[shared..];
-            return self.rows.binary_search_by(|k| k[shared..].cmp(suffix));
-        }
         let lo = self.prefixes.partition_point(|p| *p < prefix);
         if self.prefixes.get(lo) != Some(&prefix) {
             return Err(lo);
@@ -139,7 +144,13 @@ impl PageKeys {
         } else {
             lo + 1
         };
-        let found = self.rows[lo..hi].binary_search_by(|k| k.as_ref().cmp(key));
+        let shared = self.shared_prefix;
+        let found = if shared != 0 && hi - lo > 1 && key.starts_with(&self.rows[lo][..shared]) {
+            let suffix = &key[shared..];
+            self.rows[lo..hi].binary_search_by(|k| k[shared..].cmp(suffix))
+        } else {
+            self.rows[lo..hi].binary_search_by(|k| k.as_ref().cmp(key))
+        };
         found.map(|i| lo + i).map_err(|i| lo + i)
     }
 }
@@ -419,18 +430,16 @@ impl PageGroup {
         &self.pages[0].rows[0]
     }
     fn page_for(&self, key: &[u8], prefix: u64) -> usize {
-        if key.len() >= 16 && self.pages.len() >= 8 {
-            if let Some(index) =
+        preceding(
+            &self.prefixes,
+            prefix,
+            |i| self.pages[i].rows[0].as_ref() <= key,
+            || {
                 preceding_shared(key, self.pages[0].shared_prefix, self.pages.len(), |i| {
                     &self.pages[i].rows[0]
                 })
-            {
-                return index;
-            }
-        }
-        preceding(&self.prefixes, prefix, |i| {
-            self.pages[i].rows[0].as_ref() <= key
-        })
+            },
+        )
     }
     #[inline]
     fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(
@@ -528,19 +537,19 @@ pub(crate) struct MemIndex {
 }
 impl MemIndex {
     fn group_for(&self, key: &[u8], prefix: u64) -> usize {
-        if key.len() >= 16 && self.groups.len() >= 8 {
-            if let Some(index) = preceding_shared(
-                key,
-                self.groups[0].pages[0].shared_prefix,
-                self.groups.len(),
-                |i| self.groups[i].first_key(),
-            ) {
-                return index;
-            }
-        }
-        preceding(&self.prefixes, prefix, |i| {
-            self.groups[i].first_key() <= key
-        })
+        preceding(
+            &self.prefixes,
+            prefix,
+            |i| self.groups[i].first_key() <= key,
+            || {
+                preceding_shared(
+                    key,
+                    self.groups[0].pages[0].shared_prefix,
+                    self.groups.len(),
+                    |i| self.groups[i].first_key(),
+                )
+            },
+        )
     }
     pub fn len(&self) -> usize {
         self.len
@@ -1114,6 +1123,31 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn ordinary_routing_does_not_evaluate_common_prefix_proof() {
+        let prefixes = [10u64, 20, 30];
+        for (needle, expected) in [(0, 0), (10, 0), (19, 0), (20, 1), (29, 1), (30, 2), (99, 2)] {
+            assert_eq!(
+                preceding(
+                    &prefixes,
+                    needle,
+                    |i| prefixes[i] <= needle,
+                    || panic!("ordinary routing requested prefix proof")
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            preceding(
+                &[10],
+                10,
+                |_| panic!("one separator comparison"),
+                || panic!("one separator proof")
+            ),
+            0
+        );
     }
 
     #[test]
