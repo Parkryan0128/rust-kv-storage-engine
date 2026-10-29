@@ -8,6 +8,7 @@ pub(crate) struct TableScan {
     next_block: usize,
     block: Option<BlockCursor>,
     seek: bool,
+    block_in_range: bool,
     done: bool,
 }
 
@@ -36,6 +37,7 @@ impl Table {
             next_block,
             block: None,
             seek: true,
+            block_in_range: false,
             done: false,
         }
     }
@@ -57,7 +59,7 @@ impl TableScan {
         while !self.done {
             if let Some(block) = &self.block {
                 if let Some(record) = block.current() {
-                    if !self.range.allows_end(record.key) {
+                    if !self.block_in_range && !self.range.allows_end(record.key) {
                         self.done = true;
                         self.block = None;
                         return Ok(None);
@@ -78,6 +80,17 @@ impl TableScan {
                 self.next_block,
                 self.block.take().map(BlockCursor::into_block),
             )?;
+            // Decoding validates every key against the next block's first key.
+            // If that boundary is allowed, this whole block is in range. The
+            // final block has a validated maximum after read_stream_block.
+            // Partial boundary blocks still check each returned record.
+            self.block_in_range = self
+                .table
+                .index
+                .get(self.next_block + 1)
+                .map(|next| next.first.as_slice())
+                .or_else(|| self.table.last_key.get().map(Vec::as_slice))
+                .is_some_and(|upper| self.range.allows_end(upper));
             let mut record = 0;
             if self.seek {
                 if let Bound::Included(start) | Bound::Excluded(start) = &self.range.start {

@@ -856,9 +856,7 @@ impl MemScan {
             self.finish_page();
         }
     }
-    // This loop is reached through the shared memory/SST scan dispatch. Keep
-    // it separate so its page and tombstone handling does not expand that path.
-    #[inline(never)]
+    #[inline]
     pub(crate) fn next_live(&mut self) -> Option<(Vec<u8>, Bytes)> {
         loop {
             let page = self.current.as_ref()?;

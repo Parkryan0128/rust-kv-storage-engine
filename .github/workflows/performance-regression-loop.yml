@@ -143,6 +143,7 @@ jobs:
           for profile in 0 1 2 3; do
             python3 benchmarks/rocksdb-compare/workloads.py focused-results/range-profile-${profile} --baseline --reads-only --profile ${profile} --scenario scan-t1-span512 --trials 12
           done
+          python3 benchmarks/rocksdb-compare/workloads.py focused-results/range-short --baseline --reads-only --scenario scan-t1-span32 --trials 12
           python3 benchmarks/rocksdb-compare/bounds.py focused-results/range-bounds --trials 12
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/range-memory --scan-focus --trials 12
       - name: Recovery shapes beyond sequential ingestion

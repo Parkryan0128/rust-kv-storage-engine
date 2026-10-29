@@ -398,3 +398,112 @@ fn page_snapshots_survive_splits_removals_batches_and_large_keys() {
     );
     assert!(snapshot.next().is_none());
 }
+
+#[test]
+fn disk_scan_block_bounds_match_model_at_every_end_key() {
+    use std::{collections::BTreeMap, ops::Bound};
+    fn key(n: u16) -> Vec<u8> {
+        let mut out = vec![0, 255, 0];
+        out.extend_from_slice(&n.to_be_bytes());
+        if n % 3 == 0 {
+            out.extend_from_slice(&[0, 255]);
+        }
+        out
+    }
+    for value_len in [128, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            memtable_size_limit: 64 * 1024 * 1024,
+            block_size: 4096,
+            compaction_file_threshold: 1000,
+            ..Options::default()
+        };
+        let db = Engine::open_with_options(dir.path(), options.clone()).unwrap();
+        let mut model = BTreeMap::new();
+        let mut batch = WriteBatch::new();
+        for n in 0..129u16 {
+            let k = key(n * 2);
+            if n % 7 == 0 {
+                batch.delete(&k);
+            } else {
+                let v = Bytes::from(vec![(n % 251) as u8; value_len]);
+                batch.put(&k, &v);
+                model.insert(k, v);
+            }
+        }
+        db.write_batch(batch).unwrap();
+        db.flush().unwrap();
+        drop(db);
+        let db = Engine::open_with_options(dir.path(), options).unwrap();
+        assert_eq!(db.stats().sst_files, 1);
+        for mixed in [false, true] {
+            if mixed {
+                let mut batch = WriteBatch::new();
+                for n in (0..129u16).step_by(9) {
+                    let k = key(n * 2);
+                    if n % 2 == 0 {
+                        batch.delete(&k);
+                        model.remove(&k);
+                    } else {
+                        let v = Bytes::from_static(b"new version");
+                        batch.put(&k, &v);
+                        model.insert(k, v);
+                    }
+                }
+                db.write_batch(batch).unwrap();
+            }
+            let mut starts = vec![Bound::Unbounded];
+            for n in [0, 31, 128, 255, 258] {
+                starts.extend([Bound::Included(key(n)), Bound::Excluded(key(n))]);
+            }
+            let mut ends = vec![Bound::Unbounded];
+            // Include present and absent keys, exact block boundaries, the last
+            // block, and binary common prefixes for both kinds of bound.
+            for n in 0..=258 {
+                ends.extend([Bound::Included(key(n)), Bound::Excluded(key(n))]);
+            }
+            for start in &starts {
+                for end in &ends {
+                    if let (
+                        Bound::Included(a) | Bound::Excluded(a),
+                        Bound::Included(b) | Bound::Excluded(b),
+                    ) = (start, end)
+                    {
+                        if a > b {
+                            continue;
+                        }
+                    }
+                    let expected: Vec<_> = model
+                        .iter()
+                        .filter(|(k, _)| {
+                            let above = match start {
+                                Bound::Unbounded => true,
+                                Bound::Included(lo) => *k >= lo,
+                                Bound::Excluded(lo) => *k > lo,
+                            };
+                            let below = match end {
+                                Bound::Unbounded => true,
+                                Bound::Included(hi) => *k <= hi,
+                                Bound::Excluded(hi) => *k < hi,
+                            };
+                            above && below
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let mut scan = db
+                        .scan((
+                            start.as_ref().map(Vec::as_slice),
+                            end.as_ref().map(Vec::as_slice),
+                        ))
+                        .unwrap();
+                    assert_eq!(
+                        scan.by_ref().collect::<Result<Vec<_>>>().unwrap(),
+                        expected,
+                        "value_len={value_len}, mixed={mixed}, start={start:?}, end={end:?}"
+                    );
+                    assert!(scan.next().is_none());
+                }
+            }
+        }
+    }
+}
