@@ -76,28 +76,30 @@ impl Wal {
         let mut table = MemTable::default();
         let mut valid = 8;
         let mut buffer = Vec::new();
-        let mut pending = Vec::new();
-        let mut pending_bytes = 0;
+        let mut pending = ReplayBuffer::default();
         {
             let mut reader = BufReader::with_capacity(MAX_RETAINED_BUFFER, &mut file);
             while read_frame_into(&mut reader, allow_tail, &mut buffer)? {
                 if !buffer.starts_with(&[0; 8]) {
                     let entry = decode_single(&buffer, last_seq)?;
-                    let bytes = entry.1.memory_size(&entry.0);
-                    if pending_bytes + bytes > MAX_RETAINED_BUFFER {
-                        table.apply(pending.drain(..), false);
-                        pending_bytes = 0;
-                    }
-                    pending.push(entry);
-                    pending_bytes += bytes;
-                    if pending.len() == 256 || pending_bytes >= MAX_RETAINED_BUFFER {
-                        table.apply(pending.drain(..), false);
-                        pending_bytes = 0;
-                    }
+                    pending.push(entry, &mut table);
                 } else {
-                    table.apply(pending.drain(..), false);
-                    pending_bytes = 0;
-                    replay_batch(&buffer, &mut table, last_seq)?;
+                    // Validate the complete atomic frame before staging any of
+                    // its operations. Small batches share the bounded replay
+                    // buffer with legacy writes; large batches keep streaming.
+                    let (count, records, end_seq) = validate_batch(&buffer, *last_seq)?;
+                    let mut cursor = Cursor { b: records };
+                    let entries = (0..count)
+                        .map(|_| decode_record(&mut cursor).expect("validated WAL batch"));
+                    if count >= REPLAY_RECORDS {
+                        pending.flush(&mut table);
+                        table.apply(entries, false);
+                    } else {
+                        for entry in entries {
+                            pending.push(entry, &mut table);
+                        }
+                    }
+                    *last_seq = end_seq;
                 }
                 // Commit the logical offset only after CRC and replay validation.
                 // BufReader may have already read past this frame into a torn tail.
@@ -107,7 +109,7 @@ impl Wal {
                 }
             }
         }
-        table.apply(pending, false);
+        pending.flush(&mut table);
         // Discard read-ahead before truncation and seek to the verified end.
         if buffer.capacity() > MAX_RETAINED_BUFFER {
             buffer = Vec::new();
@@ -203,7 +205,7 @@ fn decode_single(payload: &[u8], last_seq: &mut u64) -> Result<(Vec<u8>, Record)
     Ok(entry)
 }
 
-fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
+fn validate_batch(payload: &[u8], last_seq: u64) -> Result<(usize, &[u8], u64)> {
     let mut c = Cursor { b: payload };
     if c.u64()? != 0 {
         return Err(corrupt("WAL batch envelope"));
@@ -218,7 +220,7 @@ fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Res
     // Validate all operations before mutating recovery state. The second pass
     // avoids staging another owned copy of every key/value in the batch.
     let records = c.b;
-    let mut end_seq = *last_seq;
+    let mut end_seq = last_seq;
     for i in 0..count {
         let record = decode_record_ref(&mut c)?;
         if record.seq <= end_seq || (i != 0 && end_seq.checked_add(1) != Some(record.seq)) {
@@ -227,13 +229,61 @@ fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Res
         end_seq = record.seq;
     }
     c.done()?;
+    Ok((count, records, end_seq))
+}
+
+#[cfg(test)]
+fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Result<()> {
+    let (count, records, end_seq) = validate_batch(payload, *last_seq)?;
     let mut c = Cursor { b: records };
-    // The immutable payload was fully decoded and checked above. Replay uses
-    // the same page-local batch path without another owned staging buffer.
     table.apply(
         (0..count).map(|_| decode_record(&mut c).expect("validated WAL batch")),
         false,
     );
     *last_seq = end_seq;
     Ok(())
+}
+
+const REPLAY_RECORDS: usize = 256;
+struct ReplayBuffer {
+    entries: Vec<(Vec<u8>, Record)>,
+    bytes: usize,
+    sorted: bool,
+}
+impl Default for ReplayBuffer {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            sorted: true,
+        }
+    }
+}
+impl ReplayBuffer {
+    fn push(&mut self, entry: (Vec<u8>, Record), table: &mut MemTable) {
+        let bytes = entry.1.memory_size(&entry.0);
+        if self.bytes + bytes > MAX_RETAINED_BUFFER {
+            self.flush(table);
+        }
+        if self.sorted && self.entries.last().is_some_and(|last| last.0 > entry.0) {
+            self.sorted = false;
+        }
+        self.entries.push(entry);
+        self.bytes += bytes;
+        if self.entries.len() == REPLAY_RECORDS || self.bytes >= MAX_RETAINED_BUFFER {
+            self.flush(table);
+        }
+    }
+    fn flush(&mut self, table: &mut MemTable) {
+        if !self.sorted {
+            // Recovery state is unpublished. Group nearby keys to amortize
+            // page ownership and shifts; sequence breaks ties so the newest
+            // duplicate/tombstone still wins. Chunks are applied in WAL order.
+            self.entries
+                .sort_unstable_by(|(a, ar), (b, br)| a.cmp(b).then_with(|| ar.seq.cmp(&br.seq)));
+        }
+        table.apply(self.entries.drain(..), false);
+        self.bytes = 0;
+        self.sorted = true;
+    }
 }

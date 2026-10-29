@@ -191,3 +191,5 @@ complete logical checks after compact and reopen remain mandatory.
 ### Reproducing optimization regressions
 
 `performance-regression-loop` compares an exact baseline SHA with the current engine and RocksDB, retaining the snapshot/range guards and using 12 trials for every durable-write case and four WAL recovery patterns. Its random-read run adds `--engine-control`: the identical current executable and immutable SST fixture are read in another process in the rotated order. Compare this A/A variation before attributing a small difference to a source change. Twelve trials balance the four backend positions and three block sizes. WAL sync and integrity checks are unchanged.
+
+The recovery guards include single-operation WriteBatch frames, random key order, overwrites, and 256-operation frames. Small validated WAL frames share a bounded replay buffer (256 records / 64 KiB logical charge), sorted by key and sequence only when the input is not already ordered. Large batches still stream directly. This affects unpublished recovery state only; live writes and WAL commit order are unchanged.

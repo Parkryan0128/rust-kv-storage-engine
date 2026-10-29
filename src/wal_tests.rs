@@ -389,3 +389,126 @@ fn maximum_sequence_is_checked_through_real_recovery() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(Wal::recover(&path, 1, false, &mut (u64::MAX - 1)).is_err());
 }
+
+#[test]
+fn mixed_small_batch_replay_preserves_duplicates_tombstones_and_torn_atomic_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.wal");
+    let mut bytes = MAGIC.to_vec();
+    let mut model = std::collections::BTreeMap::new();
+    let mut previous = model.clone();
+    let mut seq = 0u64;
+    let mut previous_seq = 0;
+    let mut prefix = 0;
+    for frame in 0..25 {
+        if frame == 24 {
+            previous = model.clone();
+            previous_seq = seq;
+            prefix = bytes.len();
+        }
+        let count = [1, 1, 3, 255, 256][frame % 5];
+        let mut body = Vec::new();
+        if frame % 5 != 0 {
+            put_u64(&mut body, 0);
+            put_u32(&mut body, BATCH_VERSION);
+            put_u32(&mut body, count);
+        }
+        for _ in 0..count {
+            seq += 1;
+            let key = ((seq * 7919) % 1009).to_be_bytes().to_vec();
+            let record = Record {
+                seq,
+                value: (seq % 7 != 0).then(|| Bytes::from(vec![seq as u8; (seq % 31) as usize])),
+            };
+            encode_record(&key, &record, &mut body);
+            model.insert(key, record);
+        }
+        write_frame(&mut bytes, &body).unwrap();
+    }
+    for cut in [
+        prefix,
+        prefix + 1,
+        prefix + HEADER - 1,
+        prefix + HEADER,
+        bytes.len() - 1,
+        bytes.len(),
+    ] {
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        let mut recovered_seq = 0;
+        let (mut wal, table) = Wal::recover(&path, 1, true, &mut recovered_seq).unwrap();
+        let complete = cut == bytes.len();
+        let expected = if complete { &model } else { &previous };
+        assert_eq!(recovered_seq, if complete { seq } else { previous_seq });
+        assert_eq!(
+            table
+                .data
+                .iter()
+                .map(|(k, r)| (k.to_vec(), r.clone()))
+                .collect::<Vec<_>>(),
+            expected.clone().into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.bytes,
+            expected
+                .iter()
+                .map(|(k, r)| r.memory_size(k))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            wal.bytes as usize,
+            if complete { bytes.len() } else { prefix }
+        );
+        wal.append(b"after", &single(b"ok", recovered_seq + 1))
+            .unwrap();
+        drop(wal);
+        let (_, again) = Wal::recover(&path, 1, false, &mut 0).unwrap();
+        assert_eq!(
+            again.get(b"after").unwrap().value.as_deref(),
+            Some(b"ok".as_slice())
+        );
+    }
+}
+
+#[test]
+fn replay_staging_is_bounded_and_oversized_rows_do_not_stay_buffered() {
+    let mut buffer = ReplayBuffer::default();
+    let mut table = MemTable::default();
+    let mut model = std::collections::BTreeMap::new();
+    for seq in 1..=1200u64 {
+        let key = ((seq * 7919) % 509).to_be_bytes().to_vec();
+        let record = Record {
+            seq,
+            value: (seq % 11 != 0).then(|| {
+                Bytes::from(vec![
+                    seq as u8;
+                    if seq == 17 {
+                        MAX_RETAINED_BUFFER * 3
+                    } else {
+                        17
+                    }
+                ])
+            }),
+        };
+        model.insert(key.clone(), record.clone());
+        buffer.push((key, record), &mut table);
+        assert!(buffer.entries.len() < REPLAY_RECORDS);
+        assert!(buffer.entries.capacity() <= REPLAY_RECORDS);
+        assert!(buffer.bytes < MAX_RETAINED_BUFFER);
+        if seq == 17 {
+            assert!(buffer.entries.is_empty());
+        }
+    }
+    buffer.flush(&mut table);
+    assert_eq!(
+        table
+            .data
+            .iter()
+            .map(|(k, r)| (k.to_vec(), r.clone()))
+            .collect::<Vec<_>>(),
+        model.clone().into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        table.bytes,
+        model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+    );
+}
