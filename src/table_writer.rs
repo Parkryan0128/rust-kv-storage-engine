@@ -185,25 +185,30 @@ impl TableWriter {
             } else {
                 // Positional reads must see every buffered output block.
                 self.file.flush()?;
-                for i in &self.index {
+                for (n, i) in self.index.iter().enumerate() {
                     resize_frame(&mut self.block, i.len as usize);
                     fault::hit("bloom_rebuild_read")?;
                     self.file
                         .get_ref()
                         .read_exact_at(&mut self.block, i.offset)?;
-                    if self.prefix_encoded {
-                        self.block = expand_prefix_frame(
-                            std::mem::take(&mut self.block),
+                    let next = self.index.get(n + 1).map(|entry| entry.first.as_slice());
+                    let bytes = std::mem::take(&mut self.block);
+                    let (block, _) = if self.prefix_encoded {
+                        ReadBlock::decode_prefix_indexed(
+                            bytes,
+                            &i.first,
+                            next,
+                            self.max_seq,
+                            0,
                             self.expanded_frame_limit,
-                        )?;
-                    }
-                    let mut c = Cursor {
-                        b: indexed_records(frame_payload(&self.block)?)?,
+                        )?
+                    } else {
+                        ReadBlock::decode_indexed(bytes, &i.first, next, self.max_seq, 0)?
                     };
-                    while !c.b.is_empty() {
-                        let hash = self.bloom_hasher.hash(decode_record_ref(&mut c)?.key);
-                        self.bloom.insert_hash(hash);
-                    }
+                    block.visit_key_hashes(&mut self.bloom_hasher, |hash| {
+                        self.bloom.insert_hash(hash)
+                    })?;
+                    (self.block, _) = block.into_buffers();
                 }
             }
         }

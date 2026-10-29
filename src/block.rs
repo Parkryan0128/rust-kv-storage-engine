@@ -6,7 +6,7 @@ pub(crate) const SHARE_LARGE_VALUE_AT: usize = 64 * 1024;
 const MAX_SHARED_OVERHEAD: usize = 256;
 #[path = "prefix_block.rs"]
 mod prefix_block;
-pub(crate) use prefix_block::{encode_prefix_frame, expand_prefix_frame};
+pub(crate) use prefix_block::encode_prefix_frame;
 
 // The frame and offsets stay immutable after validation. Small values are
 // copied out; a lone large value may share its block with bounded overhead.
@@ -127,6 +127,26 @@ impl ReadBlock {
             },
             fingerprint,
         ))
+    }
+
+    pub(crate) fn visit_key_hashes(
+        &self,
+        ordinary: &mut crate::bloom::PrefixHasher,
+        mut consume: impl FnMut(u64),
+    ) -> Result<()> {
+        if self.record_start == HEADER {
+            for row in 0..self.record_count() {
+                consume(ordinary.hash(self.key_at(row)?));
+            }
+        } else {
+            let prefix = crate::bloom::ReadPrefixHash::from_prefix(
+                &self.bytes[HEADER + 8..self.record_start],
+            );
+            for row in 0..self.record_count() {
+                consume(prefix.hash_suffix(self.key_at(row)?));
+            }
+        }
+        Ok(())
     }
 
     pub fn into_buffers(self) -> (Vec<u8>, Vec<u32>) {

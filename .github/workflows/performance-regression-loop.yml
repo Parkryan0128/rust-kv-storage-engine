@@ -171,6 +171,9 @@ jobs:
         if: ${{ contains(github.event.head_commit.message, '[prefix-block-guard]') || contains(github.event.head_commit.message, '[merge-guard]') }}
         run: |
           python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/prefix-merge --allow-format-change --trials 12
+      - name: Compaction Bloom rebuilding beyond retained-hash capacity
+        if: ${{ contains(github.event.head_commit.message, '[bloom-readback-guard]') }}
+        run: python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/merge-bloom-readback --trials 12 --case n4-k8-overlap-wide --case n4-k136-overlap-wide --case n16-k8-overlap-wide --case n16-k136-overlap-wide
       - name: Long common-prefix cached and uncached read guards
         if: ${{ contains(github.event.head_commit.message, '[prefix-block-guard]') || contains(github.event.head_commit.message, '[long-key-guard]') }}
         run: |

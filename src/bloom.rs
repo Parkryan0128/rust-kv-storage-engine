@@ -96,7 +96,13 @@ impl ReadPrefixHash {
         } else {
             0
         };
-        Self(extend_hash(HASH_SEED, &first[..len]))
+        Self::from_prefix(&first[..len])
+    }
+    pub(crate) fn from_prefix(prefix: &[u8]) -> Self {
+        Self(extend_hash(HASH_SEED, prefix))
+    }
+    pub(crate) fn hash_suffix(&self, suffix: &[u8]) -> u64 {
+        finish_hash(extend_hash(self.0, suffix))
     }
     // Called only for long query keys from the Get path. Keep prefix checks
     // and the table-state load outside ordinary short-key hashing code.
@@ -105,7 +111,7 @@ impl ReadPrefixHash {
         if first.len() >= 64 {
             let len = (first.len() - 8).min(128);
             if let Some(suffix) = key.strip_prefix(&first[..len]) {
-                return finish_hash(extend_hash(self.0, suffix));
+                return self.hash_suffix(suffix);
             }
         }
         hash(key)

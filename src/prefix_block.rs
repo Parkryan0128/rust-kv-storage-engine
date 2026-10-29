@@ -28,16 +28,30 @@ pub(crate) fn encode_prefix_frame(
     put_u32(encoded, prefix_len as u32);
     encoded.extend_from_slice(&first[..prefix_len]);
     let start = encoded.len();
-    let mut cursor = Cursor { b: records };
-    for offset in offsets.iter_mut() {
-        let record = decode_record_ref(&mut cursor)?;
-        // Writer input is already strictly sorted. Common prefix of its first
-        // and last keys is therefore shared by every key between them.
-        debug_assert!(record.key.starts_with(&first[..prefix_len]));
-        *offset = (encoded.len() - start) as u32;
-        encode_record_parts(&record.key[prefix_len..], record.seq, record.value, encoded);
+    // push() already validated these records. Copy their encoded headers and
+    // contiguous suffix/value bodies instead of decoding and encoding again.
+    for row in 0..offsets.len() {
+        let begin = offsets[row] as usize;
+        let end = offsets.get(row + 1).map_or(records.len(), |n| *n as usize);
+        let record = records
+            .get(begin..end)
+            .ok_or_else(|| corrupt("SST writer offset"))?;
+        let header = record
+            .get(..17)
+            .ok_or_else(|| corrupt("SST writer record"))?;
+        let key_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+        let suffix_len = key_len
+            .checked_sub(prefix_len)
+            .ok_or_else(|| corrupt("SST writer prefix"))?;
+        let body = record
+            .get(17 + prefix_len..)
+            .ok_or_else(|| corrupt("SST writer prefix body"))?;
+        offsets[row] = (encoded.len() - start) as u32;
+        encoded.extend_from_slice(&header[..9]);
+        put_u32(encoded, suffix_len as u32);
+        encoded.extend_from_slice(&header[13..]);
+        encoded.extend_from_slice(body);
     }
-    cursor.done()?;
     for offset in offsets.iter() {
         put_u32(encoded, *offset);
     }
@@ -51,7 +65,8 @@ pub(crate) fn encode_prefix_frame(
 // Expand once on admission; existing cached lookup and cursor representations
 // remain unchanged. Validate the complete encoded frame before allocating from
 // its counts, and cap expansion by the checksummed table summary and MAX_FRAME.
-pub(crate) fn expand_prefix_frame(bytes: Vec<u8>, maximum: usize) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn expand_prefix_frame(bytes: Vec<u8>, maximum: usize) -> Result<Vec<u8>> {
     if bytes.len() > maximum {
         return Err(corrupt("SST expanded block limit"));
     }
@@ -345,6 +360,22 @@ mod tests {
                     plain.key_at(n).unwrap().cmp(&key)
                 );
             }
+        }
+        let mut native_hashes = Vec::new();
+        let mut plain_hashes = Vec::new();
+        native
+            .visit_key_hashes(&mut crate::bloom::PrefixHasher::default(), |h| {
+                native_hashes.push(h)
+            })
+            .unwrap();
+        plain
+            .visit_key_hashes(&mut crate::bloom::PrefixHasher::default(), |h| {
+                plain_hashes.push(h)
+            })
+            .unwrap();
+        assert_eq!(native_hashes, plain_hashes);
+        for (row, hash) in native_hashes.into_iter().enumerate() {
+            assert_eq!(hash, crate::bloom::hash(plain.key_at(row).unwrap()));
         }
         let mut cursor = BlockCursor::new(native, 3).unwrap();
         for n in 3..plain.record_count() {

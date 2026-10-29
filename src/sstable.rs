@@ -1,10 +1,7 @@
 #[cfg(test)]
 use crate::cache::Cache;
 use crate::{
-    block::{
-        encode_prefix_frame, expand_prefix_frame, indexed_records, BlockCursor, ReadBlock,
-        SHARE_LARGE_VALUE_AT,
-    },
+    block::{encode_prefix_frame, BlockCursor, ReadBlock, SHARE_LARGE_VALUE_AT},
     bloom::{Bloom, ReadPrefixHash},
     cache::{BlockCache, CacheKey, Counters},
     codec::*,

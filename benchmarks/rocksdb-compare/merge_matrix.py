@@ -39,6 +39,14 @@ def main():
               merge_deletes=shape == "deletes"))
              for n in [2, 4, 8, 9, 16] for key_bytes in [8, 136]
              for shape in ["distinct", "overlap", "deletes"]]
+    # Opt-in outputs larger than the bounded retained-hash buffer force the
+    # publisher's Bloom readback path, absent from the original 8k overlap cases.
+    for n in [4, 16]:
+        for key_bytes in [8, 136]:
+            label = f"n{n}-k{key_bytes}-overlap-wide"
+            if args.selected_cases and label in args.selected_cases:
+                cases.append((label, dict(keys=16384, value=128, generations=n,
+                    block=4096, merge_key_bytes=key_bytes, churn=True, merge_deletes=False)))
     if args.selected_cases:
         selected = set(args.selected_cases)
         available = {name for name, _ in cases}
