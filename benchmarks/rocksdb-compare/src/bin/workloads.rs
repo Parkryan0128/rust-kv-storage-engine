@@ -521,6 +521,41 @@ fn reads(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     }
     Ok(())
 }
+// Repeat first-pass traces with a fresh database handle each time. Open, close,
+// resource collection and full verification stay outside the throughput timer.
+fn reopened_scans(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let reopens = raw["reopens"].as_u64().unwrap() as usize;
+    assert!(c.workload == "scan" && c.threads == 1 && (1..=128).contains(&reopens));
+    let before = metrics(path)?;
+    let mut seconds = 0.0;
+    let mut row_count = 0;
+    let mut traces = Vec::with_capacity(reopens);
+    let mut open_seconds = 0.0;
+    for _ in 0..reopens {
+        let start = Instant::now();
+        let db = Backend::open(path, c)?;
+        open_seconds += start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let rows = scan_reads(&db, c, ReadPass::Throughput)?.rows;
+        let elapsed = start.elapsed().as_secs_f64();
+        seconds += elapsed;
+        traces.push(elapsed);
+        row_count += rows;
+        assert_eq!(scan_reads(&db, c, ReadPass::Verify)?.rows, rows);
+    }
+    report(
+        "first-reopened",
+        raw,
+        json!({"seconds":seconds,
+        "operations":c.queries * reopens,"rows":row_count,
+        "ops_per_second":(c.queries * reopens) as f64 / seconds,
+        "reopens":reopens,"trace_seconds":traces,"open_seconds":open_seconds,
+        "before":before,"after":metrics(path)?,
+        "measurement":"fresh handle/cache/validation state per trace; warm OS cache; open/close/verification excluded"}),
+    );
+    Ok(())
+}
+
 fn writes(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     assert!(!path.exists());
     let db = Backend::open(path, c)?;
@@ -1291,6 +1326,7 @@ fn main() -> Result<()> {
         "disjoint-range" => disjoint_range(path, &c, &raw)?,
         "mixed-steady" => mixed_steady(path, &c, &raw)?,
         "read" => reads(path, &c, &raw)?,
+        "read-reopened" => reopened_scans(path, &c, &raw)?,
         "write" => writes(path, &c, &raw)?,
         "compact" => {
             let db = Backend::open(path, &c)?;

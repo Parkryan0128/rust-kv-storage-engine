@@ -109,6 +109,59 @@ enum Source {
     Exhausted,
 }
 
+// A range often touches exactly one memory page stream or SST. Keep that
+// source inline instead of allocating a merge directory for every short scan.
+enum Sources {
+    Empty,
+    One(Source),
+    Many(Vec<Source>),
+}
+impl Sources {
+    fn collect(sources: impl IntoIterator<Item = Source>) -> Self {
+        let mut sources = sources.into_iter().fuse();
+        match (sources.next(), sources.next()) {
+            (None, None) => Self::Empty,
+            (Some(one), None) => Self::One(one),
+            (Some(first), Some(second)) => {
+                let mut many = vec![first, second];
+                many.extend(sources);
+                Self::Many(many)
+            }
+            _ => unreachable!("source iterator is fused"),
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [Source] {
+        match self {
+            Self::Empty => &mut [],
+            Self::One(one) => std::slice::from_mut(one),
+            Self::Many(many) => many,
+        }
+    }
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(many) => many.capacity(),
+        }
+    }
+}
+impl std::ops::Deref for Sources {
+    type Target = [Source];
+    fn deref(&self) -> &[Source] {
+        match self {
+            Self::Empty => &[],
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many,
+        }
+    }
+}
+impl std::ops::DerefMut for Sources {
+    fn deref_mut(&mut self) -> &mut [Source] {
+        self.as_mut_slice()
+    }
+}
+
 impl Source {
     fn head(&self) -> Option<(&[u8], u64)> {
         match self {
@@ -156,7 +209,7 @@ impl Source {
 #[must_use = "scans read SST data only when iterated"]
 pub struct Scan {
     engine: Option<Engine>,
-    sources: Vec<Source>,
+    sources: Sources,
     heap: BinaryHeap<Reverse<(CandidateKey, usize, u64)>>,
     pending: Vec<usize>,
     initialized: bool,
@@ -171,16 +224,19 @@ impl Scan {
         tables: &[Arc<Table>],
         range: Arc<KeyRange>,
     ) -> Self {
-        let mut sources = Vec::with_capacity(memory.len());
-        sources.extend(memory.into_iter().map(|iter| Source::Memory {
-            iter,
-            started: false,
-        }));
-        sources.extend(
-            tables
-                .iter()
-                .filter(|table| table.overlaps(&range))
-                .map(|table| Source::Table(table.scan(range.clone()))),
+        let sources = Sources::collect(
+            memory
+                .into_iter()
+                .map(|iter| Source::Memory {
+                    iter,
+                    started: false,
+                })
+                .chain(
+                    tables
+                        .iter()
+                        .filter(|table| table.overlaps(&range))
+                        .map(|table| Source::Table(table.scan(range.clone()))),
+                ),
         );
         let borrowed_merge = sources.len() <= BORROWED_MERGE_SOURCES
             && sources
@@ -201,7 +257,7 @@ impl Scan {
         Self {
             engine: None,
             borrowed_merge: false,
-            sources: Vec::new(),
+            sources: Sources::Empty,
             heap: BinaryHeap::new(),
             pending: Vec::new(),
             initialized: true,
@@ -395,12 +451,12 @@ impl Scan {
             iter.advance();
             *started = false;
         }
-        self.sources = vec![source];
+        self.sources = Sources::One(source);
         self.pending.clear();
     }
 
     fn finish(&mut self) {
-        self.sources = Vec::new();
+        self.sources = Sources::Empty;
         self.heap = BinaryHeap::new();
         self.pending = Vec::new();
         self.engine = None;

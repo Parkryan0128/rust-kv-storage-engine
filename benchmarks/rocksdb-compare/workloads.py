@@ -82,7 +82,10 @@ def main():
     parser.add_argument("--profile", type=int, choices=range(6), help="Run one numbered read profile")
     parser.add_argument("--scenario", choices=["uniform-t1-span0", "uniform-t4-span0", "hot-t1-span0", "miss-t1-span0", "scan-t1-span32", "scan-t1-span512"])
     parser.add_argument("--trials", type=int, choices=range(1, 31))
+    parser.add_argument("--reopens", type=int, choices=range(1, 129), help="Fresh database handle for each first-pass scan trace")
     args = parser.parse_args()
+    if args.reopens and (not args.reads_only or not (args.scenario or "").startswith("scan-")):
+        parser.error("--reopens requires --reads-only and a scan --scenario")
     if (args.profile is not None or args.scenario) and (args.smoke or not args.reads_only):
         parser.error("Profile/scenario selection requires --reads-only and cannot use --smoke")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -119,6 +122,7 @@ def main():
             "read_layout": "Identical logical public-API write history; automatic compaction disabled; physical SST counts may differ",
             "write_layout": "Each engine's normal background compaction; no compression; 4 MiB memtable target",
             "scan_cache": "No fill on either backend; existing cached blocks may still benefit RocksDB",
+            "reopened_traces": args.reopens,
             "cache_state": "Pristine fixture copy and warm OS file cache before every read process; fresh engine cache on first pass; identical seeded scan trace repeated 24/96 times for warm throughput only",
             "latency": "Separate warm pass: point API call only; scan creation/consumption/drop, no expected-value construction or verification",
             "throughput": "v2: includes RNG and owned result/drop; excludes full verification, per-query timers, worker startup/join. Identical seeded full verification runs after timing. Not directly comparable to earlier v1 absolute rates.",
@@ -157,7 +161,7 @@ def main():
                         print("WORKLOAD_RESULT " + json.dumps(row), flush=True)
                     elif line.startswith("WORKLOAD_PREPARED "):
                         print(line, flush=True)
-                assert stages == {"prepare": [], "read": ["open", "first", "repeat"], "write": ["write"], "compact": ["compact"]}[mode]
+                assert stages == {"prepare": [], "read": ["open", "first", "repeat"], "read-reopened": ["first-reopened"], "write": ["write"], "compact": ["compact"]}[mode]
 
             for profile_index, profile in enumerate(profiles):
                 if args.profile is not None and profile_index != args.profile:
@@ -182,6 +186,8 @@ def main():
                             config["queries"] = 96 if scenario["span"] == 32 else 48
                         if scenario["workload"] == "scan":
                             config["scan_repeat_passes"] = 2 if args.smoke else (96 if scenario["span"] == 32 else 24)
+                        if args.reopens:
+                            config["reopens"] = args.reopens
                         offset_backend = (trial - 1) % len(binaries)
                         order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
                         for order, name in enumerate(order_names, 1):
@@ -190,7 +196,7 @@ def main():
                             copy = root / f"read-{profile_index}-{trial}-{name}"
                             shutil.copytree(fixtures[name], copy)
                             warm(copy)
-                            run(name, "read", copy, config, case, label, trial, order)
+                            run(name, "read-reopened" if args.reopens else "read", copy, config, case, label, trial, order)
                             shutil.rmtree(copy)
                     if profile["churn"] and not args.reads_only:
                         for order, name in enumerate(order_names, 1):

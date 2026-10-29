@@ -472,7 +472,8 @@ impl Engine {
     /// Creation shares overlapping active and frozen memory page groups under
     /// the state lock; it does not copy keys. Small boundary slices retain only
     /// their selected pages. Updates to shared pages use bounded deltas; inserts
-    /// and delta folds copy page contents. Consumed groups are released as the
+    /// copy affected keys and values; delta folds share keys and copy values only.
+    /// Consumed groups are released as the
     /// scan advances. SST data is read lazily
     /// and without polluting the point-read cache. Handle each iterator item's
     /// `Result`: a disk error ends the scan, potentially after earlier results.
