@@ -1,0 +1,28 @@
+name: bloom-api-diagnostics
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: contains(github.event.head_commit.message, '[bloom-api-diag]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 3
+      KV_BENCH_DIR: /tmp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: c0299ec14e60a249fb9628f1888c5740c655432b
+          path: baseline
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test isolated Bloom candidates, then compare real Get
+        run: python3 benchmarks/rocksdb-compare/bloom_api.py bloom-api-diagnostics
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bloom-api-diagnostics
+          path: bloom-api-diagnostics/
