@@ -327,7 +327,7 @@ mod tests {
     fn cursor_reuses_keys_across_prefixes_and_releases_oversized_or_plain_scratch() {
         let mut key_buffer = Vec::new();
         let mut previous_address = None;
-        for byte in [b'x', b'y', b'z'] {
+        for byte in *b"xyz" {
             let (mut full, mut first, mut last, mut offsets) = fixture();
             for offset in &offsets {
                 let key_start = HEADER + *offset as usize + 17;
