@@ -9,7 +9,8 @@ const PAGE_KEY_BYTES: usize = 64 * 1024;
 // Mutations copy at most this many page handles before copying a shared page.
 const GROUP_PAGES: usize = 64;
 
-// Monotone prefix only: equal prefixes always fall back to complete key bytes.
+// Monotone routing prefix. Equality proves a whole key only when both keys
+// have the same length of at most eight bytes; other ties compare full bytes.
 fn prefix(key: &[u8]) -> u64 {
     if let Some(bytes) = key.get(..8) {
         return u64::from_be_bytes(bytes.try_into().unwrap());

@@ -34,6 +34,11 @@ fn main() -> Result<()> {
 }
 ```
 
+`get()` returns an owned, immutable `Bytes` value that remains valid after
+writes, cache eviction, compaction, or dropping the engine. Large single-record
+values may share validated storage; retained values are outside the block-cache
+capacity. See [value ownership](docs/storage-format.md) for memory details.
+
 `Engine::new()` creates an in-memory store. `Engine::clone()` shares the same database and can be used across threads. Only one engine can open a database directory at a time.
 
 In-memory deletes remove keys immediately. Persistent deletes retain tombstones until compaction can safely discard them, so older on-disk values do not reappear.

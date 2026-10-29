@@ -4,9 +4,11 @@ This isolated package compares the current engine and RocksDB 11.8.1
 (rust-rocksdb 0.25.0). Both run the same Rust random-Get harness as separate
 release processes on one Linux host. RocksDB is only a benchmark dependency.
 
-Only random point reads are measured. The previous write, update, delete,
-compaction and sequential verification phases have been removed. Ordinary
-correctness tests for those operations remain in the library's test suite.
+The `run.py` runner measures random point reads. Other runners in this package
+measure writes, ranges, recovery, snapshots, cache pressure and compaction;
+`full-comparison` combines them. The random-read runner has no timed sequential
+verification or write phase. Ordinary correctness tests remain in the library's
+test suite.
 
 ## Fixtures and conditions
 
