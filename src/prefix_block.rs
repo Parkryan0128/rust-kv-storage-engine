@@ -428,14 +428,23 @@ mod tests {
         for (row, hash) in native_hashes.into_iter().enumerate() {
             assert_eq!(hash, crate::bloom::hash(plain.key_at(row).unwrap()));
         }
+        let (plain_cursor_block, _) =
+            ReadBlock::decode_indexed(bytes.clone(), &first, None, 73, 0).unwrap();
+        let mut plain_cursor =
+            BlockCursor::new_for::<false>(plain_cursor_block, 3, Vec::new()).unwrap();
         let mut cursor = BlockCursor::new(native, 3, Vec::new()).unwrap();
         for n in 3..plain.record_count() {
             let row = cursor.current().unwrap();
             assert_eq!(row.key, plain.key_at(n).unwrap());
             assert_eq!(row.to_owned(), plain.record_at(n).unwrap().to_owned());
+            let plain_row = plain_cursor.current_for::<false>().unwrap();
+            assert_eq!(row.key, plain_row.key);
+            assert_eq!(row.to_owned(), plain_row.to_owned());
+            plain_cursor.advance_for::<false>().unwrap();
             cursor.advance().unwrap();
         }
         assert!(cursor.current().is_none());
+        assert!(plain_cursor.current_for::<false>().is_none());
         for index in 0..encoded.len() {
             let mut damaged = encoded.clone();
             damaged[index] ^= 1;
