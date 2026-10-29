@@ -856,11 +856,15 @@ impl MemIndex {
                 range,
             });
         }
-        let mut groups: VecDeque<_> = self.groups[start..]
-            .iter()
-            .take_while(|g| range.allows_end(g.first_key()))
-            .cloned()
-            .collect();
+        let candidates = &self.groups[start..];
+        // Prove the end once instead of visiting every group boundary. The
+        // exact slice length also lets collection allocate its directory once.
+        let end = if range.allows_end(candidates.last().unwrap().first_key()) {
+            candidates.len()
+        } else {
+            candidates.partition_point(|g| range.allows_end(g.first_key()))
+        };
+        let mut groups: VecDeque<_> = candidates[..end].iter().cloned().collect();
         // Trim small boundary slices instead of retaining unrelated pages in
         // their groups. Broad ranges still clone only one handle per group.
         let last = groups.len() - 1;
