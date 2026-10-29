@@ -151,6 +151,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(github.event.head_commit.message, '[snapshot-scaling-guard]') }}
         timeout-minutes: 15
         run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py extra-results/snapshot-cpu
+      - name: Optional native long-key range confirmation
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(github.event.head_commit.message, '[prefix-range-guard]') }}
+        timeout-minutes: 15
+        run: python3 benchmarks/rocksdb-compare/remaining.py extra-results/prefix-ranges --trials 12 --case prefix-range-4096-10 --case prefix-range-4096-512 --case prefix-range-4096-20000 --case prefix-range-16384-10 --case prefix-range-16384-512 --case prefix-range-16384-20000
       - name: Preserve raw measurements and exact harness
         if: always()
         uses: actions/upload-artifact@v4

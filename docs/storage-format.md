@@ -163,7 +163,9 @@ A fold copies current value handles while retaining the key arrays; structural
 edits detach those arrays as needed. No write clones the entire memtable. Retained snapshots can increase
 write latency and keep old values alive. Disk buffering grows with SST count and
 block sizes; it is not a fixed process-memory limit. Completed sources release
-their SST handles early. The engine handle remains until drop, error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming
+their SST handles early. A range with no overlapping source is exhausted at
+creation and holds no database handle. Other engine handles remain until drop,
+error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming
 their space; `sst_bytes` counts current live tables, not unlinked pinned files.
 Drop long-lived or partially consumed scans before reopening the database.
 
@@ -330,6 +332,9 @@ The reader validates expansion length, directory, full record limits and CRC,
 then applies normal ordering, sequence and table-bound checks. Blocks remain
 prefix encoded in the cache. Point reads check the shared prefix once and
 search suffix keys; sequential cursors reconstruct only their current key.
+A cursor retains the shared prefix while advancing and recycles its key buffer
+across prefix blocks. Entering a plain block or a smaller encoded capacity
+releases incompatible scratch space.
 A cursor key fits within the encoded payload (shared prefix plus one suffix);
 its capacity is capped there. Compaction charges two encoded-frame capacities
 for buffer reuse and one for the current key, instead of an expanded block.

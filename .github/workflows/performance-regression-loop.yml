@@ -209,19 +209,6 @@ jobs:
           done
           python3 benchmarks/rocksdb-compare/bounds.py focused-results/plain-bounds --trials 12 --case 16files-128b-hit
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/plain-extra --trials 12 --case disjoint12-reopened-range10 --case mixed-pressure-4m
-      - name: Record cursor symbol sizes for both production builds
-        if: ${{ contains(github.event.head_commit.message, '[plain-cursor-guard]') }}
-        run: |
-          python3 - <<'PY'
-          import subprocess
-          from pathlib import Path
-          output = []
-          for name in ["baseline", "engine"]:
-              output.append(name)
-              symbols = subprocess.check_output(["nm", "-S", "-C", "comparison-bin/workloads-" + name], text=True)
-              output.extend(line for line in symbols.splitlines() if any(key in line for key in ["BlockCursor::", "TableScan::advance", "Scan::read_next"]))
-          Path("focused-results/cursor-symbols.txt").write_text("\n".join(output) + "\n")
-          PY
       - name: Proven-empty ranges and nonempty acquisition guards
         if: ${{ contains(github.event.head_commit.message, '[empty-range-guard]') }}
         run: |

@@ -109,6 +109,8 @@ bounds return `InvalidConfig`; equal endpoints are empty unless both are include
 Ordering uses raw bytes, so `user:10` sorts before `user:2`.
 
 Each owned `Scan` captures a snapshot when created, including whole atomic batches.
+A range proven empty at creation retains no database handles and stays empty
+even when later writes add keys in that range.
 Later puts, deletes, flushes and compactions do not change its results. Duplicate
 versions are merged and deleted keys are omitted. SST blocks are read lazily,
 bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
