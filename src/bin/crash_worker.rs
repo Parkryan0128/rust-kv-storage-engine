@@ -92,6 +92,10 @@ fn main() {
         e.compact().unwrap();
         return;
     }
+    if mode == "flush-only" {
+        e.flush().unwrap();
+        return;
+    }
     let n = if mode == "stream" { 1_000_000 } else { 50 };
     for i in 0..n as u64 {
         e.put(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
