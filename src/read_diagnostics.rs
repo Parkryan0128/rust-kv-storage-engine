@@ -1,5 +1,6 @@
 //! Opt-in read-path experiments. Fixture creation is outside measured regions.
 use super::*;
+use crate::block::indexed_records;
 use crate::{manifest::Manifest, Engine, Options};
 use bytes::Bytes;
 use serde_json::json;
