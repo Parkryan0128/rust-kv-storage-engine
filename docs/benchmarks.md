@@ -1,5 +1,7 @@
 # Benchmarks
 
+For the 2026-10-29 owned-value read comparison, including tuned RocksDB caches, see [cache-policy results](cache-policy-results.md). The older reports below retain their original dates and methodology.
+
 These are small workloads on container storage (overlayfs). Its very short sync times do not represent physical-disk durability latency.
 
 ## Reads and writes
