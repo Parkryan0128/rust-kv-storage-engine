@@ -223,3 +223,9 @@ one entry needs no search, and an equal-prefix suffix ends at the last entry.
 Complete key-byte comparisons still decide ordering when prefixes collide.
 The variable/common-prefix memory workloads and boundary/model tests guard
 these shortcuts without adding an index, cache, or retained allocation.
+
+The full comparison also runs 12 large-random trials with the identical-binary
+control. Keep cache-resident, long-key and cache-pressure cases alongside large
+random reads: a fixed-step indexed lookup experiment preserved correctness but
+regressed cached Get throughput, so production retains early equality exit.
+The boundary/model regression tests remain in place.

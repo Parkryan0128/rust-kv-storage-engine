@@ -145,27 +145,18 @@ impl ReadBlock {
 
     pub fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
         if self.index_start != 0 {
-            let mut size = self.record_count();
-            if size == 0 {
-                return Ok(None);
+            let (mut left, mut right) = (0, self.record_count());
+            while left < right {
+                let middle = left + (right - left) / 2;
+                match self.key_at(middle)?.cmp(key) {
+                    std::cmp::Ordering::Less => left = middle + 1,
+                    std::cmp::Ordering::Greater => right = middle,
+                    std::cmp::Ordering::Equal => {
+                        return Ok(Some(self.record_at(middle)?.to_owned()))
+                    }
+                }
             }
-            // Keep the iteration count independent of the comparison outcome.
-            // This gives the optimizer a conditional-select search step instead
-            // of two unpredictable branches for each random key. Every offset
-            // and selected record still passes the checked decoder.
-            let mut left = 0;
-            while size > 1 {
-                let half = size / 2;
-                let middle = left + half;
-                let greater = self.key_at(middle)? > key;
-                left = if greater { left } else { middle };
-                size -= half;
-            }
-            return if self.key_at(left)? == key {
-                Ok(Some(self.record_at(left)?.to_owned()))
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         }
         let index = self
             .offsets
