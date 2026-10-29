@@ -73,6 +73,7 @@ fn profile_bloom_reduction() {
                         "BLOOM_PROFILE {}",
                         serde_json::json!({"count":count,"present":present,
                         "method":name,"trial":trial,"order":position+1,
+                        "metadata_bytes":std::mem::size_of::<Bloom>(),
                         "operations":queries.len() as u64*repeats,"seconds":seconds,
                         "notes":"Warm prehashed corpus; same Bloom bytes and struct layout; opaque function-call overhead on both methods. Not total Get throughput or a RocksDB comparison."})
                     );

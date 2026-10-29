@@ -1,10 +1,12 @@
 use crate::{codec::*, error::corrupt, Result};
 
 pub(crate) struct Bloom {
-    bits: Vec<u8>,
+    bits: Box<[u8]>,
     probes: u32,
+    // Filters have a fixed byte length; no spare Vec capacity is retained.
+    // The format caps the bit count at 2^26, so u32 preserves every value.
     // Reciprocal is runtime-only; persisted positions still use h % bit_count.
-    bit_count: u64,
+    bit_count: u32,
     reciprocal: u64,
 }
 // Bloom format depends on this hash; bump the version if it changes.
@@ -89,12 +91,12 @@ fn delta(hash: u64) -> u64 {
 impl Bloom {
     pub fn new(count: u64, bits_per_key: usize) -> Self {
         let len = Self::byte_len(count, bits_per_key);
-        let bit_count = len as u64 * 8;
+        let bit_count = (len * 8) as u32;
         Self {
-            bits: vec![0; len],
+            bits: vec![0; len].into_boxed_slice(),
             probes: ((bits_per_key as f64 * 0.69) as u32).clamp(1, 20),
             bit_count,
-            reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
+            reciprocal: u64::MAX / u64::from(bit_count) + u64::from(bit_count.is_power_of_two()),
         }
     }
     fn byte_len(count: u64, bits_per_key: usize) -> usize {
@@ -136,10 +138,11 @@ impl Bloom {
         // floor(2^64 / n) gives a quotient at most one below floor(hash / n).
         // Thus the subtraction cannot overflow, and one correction is exact.
         // n is in 64..=2^26, so the reciprocal always fits in u64.
+        let bit_count = u64::from(self.bit_count);
         let quotient = ((u128::from(hash) * u128::from(self.reciprocal)) >> 64) as u64;
-        let remainder = hash - quotient * self.bit_count;
-        (if remainder >= self.bit_count {
-            remainder - self.bit_count
+        let remainder = hash - quotient * bit_count;
+        (if remainder >= bit_count {
+            remainder - bit_count
         } else {
             remainder
         }) as usize
@@ -147,7 +150,7 @@ impl Bloom {
     pub fn encode(&self, out: &mut Vec<u8>) {
         put_u32(out, self.probes);
         put_u32(out, self.bits.len() as u32);
-        out.extend(&self.bits);
+        out.extend_from_slice(&self.bits);
     }
     pub fn decode(c: &mut Cursor<'_>) -> Result<Self> {
         let probes = c.u32()?;
@@ -155,12 +158,12 @@ impl Bloom {
         if !(1..=20).contains(&probes) || !(8..=8 * 1024 * 1024).contains(&len) {
             return Err(corrupt("invalid Bloom filter"));
         }
-        let bit_count = len as u64 * 8;
+        let bit_count = (len * 8) as u32;
         Ok(Self {
-            bits: c.take(len)?.to_vec(),
+            bits: c.take(len)?.into(),
             probes,
             bit_count,
-            reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
+            reciprocal: u64::MAX / u64::from(bit_count) + u64::from(bit_count.is_power_of_two()),
         })
     }
 }
@@ -176,9 +179,9 @@ mod tests {
             let bit_count = bytes as u64 * 8;
             // Avoid allocating the largest bitsets just to check the arithmetic.
             let bloom = Bloom {
-                bits: Vec::new(),
+                bits: Box::default(),
                 probes: 6,
-                bit_count,
+                bit_count: bit_count as u32,
                 reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
             };
             for hash in [
@@ -216,7 +219,7 @@ mod tests {
                         h = h.wrapping_add(delta);
                     }
                 }
-                assert_eq!(bloom.bits, reference);
+                assert_eq!(bloom.bits.as_ref(), reference.as_slice());
                 let mut encoded = Vec::new();
                 bloom.encode(&mut encoded);
                 let decoded = Bloom::decode(&mut Cursor { b: &encoded }).unwrap();
