@@ -138,7 +138,7 @@ impl Merge {
                 let rebuild = tree.is_stale();
                 let mut dirty = 0;
                 while let Some(i) = self.pending.pop() {
-                    self.cursors[i].advance_for::<PREFIX>()?;
+                    self.cursors[i].advance()?;
                     if !dense && !rebuild {
                         dirty |= tree.update_leaf(i, &self.cursors);
                     }
@@ -157,7 +157,7 @@ impl Merge {
                 }
             } else {
                 while let Some(i) = self.pending.pop() {
-                    self.cursors[i].advance_for::<PREFIX>()?;
+                    self.cursors[i].advance()?;
                 }
                 Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
             };

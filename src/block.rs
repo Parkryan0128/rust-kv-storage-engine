@@ -339,7 +339,6 @@ struct RecordPosition {
     has_value: bool,
 }
 impl BlockCursor {
-    #[cfg(test)]
     pub fn new(block: ReadBlock, index: usize, prefix_key: Vec<u8>) -> Result<Self> {
         Self::new_for::<true>(block, index, prefix_key)
     }
@@ -443,7 +442,6 @@ impl BlockCursor {
                 .then(|| &self.block.bytes[head.key_end..head.end]),
         })
     }
-    #[cfg(test)]
     pub fn advance(&mut self) -> Result<()> {
         self.advance_for::<true>()
     }

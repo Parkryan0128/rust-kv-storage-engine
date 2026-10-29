@@ -952,37 +952,33 @@ impl MemScan {
             self.finish_page();
         }
     }
+    #[inline(never)]
+    fn next_live_offset(records: &[Record]) -> Option<usize> {
+        records.iter().position(|record| record.value.is_some())
+    }
     #[inline]
     pub(crate) fn next_live(&mut self) -> Option<(Vec<u8>, Bytes)> {
         loop {
             let page = self.current.as_ref()?;
-            if self.page_in_range && page.updates.is_empty() {
-                // This immutable page needs neither per-row range checks nor
-                // delta lookups. Skip deletions directly in its base records.
-                let live = page.records[self.row..self.page_end]
-                    .iter()
-                    .enumerate()
-                    .find_map(|(offset, record)| {
-                        record.value.as_ref().map(|value| (offset, value))
-                    });
-                if let Some((offset, value)) = live {
-                    let row = self.row + offset;
-                    let out = (crate::scan::copy_scan_key(&page.rows[row]), value.clone());
-                    self.row = row + 1;
-                    if self.row == self.page_end {
-                        self.finish_page();
-                    }
-                    return Some(out);
-                }
-                self.finish_page();
-                continue;
-            }
             if !self.page_in_range && !self.range.allows_end(&page.rows[self.row]) {
                 self.current = None;
                 self.groups.clear();
                 return None;
             }
-            let out = page.record(self.row).value.as_ref().map(|value| {
+            let mut value = page.record(self.row).value.as_ref();
+            if value.is_none() && self.page_in_range && page.updates.is_empty() {
+                // Keep the common live-row path small. The base-page search
+                // is needed only after encountering a deletion with no deltas.
+                let Some(offset) =
+                    Self::next_live_offset(&page.records[self.row + 1..self.page_end])
+                else {
+                    self.finish_page();
+                    continue;
+                };
+                self.row += offset + 1;
+                value = page.records[self.row].value.as_ref();
+            }
+            let out = value.map(|value| {
                 (
                     crate::scan::copy_scan_key(&page.rows[self.row]),
                     value.clone(),
