@@ -286,7 +286,7 @@ mod tests {
             golden.insert_hash(hash(key));
         }
         // Golden bytes from the pre-hash-retention storage-format algorithm.
-        assert_eq!(golden.bits, [158, 37, 100, 240, 129, 3, 3, 242]);
+        assert_eq!(golden.bits.as_ref(), &[158, 37, 100, 240, 129, 3, 3, 242]);
         for bits in [1, 10, 30] {
             let mut direct = Bloom::new(1000, bits);
             let mut retained = Bloom::new(1000, bits);
