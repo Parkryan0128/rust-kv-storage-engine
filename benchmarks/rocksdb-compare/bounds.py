@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('output', type=Path)
     parser.add_argument('--trials', type=int, choices=range(1, 31), default=6)
+    parser.add_argument("--case", action="append", dest="selected_cases", help="Select named bound cases (repeatable)")
     args = parser.parse_args()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
@@ -26,10 +27,17 @@ def main():
     cases = [(f"{files}files-{value}b-{probe}", dict(common, generations=files, value=value, range=probe))
              for files, value in [(4, 128), (16, 128), (16, 16384)]
              for probe in ["gap", "above", "hit"]]
+    if args.selected_cases:
+        selected = set(args.selected_cases)
+        available = {name for name, _ in cases}
+        if selected - available:
+            parser.error(f"Unknown cases: {sorted(selected - available)}")
+        cases = [case for case in cases if case[0] in selected]
     environment = {
         "commit": capture("git", "rev-parse", "HEAD"),
         "baseline": capture("git", "-C", "baseline", "rev-parse", "HEAD"),
         "platform": platform.platform(), "cpu": capture("lscpu"), "trials": args.trials,
+        "selected_cases": [name for name, _ in cases],
         "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in binaries.items()},
         "semantics": "Same logical disjoint ranges and durable write history, native SST format per backend; automatic compaction disabled, no compression, no data-block cache. Fresh fixture copy for each trial; warm OS cache before open. Open, first post-open scan and 2000 repeats are separate. First scan includes collection of owned results; validation/drop are outside that first timer. Repeats include result drop, not full validation. All data validated after timing and reopen.",
         "limits": f"Shared CI, {args.trials} first-query samples, warm OS cache; not cold-device p99. Extra engine data block reads are measured directly; RocksDB internal counters are not equivalent. Native fixtures differ by design to exercise persisted maximum-key metadata."

@@ -38,6 +38,8 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="Include the baseline binary with its native SST fixtures")
     parser.add_argument("--trials", type=int, choices=range(1, 31), help="Repeat balanced backend rotations")
     parser.add_argument("--engine-control", action="store_true", help="Run the identical current binary again to measure A/A noise")
+    parser.add_argument("--case", action="append", dest="selected_cases", help="Select keys-value_bytes-tables cases (repeatable)")
+    parser.add_argument("--block-bytes", type=int, choices=(4096, 8192, 16384), action="append", help="Select measured block sizes (repeatable)")
     args = parser.parse_args()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
@@ -48,10 +50,16 @@ def main():
     smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
     queries = 1000 if smoke else 500_000
     trials = args.trials or (1 if smoke else 6)
-    block_sizes = (4096, 8192, 16384)
+    block_sizes = tuple(dict.fromkeys(args.block_bytes or (4096, 8192, 16384)))
     cases = [(100, 128, 1)] if smoke else [
         (100_000, 128, 1), (1_000_000, 128, 5), (100_000, 1024, 5)
     ]
+    if args.selected_cases:
+        selected = set(args.selected_cases)
+        available = {f"{keys}-{size}-{tables}" for keys, size, tables in cases}
+        if selected - available:
+            parser.error(f"Unknown cases: {sorted(selected - available)}")
+        cases = [case for case in cases if "-".join(map(str, case)) in selected]
     metadata = {
         "commit": capture("git", "rev-parse", "HEAD"),
         "platform": platform.platform(),

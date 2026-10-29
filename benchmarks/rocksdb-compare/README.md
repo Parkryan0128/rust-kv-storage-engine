@@ -355,3 +355,19 @@ python3 benchmarks/rocksdb-compare/export_results.py ARTIFACT_DIR/comparison-sum
 Omit `--fixed-paths` only when inspecting a historical native-path artifact; the
 CSV explicitly labels that methodology. Missing data or a mismatched revision
 fails validation instead of silently generating an incomplete comparison.
+
+
+### Residual read controls
+
+`[residual-read-control]` runs two independent 24-trial jobs: the original
+comparison baseline, and a separately built identical-source baseline. Both
+include the exact-current-executable control for million-key/8 KiB random reads,
+plus the flagged cache-admission, snapshot, open and empty-range conditions.
+The same-source job asserts identical library, manifest, lock and copied Rust
+harness files. Keep each job’s CPU and absolute timings separate; do not subtract
+one host’s control ratio from another host’s result. This diagnostic tests small
+regressions before attributing them to production code.
+
+`run.py --case 1000000-128-5 --block-bytes 8192` and
+`bounds.py --case 16files-128b-above` select only those existing cases. Both
+options are opt-in; the complete comparison’s default matrix is unchanged.

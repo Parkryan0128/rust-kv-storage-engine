@@ -1,0 +1,106 @@
+name: residual-read-control
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: residual-read-control-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  compare:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[residual-read-control]')
+    strategy:
+      fail-fast: false
+      matrix:
+        reference: [original, identical-source]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: 3
+      CXXFLAGS: '-g0'
+      KV_BENCH_DIR: /tmp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve independent or identical-source reference
+        id: reference
+        env:
+          REFERENCE_KIND: ${{ matrix.reference }}
+        run: |
+          python3 - <<'PY'
+          import os
+          ref = os.environ["GITHUB_SHA"] if os.environ["REFERENCE_KIND"] == "identical-source" else "c0299ec14e60a249fb9628f1888c5740c655432b"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ref={ref}\n")
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.reference.outputs.ref }}
+          path: baseline
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+      - name: Validate syntax and fixture restoration
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+          python3 -m compileall -q benchmarks/rocksdb-compare
+          python3 -m unittest discover -s benchmarks/rocksdb-compare -p 'test_*.py'
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: benchmarks/rocksdb-compare/target
+          key: rocksdb-compare-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+      - name: Build matching baseline, current and RocksDB harnesses
+        id: build
+        run: |
+          mkdir -p comparison-bin
+          cp benchmarks/rocksdb-compare/src/bin/workloads.rs baseline/benchmarks/rocksdb-compare/src/bin/workloads.rs
+          cp benchmarks/rocksdb-compare/src/workloads_backend.rs baseline/benchmarks/rocksdb-compare/src/workloads_backend.rs
+          cp benchmarks/rocksdb-compare/src/bounds_workload.rs baseline/benchmarks/rocksdb-compare/src/bounds_workload.rs
+          cp benchmarks/rocksdb-compare/src/main.rs baseline/benchmarks/rocksdb-compare/src/main.rs
+          cp benchmarks/rocksdb-compare/src/backend.rs baseline/benchmarks/rocksdb-compare/src/backend.rs
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bins
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline
+          cp baseline/benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins --features rocks -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins --features rocks
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
+      - name: Verify separately built same-source control
+        if: matrix.reference == 'identical-source'
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          files = sorted(Path("src").rglob("*.rs")) + [Path("Cargo.toml"), Path("Cargo.lock")]
+          files += sorted(Path("benchmarks/rocksdb-compare/src").rglob("*.rs"))
+          files += [Path("benchmarks/rocksdb-compare/Cargo.toml"), Path("benchmarks/rocksdb-compare/Cargo.lock")]
+          hashes = {}
+          for path in files:
+              assert path.read_bytes() == (Path("baseline") / path).read_bytes(), path
+              hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+          Path("residual-results").mkdir(exist_ok=True)
+          Path("residual-results/identical-source.json").write_text(json.dumps(hashes, indent=2))
+          PY
+      - name: Repeat the flagged million-key block size with identical-executable control
+        run: python3 benchmarks/rocksdb-compare/run.py residual-results/random --baseline --trials 24 --engine-control --case 1000000-128-5 --block-bytes 8192
+      - name: Repeat cache admission and snapshot retention costs
+        run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/cache-snapshot --trials 24 --case phase-20000-2m --case phase-20000-4m --case snapshot-release --case snapshot-write32 --case snapshot-narrow-write32
+      - name: Repeat the flagged open and empty bounds
+        run: |
+          python3 benchmarks/rocksdb-compare/workloads.py residual-results/open --baseline --reads-only --profile 2 --scenario uniform-t4-span0 --trials 24
+          python3 benchmarks/rocksdb-compare/bounds.py residual-results/bounds --trials 24 --case 16files-128b-above
+      - name: Preserve every result and control
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: residual-read-${{ matrix.reference }}
+          path: |
+            residual-results/
+            benchmarks/rocksdb-compare/Cargo.lock
+          if-no-files-found: error
