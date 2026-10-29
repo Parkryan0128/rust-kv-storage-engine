@@ -57,6 +57,8 @@ def main():
         "rust": capture("rustc", "--version"),
         "cpu": capture("lscpu"),
         "host_memory": Path("/proc/meminfo").read_text(),
+        "kernel_schedstats": (Path("/proc/sys/kernel/sched_schedstats").read_text().strip()
+                              if Path("/proc/sys/kernel/sched_schedstats").exists() else None),
         "binaries": {
             name: {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
             for name, p in binaries.items()
@@ -89,6 +91,7 @@ def main():
             "Latency samples time Get only; throughput includes RNG, validation and value release.",
             "Single-client OS-cache-warm hit workload, not physical-disk or write performance.",
             "READ_PROFILE is a separate forced-miss microbenchmark, not an end-to-end CPU profile.",
+            "Optional Linux main-thread CPU/runqueue counters are sampled outside the throughput timer; the diagnostic window is slightly wider. Runqueue counters may be unavailable or disabled; wall time remains the primary result.",
             "Optional engine-control uses the exact current executable and fixture in a separate measured process; differences measure A/A noise.",
             "Profile CRC-only time overlaps decode; routing/cache/locks/allocation are excluded.",
         ],

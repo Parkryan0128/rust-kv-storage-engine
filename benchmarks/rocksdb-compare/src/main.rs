@@ -24,6 +24,27 @@ fn memory() -> Value {
     json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:")})
 }
 
+// Optional Linux diagnostics sampled outside the throughput timer. These are
+// main-thread CPU/runqueue counters, not a replacement for elapsed wall time.
+fn scheduling() -> Option<[u64; 3]> {
+    let text = fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let mut fields = text.split_whitespace();
+    Some([
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    ])
+}
+fn scheduling_delta(before: Option<[u64; 3]>) -> Option<Value> {
+    let after = scheduling()?;
+    let before = before?;
+    Some(json!({
+        "main_thread_cpu_ns":after[0].checked_sub(before[0])?,
+        "runqueue_wait_ns":after[1].checked_sub(before[1])?,
+        "timeslices":after[2].checked_sub(before[2])?,
+    }))
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     assert!(
@@ -66,6 +87,7 @@ fn main() -> Result<()> {
         let before = db.stats()?;
         let mut samples = Vec::with_capacity(queries.div_ceil(stride));
         let mut rng = seed;
+        let scheduler_before = scheduling();
         let start = Instant::now();
         for i in 0..queries {
             rng ^= rng << 13;
@@ -81,6 +103,7 @@ fn main() -> Result<()> {
             assert_eq!(actual.as_deref(), Some(expected.as_slice()));
         }
         let seconds = start.elapsed().as_secs_f64();
+        let scheduler = scheduling_delta(scheduler_before);
         samples.sort_unstable();
         let percentile = |p| samples[(samples.len() - 1) * p / 100] as f64 / 1000.0;
         let after = db.stats()?;
@@ -93,7 +116,7 @@ fn main() -> Result<()> {
                 "ops_per_second":queries as f64/seconds,
                 "sample_count":samples.len(),"sampled_p50_us":percentile(50),
                 "sampled_p99_us":percentile(99),"memory":memory(),
-                "stats_before":before,"stats_after":after
+                "stats_before":before,"stats_after":after,"scheduler":scheduler
             })
         );
     }

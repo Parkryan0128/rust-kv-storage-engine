@@ -201,3 +201,10 @@ public `put` WAL frame. The regression loop also replays 100,000 shuffled keys
 written with individual puts and 32-operation batches. Fixtures assert that no
 SST was flushed before the simulated process exit, and overwrite values carry
 a generation byte so recovery must return the latest operation, not any version.
+
+Random-read reports optionally include Linux main-thread CPU time, runqueue wait
+and timeslices from [`/proc/thread-self/schedstat`](https://docs.kernel.org/scheduler/sched-stats.html).
+These samples surround the wall-time loop and include a slightly wider diagnostic
+window. They do not replace elapsed throughput or include background-thread CPU.
+The environment records whether kernel schedstats are enabled; missing counters
+remain null and disabled runqueue accounting must not be interpreted as no wait.

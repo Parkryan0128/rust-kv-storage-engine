@@ -66,8 +66,15 @@ impl PageKeys {
 
 #[derive(Clone, Default)]
 struct PageData {
+    keys: Arc<PageKeys>,
     records: Vec<Record>,
     value_bytes: usize,
+}
+impl std::ops::Deref for PageData {
+    type Target = PageKeys;
+    fn deref(&self) -> &PageKeys {
+        &self.keys
+    }
 }
 impl PageData {
     fn replace(&mut self, row: usize, record: Record) -> usize {
@@ -77,15 +84,8 @@ impl PageData {
         self.records[row] = record;
         previous_bytes
     }
-    fn insert_at(
-        &mut self,
-        keys: &mut Arc<PageKeys>,
-        row: usize,
-        key: Vec<u8>,
-        record: Record,
-        prefix: u64,
-    ) {
-        let keys = Arc::make_mut(keys);
+    fn insert_at(&mut self, row: usize, key: Vec<u8>, record: Record, prefix: u64) {
+        let keys = Arc::make_mut(&mut self.keys);
         keys.key_bytes += key.len();
         keys.rows.insert(row, Bytes::from(key));
         keys.prefixes.insert(row, prefix);
@@ -98,14 +98,13 @@ impl PageData {
     // to share keys with retained snapshots.
     fn apply_inserting_run(
         &mut self,
-        keys: &mut Arc<PageKeys>,
         entries: &mut std::iter::Peekable<impl Iterator<Item = (Vec<u8>, Record)>>,
         upper: Option<&[u8]>,
         remove_deletes: bool,
         bytes: &mut usize,
         len: &mut usize,
     ) {
-        let keys = Arc::make_mut(keys);
+        let keys = Arc::make_mut(&mut self.keys);
         while let Some((key, record)) = entries.peek() {
             if (remove_deletes && record.value.is_none())
                 || key.as_slice() < keys.rows[0].as_ref()
@@ -151,20 +150,18 @@ impl PageData {
     }
 }
 
-// A snapshot update copies only a bounded delta and key/value base handles. Keys and
+// A snapshot update copies only a bounded delta and one base handle. Keys and
 // unchanged values stay in the immutable base until a structural edit or fold.
 const PAGE_UPDATES: usize = 16;
 #[derive(Clone, Default)]
 struct Page {
-    // Routing reads keys directly; value-page indirection is not on that path.
-    keys: Arc<PageKeys>,
     base: Arc<PageData>,
     updates: Vec<(usize, Record)>,
 }
 impl std::ops::Deref for Page {
-    type Target = PageKeys;
-    fn deref(&self) -> &PageKeys {
-        &self.keys
+    type Target = PageData;
+    fn deref(&self) -> &PageData {
+        &self.base
     }
 }
 impl Page {
@@ -175,18 +172,15 @@ impl Page {
                 return &self.updates[i].1;
             }
         }
-        &self.base.records[row]
+        &self.records[row]
     }
-    fn materialize_data<'a>(
-        base: &'a mut Arc<PageData>,
-        updates: &mut Vec<(usize, Record)>,
-    ) -> &'a mut PageData {
-        if !updates.is_empty() && Arc::get_mut(base).is_none() {
+    fn materialize(&mut self) -> &mut PageData {
+        if !self.updates.is_empty() && Arc::get_mut(&mut self.base).is_none() {
             // Copy unchanged handles once and move delta records directly into place.
             // Sorted deltas merge linearly; no per-row binary search or obsolete value clone.
-            let mut updates = std::mem::take(updates).into_iter().peekable();
-            let mut value_bytes = base.value_bytes;
-            let records = base
+            let mut updates = std::mem::take(&mut self.updates).into_iter().peekable();
+            let mut value_bytes = self.value_bytes;
+            let records = self
                 .records
                 .iter()
                 .enumerate()
@@ -201,17 +195,15 @@ impl Page {
                     }
                 })
                 .collect();
-            *base = Arc::new(PageData {
+            self.base = Arc::new(PageData {
+                keys: self.keys.clone(),
                 records,
                 value_bytes,
             });
         }
-        let base = Arc::make_mut(base);
-        base.fold(updates);
+        let base = Arc::make_mut(&mut self.base);
+        base.fold(&mut self.updates);
         base
-    }
-    fn materialize(&mut self) -> &mut PageData {
-        Self::materialize_data(&mut self.base, &mut self.updates)
     }
     fn replace(&mut self, row: usize, record: Record) -> usize {
         // A dropped snapshot must not leave superseded payloads in our base.
@@ -226,7 +218,7 @@ impl Page {
                 previous_bytes
             }
             Err(i) if self.updates.len() < (self.rows.len() / 8).clamp(PAGE_UPDATES, 32) => {
-                let old = self.base.records[row].value.as_ref().map_or(0, Bytes::len);
+                let old = self.records[row].value.as_ref().map_or(0, Bytes::len);
                 self.updates.insert(i, (row, record));
                 old
             }
@@ -234,17 +226,16 @@ impl Page {
         }
     }
     fn insert_at(&mut self, row: usize, key: Vec<u8>, record: Record, prefix: u64) {
-        let base = Self::materialize_data(&mut self.base, &mut self.updates);
-        base.insert_at(&mut self.keys, row, key, record, prefix);
+        self.materialize().insert_at(row, key, record, prefix);
     }
     fn allocated_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + std::mem::size_of::<PageData>()
             + std::mem::size_of::<PageKeys>()
             + 6 * std::mem::size_of::<usize>() // Page, base and keys Arc headers
             + self.rows.capacity() * std::mem::size_of::<Bytes>()
-            + self.base.records.capacity() * std::mem::size_of::<Record>()
+            + self.records.capacity() * std::mem::size_of::<Record>()
             + self.prefixes.capacity() * std::mem::size_of::<u64>()
-            + self.key_bytes + self.base.value_bytes
+            + self.key_bytes + self.value_bytes
             + self.updates.capacity() * std::mem::size_of::<(usize, Record)>()
             + self.updates.iter().map(|(_, r)| r.value.as_ref().map_or(0, Bytes::len)).sum::<usize>()
     }
@@ -309,33 +300,32 @@ impl PageGroup {
                 let (mut cursor, mut end) = (index, index + 1);
                 while cursor < end {
                     if self.pages[cursor].overfull() {
-                        let page = Arc::make_mut(&mut self.pages[cursor]);
+                        let page = Arc::make_mut(&mut self.pages[cursor]).materialize();
                         let middle = page.rows.len() / 2;
-                        let base = Page::materialize_data(&mut page.base, &mut page.updates);
                         let keys = Arc::make_mut(&mut page.keys);
                         let rows = keys.rows.split_off(middle);
                         let prefixes = keys.prefixes.split_off(middle);
-                        let records = base.records.split_off(middle);
+                        let records = page.records.split_off(middle);
                         let key_bytes = rows.iter().map(Bytes::len).sum();
                         let value_bytes = records
                             .iter()
                             .map(|r| r.value.as_ref().map_or(0, Bytes::len))
                             .sum();
                         keys.key_bytes -= key_bytes;
-                        base.value_bytes -= value_bytes;
+                        page.value_bytes -= value_bytes;
                         keys.rows.shrink_to_fit();
                         keys.prefixes.shrink_to_fit();
-                        base.records.shrink_to_fit();
+                        page.records.shrink_to_fit();
                         self.prefixes.insert(cursor + 1, prefixes[0]);
                         self.pages.insert(
                             cursor + 1,
                             Arc::new(Page {
-                                keys: Arc::new(PageKeys {
-                                    rows,
-                                    prefixes,
-                                    key_bytes,
-                                }),
                                 base: Arc::new(PageData {
+                                    keys: Arc::new(PageKeys {
+                                        rows,
+                                        prefixes,
+                                        key_bytes,
+                                    }),
                                     records,
                                     value_bytes,
                                 }),
@@ -433,10 +423,9 @@ impl MemIndex {
             // a page-local run. Shared bases retain the bounded-delta path below.
             if let Some(base) = Arc::get_mut(&mut page.base) {
                 base.fold(&mut page.updates);
-                let keys = &mut page.keys;
                 while let Some((key, record)) = entries.peek() {
                     if (remove_deletes && record.value.is_none())
-                        || key.as_slice() < keys.rows[0].as_ref()
+                        || key.as_slice() < base.rows[0].as_ref()
                         || upper
                             .as_ref()
                             .is_some_and(|end| key.as_slice() >= end.as_ref())
@@ -444,14 +433,14 @@ impl MemIndex {
                         break;
                     }
                     let prefix = prefix(key);
-                    let position = if key.as_slice() > keys.rows.last().unwrap().as_ref() {
-                        Err(keys.rows.len())
+                    let position = if key.as_slice() > base.rows.last().unwrap().as_ref() {
+                        Err(base.rows.len())
                     } else {
-                        keys.position(key, prefix)
+                        base.position(key, prefix)
                     };
                     if position.is_err()
-                        && (keys.rows.len() >= PAGE_RECORDS
-                            || keys.key_bytes + key.len() > PAGE_KEY_BYTES)
+                        && (base.rows.len() >= PAGE_RECORDS
+                            || base.key_bytes + key.len() > PAGE_KEY_BYTES)
                     {
                         break;
                     }
@@ -461,7 +450,6 @@ impl MemIndex {
                         *bytes -= RECORD_CHARGE + key.len() + base.replace(row, record);
                     } else {
                         base.apply_inserting_run(
-                            keys,
                             &mut entries,
                             upper.as_deref(),
                             remove_deletes,
@@ -589,18 +577,17 @@ impl MemIndex {
         // Missing deletes must not copy a snapshot's directory or page.
         let row = self.groups[g].pages[p].position(key, prefix).ok()?;
         let group = Arc::make_mut(&mut self.groups[g]);
-        let page = Arc::make_mut(&mut group.pages[p]);
-        let base = Page::materialize_data(&mut page.base, &mut page.updates);
+        let page = Arc::make_mut(&mut group.pages[p]).materialize();
         let keys = Arc::make_mut(&mut page.keys);
         let key = keys.rows.remove(row);
         keys.prefixes.remove(row);
         keys.key_bytes -= key.len();
-        let record = base.records.remove(row);
-        base.value_bytes -= record.value.as_ref().map_or(0, Bytes::len);
+        let record = page.records.remove(row);
+        page.value_bytes -= record.value.as_ref().map_or(0, Bytes::len);
         if keys.rows.capacity() > keys.rows.len().max(4) * 4 {
             keys.rows.shrink_to_fit();
             keys.prefixes.shrink_to_fit();
-            base.records.shrink_to_fit();
+            page.records.shrink_to_fit();
         }
         self.len -= 1;
         if page.rows.is_empty() {
@@ -625,20 +612,18 @@ impl MemIndex {
                     let right = left + 1;
                     let mut removed = Arc::unwrap_or_clone(group.pages.remove(right));
                     group.prefixes.remove(right);
-                    let removed_base =
-                        Page::materialize_data(&mut removed.base, &mut removed.updates);
-                    let target = Arc::make_mut(&mut group.pages[left]);
-                    let target_base = Page::materialize_data(&mut target.base, &mut target.updates);
+                    let removed = removed.materialize();
+                    let target = Arc::make_mut(&mut group.pages[left]).materialize();
                     let removed_keys = Arc::make_mut(&mut removed.keys);
                     let target_keys = Arc::make_mut(&mut target.keys);
                     target_keys.rows.append(&mut removed_keys.rows);
                     target_keys.prefixes.append(&mut removed_keys.prefixes);
                     target_keys.key_bytes += removed_keys.key_bytes;
-                    target_base.records.append(&mut removed_base.records);
-                    target_base.value_bytes += removed_base.value_bytes;
+                    target.records.append(&mut removed.records);
+                    target.value_bytes += removed.value_bytes;
                     target_keys.rows.shrink_to_fit();
                     target_keys.prefixes.shrink_to_fit();
-                    target_base.records.shrink_to_fit();
+                    target.records.shrink_to_fit();
                 }
             }
         }
@@ -724,7 +709,7 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
-        let page_end = current.as_ref().unwrap().base.records.len();
+        let page_end = current.as_ref().unwrap().records.len();
         let page_in_range = range.allows_end(current.as_ref().unwrap().rows.last().unwrap());
         if !page_in_range {
             // A range wholly inside one page needs no synthetic group or
@@ -810,7 +795,7 @@ impl MemScan {
         }
         self.current = self.groups.front().map(|g| g.pages[self.page].clone());
         if let Some(page) = &self.current {
-            self.page_end = page.base.records.len();
+            self.page_end = page.records.len();
             self.page_in_range = self.range.allows_end(page.rows.last().unwrap());
         }
     }
@@ -1122,7 +1107,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(map.groups[0].pages[0].base.value_bytes, 0);
+        assert_eq!(map.groups[0].pages[0].value_bytes, 0);
         assert!(map.groups[0].pages[0].updates.is_empty());
     }
 
@@ -1148,7 +1133,7 @@ mod tests {
         map.insert(32u64.to_be_bytes().to_vec(), record(2000));
         assert!(!Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
         assert!(map.groups[0].pages[0].updates.is_empty());
-        assert_eq!(map.groups[0].pages[0].base.value_bytes, 32 * 17);
+        assert_eq!(map.groups[0].pages[0].value_bytes, 32 * 17);
         assert!(old.enumerate().all(|(n, (_, r))| r.seq == n as u64 + 1));
         assert!(middle.enumerate().all(|(n, (_, r))| r.seq
             == if n < 32 {
@@ -1157,7 +1142,7 @@ mod tests {
                 n as u64 + 1
             }));
         map.insert(0u64.to_be_bytes().to_vec(), record(3000));
-        assert_eq!(map.groups[0].pages[0].base.value_bytes, 31 * 17);
+        assert_eq!(map.groups[0].pages[0].value_bytes, 31 * 17);
     }
 
     #[test]
@@ -1191,7 +1176,7 @@ mod tests {
             );
         }
         assert!(map.groups[0].pages[0].updates.is_empty());
-        assert_eq!(map.groups[0].pages[0].base.value_bytes, 1);
+        assert_eq!(map.groups[0].pages[0].value_bytes, 1);
         assert!(map.allocated_bytes() < 4096);
     }
 
@@ -1347,7 +1332,7 @@ mod tests {
         );
         assert_eq!(map.get(&key).unwrap().seq, 39);
         assert_eq!(bytes, RECORD_CHARGE + 1 + 39);
-        assert_eq!(map.groups[0].pages[0].base.value_bytes, 39);
+        assert_eq!(map.groups[0].pages[0].value_bytes, 39);
         assert!(map.groups[0].pages[0].updates.is_empty());
     }
 
@@ -1496,7 +1481,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&base, &map.groups[0].pages[0].base));
         assert!(map.groups[0].pages[0].updates.is_empty());
         assert_eq!(
-            map.groups[0].pages[0].base.value_bytes,
+            map.groups[0].pages[0].value_bytes,
             (100 - PAGE_UPDATES - 1) * 64 + PAGE_UPDATES * 3
         );
         assert!(old
@@ -1734,7 +1719,7 @@ mod tests {
             for (p, page) in group.prefixes.iter().zip(&group.pages) {
                 assert_eq!(*p, prefix(&page.rows[0]));
                 assert_eq!(page.prefixes.len(), page.rows.len());
-                assert_eq!(page.base.records.len(), page.rows.len());
+                assert_eq!(page.records.len(), page.rows.len());
             }
         }
     }
