@@ -630,7 +630,7 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
-        if !range.allows_end(&current.as_ref().unwrap().rows.last().unwrap()) {
+        if !range.allows_end(current.as_ref().unwrap().rows.last().unwrap()) {
             // A range wholly inside one page needs no synthetic group or
             // directory allocation; the current page is the complete snapshot.
             return Some(MemScan {
@@ -1505,6 +1505,7 @@ mod tests {
             for (p, page) in group.prefixes.iter().zip(&group.pages) {
                 assert_eq!(*p, prefix(&page.rows[0]));
                 assert_eq!(page.prefixes.len(), page.rows.len());
+                assert_eq!(page.records.len(), page.rows.len());
             }
         }
     }
