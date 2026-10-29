@@ -5,9 +5,20 @@ use bytes::Bytes;
 fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
     let dir = tempfile::tempdir().unwrap();
     for long_keys in [false, true] {
-        for shape in ["distinct", "overlap", "mixed", "hybrid"] {
+        for shape in ["distinct", "overlap", "mixed", "hybrid", "cross-prefix"] {
             let key = |n: u64| {
-                let mut key = if long_keys { vec![b'x'; 128] } else { vec![] };
+                let mut key = if long_keys {
+                    vec![
+                        if shape == "cross-prefix" && n >= 24 {
+                            b'y'
+                        } else {
+                            b'x'
+                        };
+                        128
+                    ]
+                } else {
+                    vec![]
+                };
                 key.extend_from_slice(&n.to_be_bytes());
                 key
             };
@@ -64,7 +75,16 @@ fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
             }
             for count in [2, 4, 8, 9, 16] {
                 let inputs = &tables[..count];
-                assert_eq!(Merge::new(inputs, false).unwrap().prefix_inputs, long_keys);
+                let merge = Merge::new(inputs, false).unwrap();
+                assert_eq!(merge.prefix_inputs, long_keys);
+                assert_eq!(
+                    merge.comparison_prefix,
+                    if long_keys && shape != "cross-prefix" {
+                        128
+                    } else {
+                        0
+                    }
+                );
                 let mut model = BTreeMap::<Vec<u8>, Record>::new();
                 for (key, record) in versions[..count].iter().flatten() {
                     if model.get(key).is_none_or(|old| record.seq > old.seq) {

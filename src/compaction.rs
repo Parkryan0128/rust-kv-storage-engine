@@ -88,6 +88,36 @@ fn tiered_positions(files: impl Iterator<Item = (u64, u64)>, threshold: usize) -
     Vec::new()
 }
 
+// Every decoded block validates its first/next keys and the final maximum.
+// Ordered keys between two bounds sharing a prefix must share it as well.
+// Reuse that proof across comparisons; legacy unknown bounds use full keys.
+fn shared_comparison_prefix(cursors: &[TableCursor]) -> usize {
+    let Some((first, _)) = cursors
+        .iter()
+        .find(|c| c.current().is_some())
+        .and_then(TableCursor::known_key_bounds)
+    else {
+        return 0;
+    };
+    let mut len = first.len().min(128);
+    for cursor in cursors.iter().filter(|c| c.current().is_some()) {
+        let Some((lo, hi)) = cursor.known_key_bounds() else {
+            return 0;
+        };
+        for bound in [lo, hi] {
+            len = first[..len]
+                .iter()
+                .zip(bound)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if len < 16 {
+                return 0;
+            }
+        }
+    }
+    len
+}
+
 pub(crate) struct Merge {
     cursors: Vec<TableCursor>,
     pending: Vec<usize>,
@@ -96,6 +126,7 @@ pub(crate) struct Merge {
     finished: bool,
     drop_tombstones: bool,
     prefix_inputs: bool,
+    comparison_prefix: usize,
 }
 impl Merge {
     pub fn new(tables: &[Arc<Table>], drop_tombstones: bool) -> Result<Self> {
@@ -113,7 +144,12 @@ impl Merge {
             .map(TableCursor::new)
             .collect::<Result<Vec<_>>>()?;
         let prefix_inputs = cursors.iter().any(TableCursor::has_prefix_blocks);
-        let tournament = tournament.then(|| Box::new(Tournament::new(&cursors)));
+        let comparison_prefix = if prefix_inputs {
+            shared_comparison_prefix(&cursors)
+        } else {
+            0
+        };
+        let tournament = tournament.then(|| Box::new(Tournament::new(&cursors, comparison_prefix)));
         Ok(Self {
             cursors,
             tournament,
@@ -122,6 +158,7 @@ impl Merge {
             finished: false,
             drop_tombstones,
             prefix_inputs,
+            comparison_prefix,
         })
     }
 
@@ -145,7 +182,11 @@ impl Merge {
                 }
                 if dense {
                     tree.invalidate();
-                    Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
+                    Self::select_linear::<PREFIX>(
+                        &self.cursors,
+                        &mut self.pending,
+                        self.comparison_prefix,
+                    )
                 } else {
                     if rebuild {
                         tree.rebuild(&self.cursors);
@@ -159,7 +200,11 @@ impl Merge {
                 while let Some(i) = self.pending.pop() {
                     self.cursors[i].advance()?;
                 }
-                Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
+                Self::select_linear::<PREFIX>(
+                    &self.cursors,
+                    &mut self.pending,
+                    self.comparison_prefix,
+                )
             };
             let Some(newest) = newest else {
                 return Ok(None);
@@ -176,13 +221,18 @@ impl Merge {
     fn select_linear<'a, const PREFIX: bool>(
         cursors: &'a [TableCursor],
         pending: &mut Vec<usize>,
+        comparison_prefix: usize,
     ) -> Option<crate::codec::RecordRef<'a>> {
         let mut newest: Option<crate::codec::RecordRef<'_>> = None;
         for (i, cursor) in cursors.iter().enumerate() {
             if let Some(record) = cursor.current_for::<PREFIX>() {
-                let order = newest
-                    .as_ref()
-                    .map_or(std::cmp::Ordering::Less, |old| record.key.cmp(old.key));
+                let order = newest.as_ref().map_or(std::cmp::Ordering::Less, |old| {
+                    if PREFIX {
+                        record.key[comparison_prefix..].cmp(&old.key[comparison_prefix..])
+                    } else {
+                        record.key.cmp(old.key)
+                    }
+                });
                 match order {
                     std::cmp::Ordering::Less => {
                         pending.clear();
