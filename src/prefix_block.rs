@@ -23,10 +23,6 @@ pub(crate) fn encode_prefix_frame(
     }
     let records = indexed_records(&full[HEADER..])?;
     encoded.clear();
-    // The exact output length is already known. Reserve it before copying
-    // records so the first prefix block does not repeatedly grow its buffer.
-    // Keep amortized growth for later blocks whose encoded lengths vary.
-    encoded.reserve(full.len() - saving);
     encoded.resize(HEADER, 0);
     put_u32(encoded, (full.len() - HEADER) as u32);
     put_u32(encoded, prefix_len as u32);
