@@ -89,7 +89,18 @@ impl Backend {
         if c.cache == 0 {
             table.disable_cache();
         } else {
-            table.set_block_cache(&Cache::new_lru_cache(c.cache));
+            let cache = match c.rocks_cache_policy.as_str() {
+                "lru-single" => {
+                    let mut options = rocksdb::LruCacheOptions::default();
+                    options.set_capacity(c.cache);
+                    options.set_num_shard_bits(0);
+                    Cache::new_lru_cache_opts(&options)
+                }
+                "hyperclock" => Cache::new_hyper_clock_cache(c.cache, 0),
+                "lru-default" => Cache::new_lru_cache(c.cache),
+                _ => unreachable!("validated cache policy"),
+            };
+            table.set_block_cache(&cache);
         }
         table.set_block_size(c.block);
         table.set_bloom_filter(10.0, false);

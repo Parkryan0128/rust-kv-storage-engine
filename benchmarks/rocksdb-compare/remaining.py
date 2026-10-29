@@ -103,6 +103,19 @@ def main():
     for case in large_guards:
         if args.cases and case[0] in args.cases:
             cases.append(case)
+    # Compare tuning choices on one host without replacing historical defaults.
+    policy_cases = [
+        ("oversized2m", "read", dict(common, keys=2, value=2097152, span=1, queries=512), "prepare"),
+        ("mixed2m", "mixed-large", dict(common, keys=4096, value=2097152, queries=4096), None),
+        ("mixed4m", "mixed-large", dict(common, keys=40000, value=4194304, queries=4096), None),
+        *[(f"small-{block}", "read", dict(common, block=block, span=1, queries=200000,
+            throughput=True), "prepare") for block in [4096, 16384]],
+    ]
+    for policy in ["lru-default", "lru-single", "hyperclock"]:
+        for label, mode, config, preparation in policy_cases:
+            label = f"policy-{policy}-{label}"
+            if args.cases and label in args.cases:
+                cases.append((label, mode, dict(config, rocks_cache_policy=policy), preparation))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

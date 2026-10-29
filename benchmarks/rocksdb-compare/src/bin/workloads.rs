@@ -38,6 +38,7 @@ struct Config {
     wal_pattern: String,
     wal_individual: bool,
     recover_to_memtable: bool,
+    rocks_cache_policy: String,
 }
 impl Config {
     fn parse(v: &Value) -> Self {
@@ -64,6 +65,10 @@ impl Config {
             wal_pattern: v["wal_pattern"].as_str().unwrap_or("sorted").to_owned(),
             wal_individual: v["wal_individual"].as_bool().unwrap_or(false),
             recover_to_memtable: v["recover_to_memtable"].as_bool().unwrap_or(false),
+            rocks_cache_policy: v["rocks_cache_policy"]
+                .as_str()
+                .unwrap_or("lru-default")
+                .to_owned(),
         };
         assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 4 * 1024 * 1024);
         assert!(
@@ -83,6 +88,10 @@ impl Config {
             // Complete 1,000-key cycles make every final generation explicit.
             assert!((2_000..=510_000).contains(&c.keys) && c.keys.is_multiple_of(2_000));
         }
+        assert!(matches!(
+            c.rocks_cache_policy.as_str(),
+            "lru-default" | "lru-single" | "hyperclock"
+        ));
         assert!(!c.wal_individual || c.batch == 1);
         assert!((1..=16).contains(&c.generations));
         assert!((8..=1024).contains(&c.merge_key_bytes));

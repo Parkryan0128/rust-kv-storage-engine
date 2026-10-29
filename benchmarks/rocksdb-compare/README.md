@@ -269,3 +269,12 @@ Bytes on all backends, though the engine may share a bounded immutable block.
 [large-frame-guard] exercises multi-record 128 KiB blocks with 128-byte/32 KiB
 values, both with zero and 8 MiB cache, using 12 trials. It has a separate
 comparison queue so it cannot replace a pending original-baseline validation.
+
+[cache-policy-guard] compares RocksDB default LRU, a single LRU shard, and
+HyperClockCache with automatic entry-size estimation. Each keeps the same
+8 MiB total capacity and owned-value API. Five cases cover 2 MiB values, mixed
+2/4 MiB values, and ordinary 4/16 KiB blocks with twelve trials per policy.
+The engine ignores the RocksDB-only policy setting; repeated engine measurements
+provide a same-host control. Historical full-matrix defaults remain unchanged.
+Large-value cache-only Get/return/drop ratios must not be presented as the speed
+of consuming those bytes or as an untuned-versus-best-tuned RocksDB comparison.
