@@ -187,3 +187,7 @@ still includes validation in throughput; the general workloads suite measures
 verification separately. Merge matrices require an explicit
 `--allow-format-change` to relax file-byte equality across format versions;
 complete logical checks after compact and reopen remain mandatory.
+
+### Reproducing optimization regressions
+
+`performance-regression-loop` compares an exact baseline SHA with the current engine and RocksDB, retaining the snapshot/range guards and using 12 trials for every durable-write case and four WAL recovery patterns. Its random-read run adds `--engine-control`: the identical current executable and immutable SST fixture are read in another process in the rotated order. Compare this A/A variation before attributing a small difference to a source change. Twelve trials balance the four backend positions and three block sizes. WAL sync and integrity checks are unchanged.

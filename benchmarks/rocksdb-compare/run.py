@@ -35,14 +35,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path, nargs="?", default=Path("comparison-results"))
     parser.add_argument("--baseline", action="store_true", help="Include the baseline binary with its native SST fixtures")
+    parser.add_argument("--trials", type=int, choices=range(1, 31), help="Repeat balanced backend rotations")
+    parser.add_argument("--engine-control", action="store_true", help="Run the identical current binary again to measure A/A noise")
     args = parser.parse_args()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     names = ("baseline", "engine", "rocksdb") if args.baseline else ("engine", "rocksdb")
-    binaries = {name: Path("comparison-bin", name).resolve() for name in names}
+    if args.engine_control:
+        names = names[:-1] + ("engine-control", names[-1])
+    binaries = {name: Path("comparison-bin", "engine" if name == "engine-control" else name).resolve() for name in names}
     smoke = os.environ.get("KV_COMPARE_SMOKE") == "1"
     queries = 1000 if smoke else 500_000
-    trials = 1 if smoke else 6
+    trials = args.trials or (1 if smoke else 6)
     block_sizes = (4096, 8192, 16384)
     cases = [(100, 128, 1)] if smoke else [
         (100_000, 128, 1), (1_000_000, 128, 5), (100_000, 1024, 5)
@@ -77,7 +81,7 @@ def main():
             "Fixture creation and OS-cache warming are outside measured processes.",
             "Fresh process/block cache per trial; two identical seeded random passes.",
             "Read-only fixed layouts: engine compaction trigger 64; RocksDB read-only open.",
-            "Block-size and backend order rotate across six trials.",
+            "Block-size and backend order rotate across trials; 12 balances the four-backend A/A control.",
             "RSS excludes fixture creation and OS page cache.",
             "Each engine revision writes its native SST format; RocksDB uses its production SST writer.",
             "Both Get APIs return owned values. Older pinned-Get measurements are not directly comparable.",
@@ -85,6 +89,7 @@ def main():
             "Latency samples time Get only; throughput includes RNG, validation and value release.",
             "Single-client OS-cache-warm hit workload, not physical-disk or write performance.",
             "READ_PROFILE is a separate forced-miss microbenchmark, not an end-to-end CPU profile.",
+            "Optional engine-control uses the exact current executable and fixture in a separate measured process; differences measure A/A noise.",
             "Profile CRC-only time overlaps decode; routing/cache/locks/allocation are excluded.",
         ],
     }
@@ -103,13 +108,15 @@ def main():
                 fixtures = {}
                 for block_bytes in block_sizes:
                     label = f"{case}-{block_bytes}"
-                    directories = {name: root / (label + "-" + name) for name in names}
+                    directories = {name: root / (label + "-" + ("engine" if name == "engine-control" else name)) for name in names}
                     env = dict(os.environ, KV_READ_FIXTURE_KEYS=str(keys),
                                KV_READ_FIXTURE_VALUE_BYTES=str(size), KV_READ_FIXTURE_TABLES=str(tables),
                                KV_READ_FIXTURE_BLOCK_BYTES=str(block_bytes), KV_READ_BLOCK_BYTES=str(block_bytes))
                     fixtures[block_bytes] = (directories, env)
                     print(f"READ_PREPARE {label}", flush=True)
                     for name in names:
+                        if name == "engine-control":
+                            continue
                         if name == "rocksdb":
                             subprocess.run(
                                 [str(binaries[name]), "prepare", str(directories[name]),

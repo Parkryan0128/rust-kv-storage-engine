@@ -90,6 +90,57 @@ impl PageData {
         self.value_bytes += record.value.as_ref().map_or(0, Bytes::len);
         self.records.insert(row, record);
     }
+    // Called only after a structural insertion has been selected. Detach the
+    // key arrays once for the rest of this page-local run, rather than doing an
+    // atomic ownership check for every inserted row. Value-only runs continue
+    // to share keys with retained snapshots.
+    fn apply_inserting_run(
+        &mut self,
+        entries: &mut std::iter::Peekable<impl Iterator<Item = (Vec<u8>, Record)>>,
+        upper: Option<&[u8]>,
+        remove_deletes: bool,
+        bytes: &mut usize,
+        len: &mut usize,
+    ) {
+        let keys = Arc::make_mut(&mut self.keys);
+        while let Some((key, record)) = entries.peek() {
+            if (remove_deletes && record.value.is_none())
+                || key.as_slice() < keys.rows[0].as_ref()
+                || upper.is_some_and(|end| key.as_slice() >= end)
+            {
+                break;
+            }
+            let prefix = prefix(key);
+            let position = if key.as_slice() > keys.rows.last().unwrap().as_ref() {
+                Err(keys.rows.len())
+            } else {
+                keys.position(key, prefix)
+            };
+            if position.is_err()
+                && (keys.rows.len() >= PAGE_RECORDS || keys.key_bytes + key.len() > PAGE_KEY_BYTES)
+            {
+                break;
+            }
+            let (key, record) = entries.next().unwrap();
+            let value_bytes = record.value.as_ref().map_or(0, Bytes::len);
+            *bytes += record.memory_size(&key);
+            self.value_bytes += value_bytes;
+            match position {
+                Ok(row) => {
+                    let old = std::mem::replace(&mut self.records[row], record);
+                    self.value_bytes -= old.value.as_ref().map_or(0, Bytes::len);
+                    *bytes -= old.memory_size(&key);
+                }
+                Err(row) => {
+                    keys.key_bytes += key.len();
+                    keys.rows.insert(row, Bytes::from(key));
+                    keys.prefixes.insert(row, prefix);
+                    self.records.insert(row, record);
+                    *len += 1;
+                }
+            }
+        }
+    }
     fn fold(&mut self, updates: &mut Vec<(usize, Record)>) {
         for (row, record) in updates.drain(..) {
             self.replace(row, record);
@@ -387,14 +438,19 @@ impl MemIndex {
                     {
                         break;
                     }
-                    let (key, record) = entries.next().unwrap();
-                    *bytes += record.memory_size(&key);
-                    match position {
-                        Ok(row) => *bytes -= base.replace(row, record).memory_size(&key),
-                        Err(row) => {
-                            base.insert_at(row, key, record, prefix);
-                            self.len += 1;
-                        }
+                    if let Ok(row) = position {
+                        let (key, record) = entries.next().unwrap();
+                        *bytes += record.memory_size(&key);
+                        *bytes -= base.replace(row, record).memory_size(&key);
+                    } else {
+                        base.apply_inserting_run(
+                            &mut entries,
+                            upper.as_deref(),
+                            remove_deletes,
+                            bytes,
+                            &mut self.len,
+                        );
+                        break;
                     }
                 }
                 continue;
@@ -1140,6 +1196,83 @@ mod tests {
         for (key, r) in rows {
             assert_eq!(map.get(&key), Some(&r));
         }
+    }
+
+    #[test]
+    fn inserting_runs_detach_shared_keys_and_preserve_batch_order() {
+        let mut map = MemIndex::default();
+        let mut model = std::collections::BTreeMap::new();
+        let mut bytes = 0;
+        let key = |n: u64| n.to_be_bytes().to_vec();
+        for n in (0..200).step_by(2) {
+            let r = Record {
+                seq: n + 1,
+                value: Some(Bytes::from(vec![1; 32])),
+            };
+            map.apply([(key(n), r.clone())], false, &mut bytes);
+            model.insert(key(n), r);
+        }
+        let before = map.snapshot(all()).unwrap();
+        let expected_before = model.clone();
+        // Fold values while retaining the old page: the new base is exclusive,
+        // but its key array is still shared with the snapshot.
+        let shared_keys = map.groups[0].pages[0].keys.clone();
+        for n in (0..80).step_by(2) {
+            let r = Record {
+                seq: 1000 + n,
+                value: Some(Bytes::from_static(b"changed")),
+            };
+            map.apply([(key(n), r.clone())], false, &mut bytes);
+            model.insert(key(n), r);
+        }
+        assert!(Arc::ptr_eq(&shared_keys, &map.groups[0].pages[0].keys));
+        for remove_deletes in [false, true] {
+            // Mix inserts, duplicates, tombstones and physical removals, then
+            // cross the page and group limits in a single lazy input stream.
+            let entries: Vec<_> = (0..20_000u64)
+                .flat_map(|n| {
+                    [
+                        (
+                            key(n),
+                            Record {
+                                seq: 10_000 + n * 2,
+                                value: Some(Bytes::from(vec![3; (n % 31) as usize])),
+                            },
+                        ),
+                        (
+                            key(n),
+                            Record {
+                                seq: 10_001 + n * 2,
+                                value: (n % 7 != 0).then(|| Bytes::from_static(b"last")),
+                            },
+                        ),
+                    ]
+                })
+                .collect();
+            for (k, r) in &entries {
+                if remove_deletes && r.value.is_none() {
+                    model.remove(k);
+                } else {
+                    model.insert(k.clone(), r.clone());
+                }
+            }
+            map.apply(entries, remove_deletes, &mut bytes);
+            assert_eq!(
+                map.iter()
+                    .map(|(k, r)| (k.to_vec(), r.clone()))
+                    .collect::<Vec<_>>(),
+                model.clone().into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                bytes,
+                model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+            );
+        }
+        assert!(!Arc::ptr_eq(&shared_keys, &map.groups[0].pages[0].keys));
+        assert_eq!(
+            before.collect::<Vec<_>>(),
+            expected_before.into_iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]

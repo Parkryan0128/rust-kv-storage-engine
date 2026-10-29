@@ -1,0 +1,116 @@
+name: performance-regression-loop
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Baseline commit to compare with the identical harness
+        required: true
+        default: c0299ec14e60a249fb9628f1888c5740c655432b
+        type: string
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: performance-regression-loop-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  compare:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 3
+      CXXFLAGS: '-g0'
+      KV_BENCH_DIR: /tmp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve baseline
+        id: baseline
+        env:
+          REQUESTED_BASELINE: ${{ inputs.baseline }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          markers = re.findall(r"\[baseline:([0-9a-fA-F]{40})\]", os.environ.get("COMMIT_MESSAGE", ""))
+          ref = os.environ.get("REQUESTED_BASELINE") or (markers[0] if len(markers) == 1 else "")
+          if len(markers) > 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+              raise ValueError("Specify one exact baseline commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ref={ref}\n")
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.baseline.outputs.ref }}
+          path: baseline
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+      - name: Validate engine and harness formatting
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path benchmarks/rocksdb-compare/Cargo.toml --check
+          cargo test --locked --release
+          cargo test --locked --release --all-features
+          python3 -m compileall -q benchmarks/rocksdb-compare
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: benchmarks/rocksdb-compare/target
+          key: rocksdb-compare-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+      - name: Build matching baseline, current and RocksDB harnesses
+        id: build
+        run: |
+          mkdir -p comparison-bin
+          cp benchmarks/rocksdb-compare/src/bin/workloads.rs baseline/benchmarks/rocksdb-compare/src/bin/workloads.rs
+          cp benchmarks/rocksdb-compare/src/workloads_backend.rs baseline/benchmarks/rocksdb-compare/src/workloads_backend.rs
+          cp benchmarks/rocksdb-compare/src/bounds_workload.rs baseline/benchmarks/rocksdb-compare/src/bounds_workload.rs
+          cp benchmarks/rocksdb-compare/src/main.rs baseline/benchmarks/rocksdb-compare/src/main.rs
+          cp benchmarks/rocksdb-compare/src/backend.rs baseline/benchmarks/rocksdb-compare/src/backend.rs
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bins
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline
+          cp baseline/benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/baseline
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/engine
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins --features rocks -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins --features rocks
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
+          cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
+      - name: Smoke check all three backends
+        run: |
+          python3 benchmarks/rocksdb-compare/workloads.py full-results/smoke --smoke --baseline
+          KV_COMPARE_SMOKE=1 python3 benchmarks/rocksdb-compare/run.py full-results/random-smoke --baseline
+      - name: First scans with fresh handles and normal range throughput
+        run: |
+          python3 benchmarks/rocksdb-compare/workloads.py focused-results/reopened --baseline --reads-only --profile 0 --scenario scan-t1-span32 --trials 12 --reopens 32
+          python3 benchmarks/rocksdb-compare/workloads.py focused-results/ranges --baseline --reads-only --scenario scan-t1-span32
+      - name: Snapshot writes, release and memory lookup guards
+        run: |
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/snapshot --trials 12 --case snapshot-write32 --case snapshot-narrow-write32 --case snapshot-release --case keys-variable-memory --case keys-common128-memory
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory --scan-focus
+          python3 benchmarks/rocksdb-compare/bounds.py focused-results/bounds
+      - name: Durable writes and isolated snapshot CPU profiles
+        run: |
+          python3 benchmarks/rocksdb-compare/writes.py focused-results/writes --trials 12
+          python3 benchmarks/rocksdb-compare/internal.py focused-results/internal
+      - name: Tombstone scan regressions and separately timed write phases
+        run: |
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine-profile
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline-profile
+          python3 benchmarks/rocksdb-compare/audit.py focused-results/audit
+      - name: Million-key random reads with identical-binary noise control
+        run: python3 benchmarks/rocksdb-compare/run.py focused-results/random --baseline --trials 12 --engine-control
+      - name: Recovery shapes beyond sequential ingestion
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite
+      - name: Preserve raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-regression-loop
+          path: |
+            focused-results/
+            benchmarks/rocksdb-compare/Cargo.lock
