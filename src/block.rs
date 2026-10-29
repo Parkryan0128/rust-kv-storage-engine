@@ -339,15 +339,7 @@ struct RecordPosition {
     has_value: bool,
 }
 impl BlockCursor {
-    pub fn new(block: ReadBlock, index: usize, prefix_key: Vec<u8>) -> Result<Self> {
-        Self::new_for::<true>(block, index, prefix_key)
-    }
-    pub(crate) fn new_for<const PREFIX: bool>(
-        block: ReadBlock,
-        index: usize,
-        mut prefix_key: Vec<u8>,
-    ) -> Result<Self> {
-        debug_assert!(PREFIX || block.record_start == HEADER);
+    pub fn new(block: ReadBlock, index: usize, mut prefix_key: Vec<u8>) -> Result<Self> {
         prefix_key.clear();
         if prefix_key.capacity() != 0
             && (block.record_start == HEADER || prefix_key.capacity() > block.bytes.len() - HEADER)
@@ -371,7 +363,7 @@ impl BlockCursor {
             prefix_key,
         };
         if let Some(offset) = offset {
-            out.decode_at::<PREFIX>(offset)?;
+            out.decode_at(offset)?;
         }
         Ok(out)
     }
@@ -382,7 +374,7 @@ impl BlockCursor {
             self.block.index_start
         }
     }
-    fn decode_at<const PREFIX: bool>(&mut self, offset: usize) -> Result<()> {
+    fn decode_at(&mut self, offset: usize) -> Result<()> {
         let bytes = self
             .block
             .bytes
@@ -390,7 +382,7 @@ impl BlockCursor {
             .ok_or_else(|| corrupt("SST cursor offset"))?;
         let mut c = Cursor { b: bytes };
         let record = decode_record_ref(&mut c)?;
-        if PREFIX && self.block.record_start != HEADER {
+        if self.block.record_start != HEADER {
             let prefix_len = self.block.record_start - HEADER - 8;
             // This block never changes. Preserve its common prefix and replace
             // only the variable suffix as the cursor advances.
@@ -443,15 +435,11 @@ impl BlockCursor {
         })
     }
     pub fn advance(&mut self) -> Result<()> {
-        self.advance_for::<true>()
-    }
-    pub(crate) fn advance_for<const PREFIX: bool>(&mut self) -> Result<()> {
-        debug_assert!(PREFIX || self.block.record_start == HEADER);
         let Some(head) = self.head.take() else {
             return Ok(());
         };
         if head.end != self.data_end() {
-            self.decode_at::<PREFIX>(head.end)?;
+            self.decode_at(head.end)?;
         }
         Ok(())
     }
