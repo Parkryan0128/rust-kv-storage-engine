@@ -147,6 +147,10 @@ jobs:
         run: |
           python3 benchmarks/rocksdb-compare/summarize_full.py full-results "${{ github.sha }}" "${{ steps.baseline.outputs.ref }}" --fixed-paths
           python3 benchmarks/rocksdb-compare/export_results.py full-results/comparison-summary.json full-results/all-public-conditions.csv
+      - name: Optional production snapshot CPU scaling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(github.event.head_commit.message, '[snapshot-scaling-guard]') }}
+        timeout-minutes: 15
+        run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py extra-results/snapshot-cpu
       - name: Preserve raw measurements and exact harness
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,5 +158,6 @@ jobs:
           name: full-comparison
           path: |
             full-results/
+            extra-results/
             benchmarks/rocksdb-compare/Cargo.lock
           if-no-files-found: error

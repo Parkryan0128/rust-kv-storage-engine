@@ -52,6 +52,8 @@ Point reads cache encoded blocks. Version 03 stores the compact record-offset
 index inside each checksummed data frame. On the first read of each block after
 open, every record's bounds, header, key order, sequence and persisted offset are
 validated. The table retains an eight-byte validation fingerprint per block.
+Newly published tables inherit the writer's completed validation fingerprint,
+including for Bloom readback; reopening starts with no in-memory proof.
 After eviction, an identical payload CRC permits reuse of that validation;
 every disk read still verifies the entire frame CRC. A changed CRC triggers full
 validation again. This uses the existing CRC32 corruption model, not authentication
@@ -156,8 +158,9 @@ Snapshot creation still takes time and space proportional to the number of
 overlapping groups, not individual pages or keys. Group sizes are bounded, so
 this is a smaller linear cost rather than a constant-time snapshot. A write to a
 shared group copies at most 64 page handles and their prefix index, then a changed
-shared page copies its key/value handles and prefix index. Immutable bytes remain
-shared; no write clones the entire memtable. Retained snapshots can increase
+shared page copies a bounded bitmap-indexed delta and shares its immutable base.
+A fold copies current value handles while retaining the key arrays; structural
+edits detach those arrays as needed. No write clones the entire memtable. Retained snapshots can increase
 write latency and keep old values alive. Disk buffering grows with SST count and
 block sizes; it is not a fixed process-memory limit. Completed sources release
 their SST handles early. The engine handle remains until drop, error or exhaustion. Compaction can unlink old files, but those handles delay reclaiming
@@ -169,7 +172,7 @@ Drop long-lived or partially consumed scans before reopening the database.
 Compaction merges SSTables and keeps the newest record for each key.
 
 Flush writes borrow keys and records directly from the frozen memtable. The SST
-writer accepts both borrowed flush input and owned compaction output, preserving
+writer accepts borrowed flush and compaction input, preserving
 the same ordering checks, encoding and checksums without temporary flush copies.
 
 - **SizeTiered** (default) merges similarly sized files, avoiding repeated rewrites of large files.
@@ -265,7 +268,7 @@ active WAL containing a batch even though the file magic is unchanged. Keep a
 closed-database backup before upgrading if rollback is needed. Batch support
 does not change SSTable or MANIFEST formats.
 
-Frames are capped at 64 MiB and records at 32 MiB. New SSTables use format `RKVSST04`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
+Frames are capped at 64 MiB and records at 32 MiB. Ordinary SSTables use format `RKVSST04`; tables using the optional prefix blocks described below use `RKVSST05`. A data-frame payload contains encoded records, one little-endian u32 byte offset per record (relative to the payload start), and a final u32 record count. The directory and records share the frame CRC. This adds four bytes per record and four bytes per block. A metadata summary frame is followed by checksummed index pages targeting 1 MiB each, using the version 02 layout. A larger individual index key may exceed that target, but each frame stays within the 64 MiB limit.
 
 The summary stores record count u64, maximum sequence u64, Bloom probe count u32, Bloom byte length u32, Bloom bytes, and index-entry count u64, followed in version 04 by maximum-key length u32 and maximum-key bytes (zero length for an empty SST). Versions 02/03 end their summary after the index-entry count. Each index entry stores first-key length u32, first-key bytes, block offset u64, and framed block length u32. Entries are never split across pages. The 28-byte footer stores magic (8 bytes), metadata offset u64, total framed metadata length u64, and CRC32 of the preceding 24 bytes. Empty SSTables contain only the summary frame and no index pages.
 
@@ -314,8 +317,8 @@ engines reject version 05 by its magic, so opening a newly rewritten prefix
 table requires a reader supporting version 05.
 
 The version 05 summary extends version 04 with a u32 maximum expanded framed
-block length, bounded by 64 MiB plus the 12-byte frame header. This also bounds
-compaction input memory. Version 05 may mix ordinary indexed blocks and prefix
+block length, bounded by 64 MiB plus the 12-byte frame header. Readers validate
+that logical expansion even though no expanded block is allocated. Version 05 may mix ordinary indexed blocks and prefix
 blocks. A set high bit in the final u32 record count identifies a prefix block;
 ordinary blocks retain their existing count and bytes.
 
@@ -327,6 +330,9 @@ The reader validates expansion length, directory, full record limits and CRC,
 then applies normal ordering, sequence and table-bound checks. Blocks remain
 prefix encoded in the cache. Point reads check the shared prefix once and
 search suffix keys; sequential cursors reconstruct only their current key.
+A cursor key fits within the encoded payload (shared prefix plus one suffix);
+its capacity is capped there. Compaction charges two encoded-frame capacities
+for buffer reuse and one for the current key, instead of an expanded block.
 
 The writer uses this representation only with at least two records, a first
 key of at least 32 bytes, a common prefix of at least 16 bytes, and at least

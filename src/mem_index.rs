@@ -7,7 +7,7 @@ const PAGE_RECORDS: usize = 256;
 const PAGE_KEY_BYTES: usize = 64 * 1024;
 // Snapshot acquisition/drop touches groups, not every page in the range.
 // Mutations copy at most this many page handles before copying a shared page.
-const GROUP_PAGES: usize = 32;
+const GROUP_PAGES: usize = 64;
 
 // Monotone routing prefix. Equality proves a whole key only when both keys
 // have the same length of at most eight bytes; other ties compare full bytes.

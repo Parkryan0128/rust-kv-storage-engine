@@ -23,10 +23,6 @@ impl TableCursor {
         self.block.as_ref().and_then(BlockCursor::current)
     }
 
-    pub(crate) fn known_key_bounds(&self) -> Option<(&[u8], &[u8])> {
-        Some((&self.table.index.first()?.first, self.table.last_key.get()?))
-    }
-
     pub(crate) fn has_prefix_blocks(&self) -> bool {
         self.table.expanded_frame_limit.is_some()
     }

@@ -21,6 +21,10 @@ fn main() -> Result<()> {
         let mut initial = WriteBatch::new();
         for k in 0..keys {
             initial.put(k.to_be_bytes(), [0; 128]);
+            // Large-index diagnostics still respect the public batch payload limit.
+            if k % 100_000 == 99_999 {
+                db.write_batch(std::mem::replace(&mut initial, WriteBatch::new()))?;
+            }
         }
         db.write_batch(initial)?;
         let mut model = vec![0u8; keys as usize];

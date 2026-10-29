@@ -14,17 +14,15 @@ pub(super) struct Tournament {
     nodes: [Head; MAX_INPUTS * 2],
     leaves: usize,
     stale: bool,
-    comparison_prefix: usize,
 }
 
 impl Tournament {
-    pub fn new(cursors: &[TableCursor], comparison_prefix: usize) -> Self {
+    pub fn new(cursors: &[TableCursor]) -> Self {
         assert!(cursors.len() <= MAX_INPUTS);
         let mut out = Self {
             nodes: [Head::default(); MAX_INPUTS * 2],
             leaves: cursors.len().next_power_of_two(),
             stale: false,
-            comparison_prefix,
         };
         out.rebuild(cursors);
         out
@@ -86,12 +84,7 @@ impl Tournament {
         } else {
             let a = cursors[left.winner].current().unwrap();
             let b = cursors[right.winner].current().unwrap();
-            let order = if self.comparison_prefix == 0 {
-                a.key.cmp(b.key)
-            } else {
-                a.key[self.comparison_prefix..].cmp(&b.key[self.comparison_prefix..])
-            };
-            match order {
+            match a.key.cmp(b.key) {
                 Ordering::Less => left,
                 Ordering::Greater => right,
                 Ordering::Equal => Head {
