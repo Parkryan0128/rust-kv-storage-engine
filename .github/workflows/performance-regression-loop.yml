@@ -201,6 +201,27 @@ jobs:
         run: |
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/prefix-ranges --trials 12 --case prefix-range-4096-10 --case prefix-range-4096-512 --case prefix-range-4096-20000 --case prefix-range-16384-10 --case prefix-range-16384-512 --case prefix-range-16384-20000
           python3 benchmarks/rocksdb-compare/workloads.py focused-results/short-range --baseline --reads-only --profile 1 --scenario scan-t1-span512 --trials 12
+      - name: Plain cursor regression guards
+        if: ${{ contains(github.event.head_commit.message, '[plain-cursor-guard]') }}
+        run: |
+          for profile in 0 3 4; do
+            python3 benchmarks/rocksdb-compare/workloads.py focused-results/plain-range-${profile} --baseline --reads-only --profile ${profile} --scenario scan-t1-span512 --trials 12
+          done
+          python3 benchmarks/rocksdb-compare/bounds.py focused-results/plain-bounds --trials 12 --case 16files-128b-hit
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/plain-extra --trials 12 --case disjoint12-reopened-range10 --case mixed-pressure-4m
+      - name: Record cursor symbol sizes for both production builds
+        if: ${{ contains(github.event.head_commit.message, '[plain-cursor-guard]') }}
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          output = []
+          for name in ["baseline", "engine"]:
+              output.append(name)
+              symbols = subprocess.check_output(["nm", "-S", "-C", "comparison-bin/workloads-" + name], text=True)
+              output.extend(line for line in symbols.splitlines() if any(key in line for key in ["BlockCursor::", "TableScan::advance", "Scan::read_next"]))
+          Path("focused-results/cursor-symbols.txt").write_text("\n".join(output) + "\n")
+          PY
       - name: Recovery shapes beyond sequential ingestion
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite --case wal-put-sorted --case wal-put-random100k --case wal-batch32-random100k
       - name: Large-index clustered overwrite guard
