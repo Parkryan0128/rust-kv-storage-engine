@@ -212,7 +212,7 @@ fn version_three_scan_bounds_work_before_maximum_is_known() {
     use crate::scan::KeyRange;
     let dir = tempfile::tempdir().unwrap();
     let keys = [b"a".as_slice(), b"b", b"c", b"d", b"e"];
-    for block in [64, 4096] {
+    for block in [1, 64, 4096] {
         let path = dir.path().join(format!("{block}.sst"));
         drop(table(&path, &keys, block));
         rewrite_summary(&path, INDEXED_MAGIC, |summary| {

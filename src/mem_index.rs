@@ -61,6 +61,12 @@ impl PageKeys {
         if self.prefixes.get(lo) != Some(&prefix) {
             return Err(lo);
         }
+        // For equal-length keys of at most eight bytes, the padded prefix
+        // contains every byte. Other lengths and prefix collisions still use
+        // the complete-key search below.
+        if key.len() <= 8 && self.rows[lo].len() == key.len() {
+            return Ok(lo);
+        }
         let hi = if self.prefixes.get(lo + 1) == Some(&prefix) {
             // Common-prefix keys often fill the rest of the page. The last
             // prefix gives the upper bound without another binary search.
@@ -1760,6 +1766,52 @@ mod tests {
         assert_eq!(map.groups[0].pages[0].rows[0].as_ptr(), key_bytes);
         assert_eq!(scan.next().unwrap().1.seq, 0);
         assert_eq!(scan.count(), 70);
+    }
+
+    #[test]
+    fn short_prefix_equality_distinguishes_padded_lengths_and_missing_keys() {
+        for reverse in [false, true] {
+            let mut keys = vec![vec![]];
+            for first in [0u8, 1, b'a', 255] {
+                for len in 1..=12 {
+                    let mut key = vec![0; len];
+                    key[0] = first;
+                    keys.push(key);
+                }
+            }
+            if reverse {
+                keys.reverse();
+            }
+            let mut map = MemIndex::default();
+            let mut model = std::collections::BTreeMap::new();
+            for (n, key) in keys.iter().enumerate() {
+                map.insert(key.clone(), record(n as u64));
+                model.insert(key.clone(), record(n as u64));
+            }
+            let original = model.clone();
+            let snapshot = map.snapshot(all()).unwrap();
+            for (n, key) in keys.iter().enumerate() {
+                if n % 3 == 0 {
+                    assert_eq!(map.remove(key), model.remove(key));
+                } else {
+                    map.insert(key.clone(), record(1000 + n as u64));
+                    model.insert(key.clone(), record(1000 + n as u64));
+                }
+                for first in [0u8, 1, 2, b'a', 255] {
+                    for len in 0..=14 {
+                        let mut probe = vec![0; len];
+                        if let Some(byte) = probe.first_mut() {
+                            *byte = first;
+                        }
+                        assert_eq!(map.get(&probe), model.get(&probe), "probe={probe:?}");
+                    }
+                }
+            }
+            assert_eq!(
+                snapshot.collect::<Vec<_>>(),
+                original.into_iter().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

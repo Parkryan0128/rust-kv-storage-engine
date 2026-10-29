@@ -83,14 +83,16 @@ impl TableScan {
             // Decoding validates every key against the next block's first key.
             // If that boundary is allowed, this whole block is in range. The
             // final block has a validated maximum after read_stream_block.
+            // A one-record block is already covered by the checked first key.
             // Partial boundary blocks still check each returned record.
-            self.block_in_range = self
-                .table
-                .index
-                .get(self.next_block + 1)
-                .map(|next| next.first.as_slice())
-                .or_else(|| self.table.last_key.get().map(Vec::as_slice))
-                .is_some_and(|upper| self.range.allows_end(upper));
+            self.block_in_range = block.record_count() == 1
+                || self
+                    .table
+                    .index
+                    .get(self.next_block + 1)
+                    .map(|next| next.first.as_slice())
+                    .or_else(|| self.table.last_key.get().map(Vec::as_slice))
+                    .is_some_and(|upper| self.range.allows_end(upper));
             let mut record = 0;
             if self.seek {
                 if let Bound::Included(start) | Bound::Excluded(start) = &self.range.start {
