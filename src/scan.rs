@@ -361,23 +361,22 @@ impl Scan {
                 let Some((key, seq)) = source.head() else {
                     continue;
                 };
-                match best {
-                    None => {
-                        self.pending.push(index);
-                        best = Some((key, index, seq));
-                    }
-                    Some((old, _, _)) if key < old => {
+                // Reuse one lexicographic comparison for ordering and equality.
+                // Duplicate versions otherwise compare the same key twice.
+                let order = best.map_or(std::cmp::Ordering::Less, |(old, _, _)| key.cmp(old));
+                match order {
+                    std::cmp::Ordering::Less => {
                         self.pending.clear();
                         self.pending.push(index);
                         best = Some((key, index, seq));
                     }
-                    Some((old, _, old_seq)) if key == old => {
+                    std::cmp::Ordering::Equal => {
                         self.pending.push(index);
-                        if seq > old_seq {
+                        if seq > best.unwrap().2 {
                             best = Some((key, index, seq));
                         }
                     }
-                    _ => {}
+                    std::cmp::Ordering::Greater => {}
                 }
             }
             let Some((_, winner, _)) = best else {
