@@ -12,7 +12,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: full-comparison-${{ github.ref }}
+  # Unrequested pushes must not replace a queued requested comparison.
+  group: full-comparison-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[full-comparison]')) && github.ref || github.sha }}
   cancel-in-progress: false
 jobs:
   compare:
