@@ -282,6 +282,32 @@ mod tests {
     }
 
     #[test]
+    fn cursor_key_capacity_stays_inside_the_expanded_frame_charge() {
+        let mut first = vec![b'x'; 128];
+        first.push(0);
+        let mut last = vec![b'x'; 128];
+        last.extend_from_slice(&[1; 129]);
+        let mut full = vec![0; HEADER];
+        let mut offsets = vec![0];
+        encode_record_parts(&first, 1, None, &mut full);
+        offsets.push((full.len() - HEADER) as u32);
+        encode_record_parts(&last, 2, None, &mut full);
+        for offset in &offsets {
+            put_u32(&mut full, *offset);
+        }
+        put_u32(&mut full, 2);
+        let mut encoded = Vec::new();
+        assert!(encode_prefix_frame(&full, &first, &last, &mut offsets, &mut encoded).unwrap());
+        let (block, _) =
+            ReadBlock::decode_prefix_indexed(encoded, &first, None, 2, 0, full.len()).unwrap();
+        let mut cursor = BlockCursor::new(block, 0).unwrap();
+        assert_eq!(cursor.current().unwrap().key, first);
+        cursor.advance().unwrap();
+        assert_eq!(cursor.current().unwrap().key, last);
+        assert!(cursor.prefix_key.capacity() <= full.len() - HEADER);
+    }
+
+    #[test]
     fn native_prefix_lookup_cursor_and_cached_validation_match_full_records() {
         let (bytes, first, last, mut offsets) = fixture();
         let mut encoded = Vec::new();
