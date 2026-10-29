@@ -370,7 +370,7 @@ impl Table {
             );
             b
         };
-        if i.len as usize >= SHARE_LARGE_VALUE_AT && block.record_count() == 1 {
+        if i.len as usize >= SHARE_LARGE_VALUE_AT {
             block.lookup_shared_large(key)
         } else {
             block.lookup(key)
