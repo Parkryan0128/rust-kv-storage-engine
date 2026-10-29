@@ -26,11 +26,16 @@ jobs:
       - name: Resolve independent or identical-source reference
         id: reference
         env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           REFERENCE_KIND: ${{ matrix.reference }}
         run: |
           python3 - <<'PY'
-          import os
-          ref = os.environ["GITHUB_SHA"] if os.environ["REFERENCE_KIND"] == "identical-source" else "c0299ec14e60a249fb9628f1888c5740c655432b"
+          import os, re
+          markers = re.findall(r"\[baseline:([0-9a-fA-F]{40})\]", os.environ.get("COMMIT_MESSAGE", ""))
+          if len(markers) > 1:
+              raise ValueError("Specify at most one exact baseline commit")
+          reference = markers[0].lower() if markers else "c0299ec14e60a249fb9628f1888c5740c655432b"
+          ref = os.environ["GITHUB_SHA"] if os.environ["REFERENCE_KIND"] == "identical-source" else reference
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"ref={ref}\n")
           PY
@@ -88,13 +93,22 @@ jobs:
           Path("residual-results/identical-source.json").write_text(json.dumps(hashes, indent=2))
           PY
       - name: Repeat the flagged million-key block size with identical-executable control
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/run.py residual-results/random --baseline --trials 24 --engine-control --case 1000000-128-5 --block-bytes 8192
       - name: Repeat cache admission and snapshot retention costs
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/cache-snapshot --trials 24 --case phase-20000-2m --case phase-20000-4m --case snapshot-release --case snapshot-write32 --case snapshot-narrow-write32
       - name: Repeat the flagged open and empty bounds
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
         run: |
           python3 benchmarks/rocksdb-compare/workloads.py residual-results/open --baseline --reads-only --profile 2 --scenario uniform-t4-span0 --trials 24
           python3 benchmarks/rocksdb-compare/bounds.py residual-results/bounds --trials 24 --case 16files-128b-above
+      - name: Independently repeat directory candidate bound flags
+        if: ${{ contains(github.event.head_commit.message, '[directory-confirm]') }}
+        run: python3 benchmarks/rocksdb-compare/bounds.py residual-results/directory-bounds --trials 24 --case 16files-128b-gap --case 16files-16384b-above --case 4files-128b-above --case 4files-128b-hit
+      - name: Independently repeat volatile snapshot and ordinary writes
+        if: ${{ contains(github.event.head_commit.message, '[directory-confirm]') }}
+        run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py residual-results/snapshot-cpu --trials 24
       - name: Preserve every result and control
         if: always()
         uses: actions/upload-artifact@v4
