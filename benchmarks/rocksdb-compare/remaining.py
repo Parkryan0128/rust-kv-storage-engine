@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--trials", type=int, choices=range(1, 31), default=6)
     parser.add_argument("--scan-focus", action="store_true", help="Scan scaling plus memory lookup, writes and recovery guards")
     parser.add_argument("--case", action="append", dest="cases", help="Run only these named cases (repeatable)")
+    parser.add_argument("--fixed-executable", action="store_true", help="Execute every backend from the same pathname")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = ["baseline", "engine", "rocksdb"]
@@ -174,10 +175,15 @@ def main():
             "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name,p in binaries.items()},
             "semantics": "Same total cache/owned values/sync WAL. Baseline/current reuse identical SST and WAL bytes. OS file cache warmed. Recovery fixture exits without destructors after durable writes; recover_to_memtable=true enables RocksDB avoid_flush_during_recovery and asserts zero SST files after open on all backends. Memory/mixed setup outside timers; RSS includes setup. Read-mode throughput excludes worker startup/join, per-query timers and full validation; validation and warm latency are separate seeded passes. Other diagnostic modes retain validation/timers as reported. All include RNG/drop. Frozen internal microbenchmark is separate, not RocksDB-equivalent."}
         environment["measurement_path_policy"] = "fixed-v1"
+        environment["measurement_executable_policy"] = "fixed-executable-v1" if args.fixed_executable else "backend-paths"
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("REMAINING_ENV " + json.dumps(environment), flush=True)
         def run(name, mode, directory, config, label, trial, order):
-            completed = subprocess.run([str(binaries[name]), mode, str(directory), json.dumps(config)],
+            binary = binaries[name]
+            if args.fixed_executable:
+                binary = root / "workloads-probe"
+                shutil.copy2(binaries[name], binary)
+            completed = subprocess.run([str(binary), mode, str(directory), json.dumps(config)],
                 capture_output=True, text=True, timeout=120)
             (args.output / f"{label}-{trial}-{name}-{mode}.log").write_text(completed.stdout + completed.stderr)
             if completed.returncode:

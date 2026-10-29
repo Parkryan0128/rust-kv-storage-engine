@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        reference: [original, identical-source]
+        reference: ${{ contains(github.event.head_commit.message, '[tombstone-confirm]') && fromJSON('["original","identical-source","identical-executable"]') || fromJSON('["original","identical-source"]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -35,7 +35,7 @@ jobs:
           if len(markers) > 1:
               raise ValueError("Specify at most one exact baseline commit")
           reference = markers[0].lower() if markers else "c0299ec14e60a249fb9628f1888c5740c655432b"
-          ref = os.environ["GITHUB_SHA"] if os.environ["REFERENCE_KIND"] == "identical-source" else reference
+          ref = reference if os.environ["REFERENCE_KIND"] == "original" else os.environ["GITHUB_SHA"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"ref={ref}\n")
           PY
@@ -77,7 +77,7 @@ jobs:
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
       - name: Verify separately built same-source control
-        if: matrix.reference == 'identical-source'
+        if: matrix.reference != 'original'
         run: |
           python3 - <<'PY'
           import hashlib, json
@@ -92,6 +92,9 @@ jobs:
           Path("residual-results").mkdir(exist_ok=True)
           Path("residual-results/identical-source.json").write_text(json.dumps(hashes, indent=2))
           PY
+      - name: Use the exact same executable for the executable control
+        if: matrix.reference == 'identical-executable'
+        run: cp comparison-bin/workloads-engine comparison-bin/workloads-baseline
       - name: Repeat the flagged million-key block size with identical-executable control
         if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') && !contains(github.event.head_commit.message, '[tombstone-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/run.py residual-results/random --baseline --trials 24 --engine-control --case 1000000-128-5 --block-bytes 8192
@@ -111,7 +114,7 @@ jobs:
         run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py residual-results/snapshot-cpu --trials 24
       - name: Independently repeat deletion-heavy range flags
         if: ${{ contains(github.event.head_commit.message, '[tombstone-confirm]') }}
-        run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/tombstones --trials 24 --case tombstones-memory-512 --case tombstones-memory-2048 --case tombstones-sst-512 --case tombstones-sst-2048
+        run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/tombstones --fixed-executable --trials 24 --case tombstones-memory-512 --case tombstones-memory-2048 --case tombstones-sst-512 --case tombstones-sst-2048
       - name: Preserve every result and control
         if: always()
         uses: actions/upload-artifact@v4
