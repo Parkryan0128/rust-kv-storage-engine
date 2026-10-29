@@ -305,3 +305,7 @@ not guarantee a CPU model; inspect each artifact’s CPU metadata.
 snapshots with 32-operation durable batches. Normal engine and RocksDB timings
 are separate from the instrumented engine’s validate/lock/WAL/sync/apply phase
 report. Instrumented percentages locate costs; they are not speed scores.
+
+Use `[read-layout-latest] [baseline:<sha>]` for a single standard-runner
+repeat of the same path control. This requests `ubuntu-latest`, not a particular
+CPU; retain its machine metadata and do not pool different hosts.

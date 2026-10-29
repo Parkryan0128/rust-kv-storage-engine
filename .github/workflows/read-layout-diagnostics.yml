@@ -12,11 +12,11 @@ permissions:
   contents: read
 jobs:
   diagnose:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[read-layout-diag]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[read-layout-diag]') || contains(github.event.head_commit.message, '[read-layout-latest]')
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: ${{ contains(github.event.head_commit.message, '[read-layout-latest]') && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-22.04", "ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
