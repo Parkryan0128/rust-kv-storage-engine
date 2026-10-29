@@ -34,9 +34,14 @@ impl TableCursor {
     }
 
     pub fn advance(&mut self) -> Result<()> {
+        self.advance_for::<true>()
+    }
+
+    pub(crate) fn advance_for<const PREFIX: bool>(&mut self) -> Result<()> {
+        debug_assert!(PREFIX || !self.has_prefix_blocks());
         if let Some(block) = &mut self.block {
-            block.advance()?;
-            if block.current().is_some() {
+            block.advance_for::<PREFIX>()?;
+            if block.current_for::<PREFIX>().is_some() {
                 return Ok(());
             }
         }
@@ -46,7 +51,7 @@ impl TableCursor {
         }
         let (reusable, prefix_key) = BlockCursor::recycle(self.block.take());
         let block = self.table.read_stream_block(self.next_block, reusable)?;
-        self.block = Some(BlockCursor::new(block, 0, prefix_key)?);
+        self.block = Some(BlockCursor::new_for::<PREFIX>(block, 0, prefix_key)?);
         self.next_block += 1;
         Ok(())
     }
