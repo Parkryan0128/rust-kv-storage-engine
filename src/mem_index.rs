@@ -377,6 +377,30 @@ impl MemIndex {
     pub(crate) fn page_count(&self) -> usize {
         self.groups.iter().map(|group| group.pages.len()).sum()
     }
+    // Inclusive page span for a key interval, including insertion positions.
+    // Used only as a recovery locality estimate; it neither retains snapshots
+    // nor changes routing or the order in which records become visible.
+    pub(crate) fn page_span(&self, lower: &[u8], upper: &[u8]) -> usize {
+        if self.groups.is_empty() {
+            return 0;
+        }
+        debug_assert!(lower <= upper);
+        let first = self.group_for(lower, prefix(lower));
+        let last = self.group_for(upper, prefix(upper));
+        let begin = self.groups[first].page_for(lower, prefix(lower));
+        let end = self.groups[last].page_for(upper, prefix(upper));
+        if first == last {
+            end - begin + 1
+        } else {
+            self.groups[first].pages.len() - begin
+                + self.groups[first + 1..last]
+                    .iter()
+                    .map(|group| group.pages.len())
+                    .sum::<usize>()
+                + end
+                + 1
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -887,6 +911,57 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn replay_page_spans_match_complete_byte_order_across_groups() {
+        assert_eq!(MemIndex::default().page_span(b"", b"z"), 0);
+        for common_prefix in [false, true] {
+            let key = |n: u64| {
+                let mut bytes = if common_prefix {
+                    vec![42; 128]
+                } else {
+                    Vec::new()
+                };
+                bytes.extend_from_slice(&n.to_be_bytes());
+                bytes
+            };
+            let mut map = MemIndex::default();
+            for n in 0..17_000u64 {
+                map.insert(
+                    key(n * 2 + 2),
+                    Record {
+                        seq: n + 1,
+                        value: None,
+                    },
+                );
+            }
+            assert!(map.groups.len() > 1);
+            let starts: Vec<_> = map
+                .groups
+                .iter()
+                .flat_map(|g| &g.pages)
+                .map(|page| page.rows[0].clone())
+                .collect();
+            let mut probes = vec![Vec::new(), vec![255; 200]];
+            for n in [0, 1, 255, 256, 257, 16383, 16384, 16385, 16999, 17000] {
+                probes.push(key(n * 2 + 1));
+                probes.push(key(n * 2 + 2));
+            }
+            probes.sort();
+            probes.dedup();
+            for (i, lower) in probes.iter().enumerate() {
+                for upper in &probes[i..] {
+                    let begin = starts
+                        .partition_point(|k| k.as_ref() <= lower.as_slice())
+                        .saturating_sub(1);
+                    let end = starts
+                        .partition_point(|k| k.as_ref() <= upper.as_slice())
+                        .saturating_sub(1);
+                    assert_eq!(map.page_span(lower, upper), end - begin + 1);
+                }
+            }
+        }
     }
 
     #[test]

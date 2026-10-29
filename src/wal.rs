@@ -298,9 +298,28 @@ impl ReplayBuffer {
         }
         self.entries.push(entry);
         self.bytes += bytes;
-        if self.entries.len() == REPLAY_RECORDS || self.bytes >= REPLAY_BYTES {
+        if self.entries.len() == REPLAY_RECORDS
+            || self.bytes >= REPLAY_BYTES
+            || (self.entries.len() == REPLAY_STREAM_THRESHOLD && !self.needs_wider_window(table))
+        {
             self.flush(table);
         }
+    }
+    // A larger window only helps scattered writes that cannot share pages in
+    // the small chunk. Ordered and concentrated writes keep the original bound.
+    // This is a locality hint, not a promise about future keys or sequence order.
+    fn needs_wider_window(&self, table: &MemTable) -> bool {
+        let threshold = REPLAY_STREAM_THRESHOLD / 2;
+        if self.sorted || table.data.page_count() <= threshold {
+            return false;
+        }
+        let first = self.entries[0].0.as_slice();
+        let (mut lower, mut upper) = (first, first);
+        for (key, _) in &self.entries[1..] {
+            lower = lower.min(key.as_slice());
+            upper = upper.max(key.as_slice());
+        }
+        table.data.page_span(lower, upper) > threshold
     }
     fn flush(&mut self, table: &mut MemTable) {
         // Sorting sparse chunks across a large index rarely reuses a page.
