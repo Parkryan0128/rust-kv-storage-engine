@@ -116,6 +116,13 @@ def main():
             label = f"policy-{policy}-{label}"
             if args.cases and label in args.cases:
                 cases.append((label, mode, dict(config, rocks_cache_policy=policy), preparation))
+    # Optional prefix-frame guards retain the historical default matrix.
+    for block in [4096, 16384]:
+        for cache in [0, 8388608]:
+            label = f"prefix-disk-{block}-{cache}"
+            if args.cases and label in args.cases:
+                cases.append((label, "shaped-keys", dict(common, queries=50000,
+                    common_prefix=True, disk=True, block=block, cache=cache), None))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

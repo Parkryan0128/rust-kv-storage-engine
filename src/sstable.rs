@@ -1,7 +1,10 @@
 #[cfg(test)]
 use crate::cache::Cache;
 use crate::{
-    block::{indexed_records, BlockCursor, ReadBlock, SHARE_LARGE_VALUE_AT},
+    block::{
+        encode_prefix_frame, expand_prefix_frame, indexed_records, BlockCursor, ReadBlock,
+        SHARE_LARGE_VALUE_AT,
+    },
     bloom::Bloom,
     cache::{BlockCache, CacheKey, Counters},
     codec::*,
@@ -25,6 +28,7 @@ const LEGACY_MAGIC: &[u8; 8] = b"RKVSST01";
 const PAGED_MAGIC: &[u8; 8] = b"RKVSST02";
 const INDEXED_MAGIC: &[u8; 8] = b"RKVSST03";
 const MAGIC: &[u8; 8] = b"RKVSST04";
+const PREFIX_MAGIC: &[u8; 8] = b"RKVSST05";
 const LEGACY_FOOTER: usize = 24;
 const FOOTER: usize = 28;
 const INDEX_PAGE_TARGET: usize = 1024 * 1024;
@@ -59,6 +63,7 @@ pub(crate) struct Table {
     pub compaction_buffer_bytes: usize,
     cacheable: AtomicBool,
     indexed: bool,
+    expanded_frame_limit: Option<usize>,
     // Version 04 persists the maximum in checksummed metadata. Older files
     // learn it lazily after their last block is read, without eager data I/O.
     last_key: OnceLock<Vec<u8>>,
@@ -107,7 +112,7 @@ impl Table {
         }
         let magic = at(&file, 0, 8)?;
         let legacy = magic == LEGACY_MAGIC;
-        let indexed = magic == INDEXED_MAGIC || magic == MAGIC;
+        let indexed = magic == INDEXED_MAGIC || magic == MAGIC || magic == PREFIX_MAGIC;
         let footer_size = if legacy {
             LEGACY_FOOTER
         } else if indexed || magic == PAGED_MAGIC {
@@ -147,12 +152,21 @@ impl Table {
         let max_seq = c.u64()?;
         let bloom = Bloom::decode(&mut c)?;
         let n = if legacy { c.u32()? as u64 } else { c.u64()? };
-        let maximum = if magic == MAGIC {
+        let maximum = if magic == MAGIC || magic == PREFIX_MAGIC {
             let len = c.u32()? as usize;
             if len > MAX_RECORD - 17 {
                 return Err(corrupt("SST maximum key length"));
             }
             Some(c.take(len)?)
+        } else {
+            None
+        };
+        let expanded_frame_limit = if magic == PREFIX_MAGIC {
+            let limit = c.u32()? as usize;
+            if !(HEADER..=MAX_FRAME + HEADER).contains(&limit) {
+                return Err(corrupt("SST expanded frame limit"));
+            }
+            Some(limit)
         } else {
             None
         };
@@ -216,7 +230,12 @@ impl Table {
             frame.saturating_sub(HEADER) / 17 * std::mem::size_of::<u32>()
         };
         // A reused frame/index may retain up to twice the current requirement.
-        let compaction_buffer_bytes = (frame + offsets) * 2 + std::mem::size_of::<ReadBlock>();
+        if expanded_frame_limit.is_some_and(|limit| frame > limit) {
+            return Err(corrupt("SST encoded frame exceeds expanded limit"));
+        }
+        let compaction_buffer_bytes = (frame + offsets) * 2
+            + expanded_frame_limit.unwrap_or(0)
+            + std::mem::size_of::<ReadBlock>();
         Ok(Self {
             id,
             file,
@@ -228,6 +247,7 @@ impl Table {
             compaction_buffer_bytes,
             cacheable: AtomicBool::new(true),
             indexed,
+            expanded_frame_limit,
             last_key,
         })
     }
@@ -261,6 +281,11 @@ impl Table {
     fn decode(&self, n: usize, bytes: Vec<u8>, offsets: Vec<u32>) -> Result<ReadBlock> {
         let i = &self.index[n];
         let next = self.index.get(n + 1).map(|next| next.first.as_slice());
+        let bytes = if let Some(limit) = self.expanded_frame_limit {
+            expand_prefix_frame(bytes, limit)?
+        } else {
+            bytes
+        };
         let block = if self.indexed {
             let (block, fingerprint) = ReadBlock::decode_indexed(
                 bytes,
@@ -397,6 +422,7 @@ fn write_metadata(
     bloom: &Bloom,
     index: &[Index],
     maximum: Option<&[u8]>,
+    expanded_frame_limit: Option<usize>,
 ) -> Result<u64> {
     let mut page = vec![];
     put_u64(&mut page, count);
@@ -406,6 +432,9 @@ fn write_metadata(
     if let Some(maximum) = maximum {
         put_u32(&mut page, maximum.len() as u32);
         page.extend_from_slice(maximum);
+    }
+    if let Some(limit) = expanded_frame_limit {
+        put_u32(&mut page, limit as u32);
     }
     let mut bytes = write_frame(f, &page)?;
     page.clear();
@@ -957,7 +986,7 @@ mod tests {
         let mut bloom = Bloom::new(1, 10);
         bloom.insert(b"old");
         let offset = file.stream_position().unwrap();
-        let size = write_metadata(&mut file, 1, 1, &bloom, &index, None).unwrap();
+        let size = write_metadata(&mut file, 1, 1, &bloom, &index, None, None).unwrap();
         let mut footer = PAGED_MAGIC.to_vec();
         put_u64(&mut footer, offset);
         put_u64(&mut footer, size);

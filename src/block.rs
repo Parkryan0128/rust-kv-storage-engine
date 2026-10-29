@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 pub(crate) const SHARE_LARGE_VALUE_AT: usize = 64 * 1024;
 const MAX_SHARED_OVERHEAD: usize = 256;
+#[path = "prefix_block.rs"]
+mod prefix_block;
+pub(crate) use prefix_block::{encode_prefix_frame, expand_prefix_frame};
 
 // The frame and offsets stay immutable after validation. Small values are
 // copied out; a lone large value may share its block with bounded overhead.

@@ -23,6 +23,9 @@ pub(crate) struct TableWriter {
     max_seq: u64,
     block_size: usize,
     small_blocks: usize,
+    prefix_block: Vec<u8>,
+    prefix_encoded: bool,
+    expanded_frame_limit: usize,
 }
 
 impl TableWriter {
@@ -55,6 +58,9 @@ impl TableWriter {
             max_seq: 0,
             block_size,
             small_blocks: 0,
+            prefix_block: Vec::new(),
+            prefix_encoded: false,
+            expanded_frame_limit: 0,
         })
     }
 
@@ -113,18 +119,32 @@ impl TableWriter {
             put_u32(&mut self.block, offset);
         }
         put_u32(&mut self.block, self.offsets.len() as u32);
-        let header = frame_header(&self.block[HEADER..])?;
-        self.block[..HEADER].copy_from_slice(&header);
-        // Coalesce small frames without changing their on-disk boundaries.
-        // Position counts buffered bytes too; pread never changes it.
-        self.file.write_all(&self.block)?;
+        self.expanded_frame_limit = self.expanded_frame_limit.max(self.block.len());
+        let compressed = encode_prefix_frame(
+            &self.block,
+            &self.first,
+            &self.block[self.last_key.as_ref().unwrap().clone()],
+            &mut self.offsets,
+            &mut self.prefix_block,
+        )?;
+        let published = if compressed {
+            self.prefix_encoded = true;
+            &self.prefix_block
+        } else {
+            let header = frame_header(&self.block[HEADER..])?;
+            self.block[..HEADER].copy_from_slice(&header);
+            &self.block
+        };
+        // Coalesce frames while retaining the same logical block boundaries.
+        self.file.write_all(published)?;
+        let published_len = published.len();
         self.index.push(Index {
             first: std::mem::take(&mut self.first),
             offset: self.position,
-            len: self.block.len() as u32,
+            len: published_len as u32,
             validated: AtomicU64::new(0),
         });
-        self.position += self.block.len() as u64;
+        self.position += published_len as u64;
         // A large record should not pin scratch space for the rest of a long merge.
         // Consecutive large records keep their reusable buffer.
         let target = self.block_size.max(4096);
@@ -137,6 +157,11 @@ impl TableWriter {
         if self.small_blocks >= 4 {
             self.block.shrink_to(target);
             self.small_blocks = 0;
+        }
+        // Prefix scratch is bounded too; isolated oversized blocks must not
+        // retain it for the rest of a long publication.
+        if !compressed || self.prefix_block.capacity() > target.saturating_mul(4) {
+            self.prefix_block = Vec::new();
         }
         self.offsets.clear();
         self.last_key = None;
@@ -166,6 +191,12 @@ impl TableWriter {
                     self.file
                         .get_ref()
                         .read_exact_at(&mut self.block, i.offset)?;
+                    if self.prefix_encoded {
+                        self.block = expand_prefix_frame(
+                            std::mem::take(&mut self.block),
+                            self.expanded_frame_limit,
+                        )?;
+                    }
                     let mut c = Cursor {
                         b: indexed_records(frame_payload(&self.block)?)?,
                     };
@@ -184,9 +215,15 @@ impl TableWriter {
             &self.bloom,
             &self.index,
             Some(last_key.get().map_or(&[], Vec::as_slice)),
+            self.prefix_encoded.then_some(self.expanded_frame_limit),
         )?;
         let mut footer = Vec::new();
-        footer.extend(MAGIC);
+        let magic = if self.prefix_encoded {
+            PREFIX_MAGIC
+        } else {
+            MAGIC
+        };
+        footer.extend(magic);
         put_u64(&mut footer, self.position);
         put_u64(&mut footer, meta_len);
         let checksum = crc32fast::hash(&footer);
@@ -194,6 +231,9 @@ impl TableWriter {
         self.file.write_all(&footer)?;
         // Propagate buffered write errors before syncing or publishing the SST.
         self.file.flush()?;
+        if self.prefix_encoded {
+            self.file.get_ref().write_all_at(PREFIX_MAGIC, 0)?;
+        }
         fault::hit("sst_before_sync")?;
         self.file.get_ref().sync_all()?;
         fault::hit("sst_after_sync")?;
@@ -213,9 +253,16 @@ impl TableWriter {
             count: self.count,
             max_seq: self.max_seq,
             file_bytes: self.position + meta_len + FOOTER as u64,
-            compaction_buffer_bytes: frame * 2 + std::mem::size_of::<ReadBlock>(),
+            compaction_buffer_bytes: frame * 2
+                + if self.prefix_encoded {
+                    self.expanded_frame_limit
+                } else {
+                    0
+                }
+                + std::mem::size_of::<ReadBlock>(),
             cacheable: AtomicBool::new(true),
             indexed: true,
+            expanded_frame_limit: self.prefix_encoded.then_some(self.expanded_frame_limit),
             last_key,
         })
     }
@@ -224,6 +271,7 @@ impl TableWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn alternating_large_and_small_output_preserves_records_and_reclaims_scratch() {
@@ -292,6 +340,79 @@ mod tests {
             cursor.advance().unwrap();
         }
         assert!(cursor.current().is_none());
+    }
+
+    #[test]
+    fn prefix_tables_reopen_rebuild_bloom_and_mix_plain_blocks() {
+        for retain_hashes in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prefix.sst");
+            // Overestimate enough to exercise both retained-hash and readback
+            // Bloom rebuilding after prefix frames have been written.
+            let mut writer = TableWriter::new(&path, 100_000, 4096, 10, retain_hashes).unwrap();
+            let mut expected = Vec::new();
+            for n in 0..300u64 {
+                let mut key = vec![b'x'; 128];
+                key.extend_from_slice(&n.to_be_bytes());
+                let value = (n % 7 != 0).then(|| vec![n as u8; n as usize % 31]);
+                writer.push(&key, n + 1, value.as_deref()).unwrap();
+                expected.push((
+                    key,
+                    Record {
+                        seq: n + 1,
+                        value: value.map(Bytes::from),
+                    },
+                ));
+            }
+            // A lone large value and unrelated short keys retain plain frames.
+            writer.push(b"y", 1000, Some(&vec![9; 64 * 1024])).unwrap();
+            expected.push((
+                b"y".to_vec(),
+                Record {
+                    seq: 1000,
+                    value: Some(Bytes::from(vec![9; 64 * 1024])),
+                },
+            ));
+            writer.push(b"z", 1001, Some(&[])).unwrap();
+            expected.push((
+                b"z".to_vec(),
+                Record {
+                    seq: 1001,
+                    value: Some(Bytes::new()),
+                },
+            ));
+            let published = writer.finish(&path, 1, 10).unwrap();
+            assert_eq!(&fs::read(&path).unwrap()[..8], PREFIX_MAGIC);
+            let reopened = Table::open(&path, 1).unwrap();
+            assert_eq!(
+                published.compaction_buffer_bytes,
+                reopened.compaction_buffer_bytes
+            );
+            assert_eq!(
+                published.expanded_frame_limit,
+                reopened.expanded_frame_limit
+            );
+            for table in [published, reopened] {
+                for capacity in [0, 8192, 1024 * 1024] {
+                    let cache = BlockCache::new(capacity);
+                    let counters = Counters::default();
+                    for (key, record) in expected.iter().rev() {
+                        assert_eq!(
+                            table.get(key, &cache, &counters).unwrap(),
+                            Some(record.clone())
+                        );
+                    }
+                }
+                let mut cursor = TableCursor::new(Arc::new(table)).unwrap();
+                for (key, record) in &expected {
+                    let got = cursor.current().unwrap();
+                    assert_eq!(got.key, key);
+                    assert_eq!(got.to_owned(), *record);
+                    cursor.advance().unwrap();
+                }
+                assert!(cursor.current().is_none());
+            }
+        }
     }
 
     #[test]

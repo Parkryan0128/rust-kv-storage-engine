@@ -304,3 +304,31 @@ SizeTiered applies the threshold per size group; Full counts all live files. The
 Use a local filesystem that supports file/directory sync and atomic rename. Network filesystems are unsupported, and physical power loss has not been tested. Keep `LOCK` in place while the database is open, and do not use inherited engine handles after `fork()`.
 
 `stats()` reports memory, files, reads, cache hits, and compaction. Byte counters track engine files, not physical device I/O. Cumulative counters reset on reopen; `sst_bytes` shows current live SST bytes. Statistics are not an atomic snapshot.
+
+
+## Optional prefix blocks (version 05)
+
+Tables containing a prefix-encoded block use `RKVSST05`; tables without one
+retain the exact version 04 layout. Versions 01–04 remain readable. Older
+engines reject version 05 by its magic, so opening a newly rewritten prefix
+table requires a reader supporting version 05.
+
+The version 05 summary extends version 04 with a u32 maximum expanded framed
+block length, bounded by 64 MiB plus the 12-byte frame header. This also bounds
+compaction input memory. Version 05 may mix ordinary indexed blocks and prefix
+blocks. A set high bit in the final u32 record count identifies a prefix block;
+ordinary blocks retain their existing count and bytes.
+
+A prefix block payload contains expanded payload length u32, common-prefix
+length u32, prefix bytes, records with suffix-only keys using the existing
+17-byte record header, one u32 offset per record relative to the suffix-record
+region, and the tagged record count. The entire encoded payload is checksummed.
+The reader validates expansion length, directory, full record limits and CRC,
+expands once, then applies normal ordering, sequence and table-bound checks.
+Cached reads use the existing full-key block representation.
+
+The writer uses this representation only with at least two records, a first
+key of at least 32 bytes, a common prefix of at least 16 bytes, and at least
+12.5% payload savings. Prefix sharing reduces storage and write traffic; it
+does add reconstruction work on a cache miss. It is not general value
+compression and does not change WAL durability or logical block boundaries.
