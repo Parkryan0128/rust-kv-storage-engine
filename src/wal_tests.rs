@@ -565,3 +565,43 @@ fn replay_order_sample_does_not_assume_the_entire_batch_is_sorted() {
         );
     }
 }
+
+#[test]
+fn sparse_replay_chunks_keep_latest_values_and_accounting_without_sorting() {
+    let mut table = MemTable::default();
+    let mut model = std::collections::BTreeMap::new();
+    for key in 0..33_000u64 {
+        let bytes = key.to_be_bytes().to_vec();
+        let record = single(b"initial", key + 1);
+        table.insert(bytes.clone(), record.clone());
+        model.insert(bytes, record);
+    }
+    assert!(table.data.page_count() > REPLAY_RECORDS / 2);
+    let mut pending = ReplayBuffer::default();
+    for n in 0..1025u64 {
+        let key = ((n * 7919) % 997).to_be_bytes().to_vec();
+        let record = Record {
+            seq: 33_001 + n,
+            value: (n % 7 != 0).then(|| Bytes::from(vec![n as u8; (n % 71) as usize])),
+        };
+        model.insert(key.clone(), record.clone());
+        pending.push((key, record), &mut table);
+        if n == 254 {
+            assert!(!pending.sorted);
+            assert!(pending.entries.len() / 2 < table.data.page_count());
+        }
+    }
+    pending.flush(&mut table);
+    assert_eq!(
+        table
+            .data
+            .iter()
+            .map(|(k, r)| (k.to_vec(), r.clone()))
+            .collect::<Vec<_>>(),
+        model.clone().into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        table.bytes,
+        model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+    );
+}

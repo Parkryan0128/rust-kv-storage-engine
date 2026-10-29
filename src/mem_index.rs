@@ -374,6 +374,9 @@ impl MemIndex {
     pub fn len(&self) -> usize {
         self.len
     }
+    pub(crate) fn page_count(&self) -> usize {
+        self.groups.iter().map(|group| group.pages.len()).sum()
+    }
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

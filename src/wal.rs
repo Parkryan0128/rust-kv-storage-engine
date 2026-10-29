@@ -298,7 +298,10 @@ impl ReplayBuffer {
         }
     }
     fn flush(&mut self, table: &mut MemTable) {
-        if !self.sorted {
+        // Sorting sparse chunks across a large index rarely reuses a page.
+        // Require at least two staged records per existing page on average;
+        // otherwise retain WAL order and avoid paying for a full chunk sort.
+        if !self.sorted && self.entries.len() / 2 >= table.data.page_count() {
             // Recovery state is unpublished. Group nearby keys to amortize
             // page ownership and shifts; sequence breaks ties so the newest
             // duplicate/tombstone still wins. Chunks are applied in WAL order.
