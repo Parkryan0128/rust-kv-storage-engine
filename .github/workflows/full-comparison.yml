@@ -93,6 +93,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 12
         run: python3 benchmarks/rocksdb-compare/bounds.py full-results/bounds
+      - name: Repeated first traces with fresh handles
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 12
+        run: python3 benchmarks/rocksdb-compare/workloads.py full-results/reopened --baseline --reads-only --profile 0 --scenario scan-t1-span32 --trials 12 --reopens 32
       - name: Durable write sizes and flush pressure
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 12

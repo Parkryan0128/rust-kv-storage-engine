@@ -123,7 +123,12 @@ impl Sources {
             (None, None) => Self::Empty,
             (Some(one), None) => Self::One(one),
             (Some(first), Some(second)) => {
-                let mut many = vec![first, second];
+                // The remaining memory iterators have an exact lower bound.
+                // Reserve them up front to avoid reallocating the directory
+                // whenever a scan merges active and frozen memtables.
+                let mut many = Vec::with_capacity(2 + sources.size_hint().0);
+                many.push(first);
+                many.push(second);
                 many.extend(sources);
                 Self::Many(many)
             }
