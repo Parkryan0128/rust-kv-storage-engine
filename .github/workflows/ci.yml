@@ -32,6 +32,15 @@ jobs:
           cargo bench --locked --bench engine -- mixed_half_sync_write --test
       - run: cargo build --locked --release --example demo
       - run: python3 scripts/test_demo.py
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate benchmark runners and fixture restoration
+        run: |
+          python3 -m compileall -q benchmarks/rocksdb-compare
+          python3 -m unittest discover -s benchmarks/rocksdb-compare -p 'test_*.py'
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 10

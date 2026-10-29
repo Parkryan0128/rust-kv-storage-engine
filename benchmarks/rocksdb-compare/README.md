@@ -32,9 +32,10 @@ Cases: 100,000 keys / 128-byte values / one SST; 1,000,000 keys / 128-byte value
 five SSTs; and 100,000 keys / 1,024-byte values / five SSTs. Keys are eight-byte
 big-endian integers; values encode the key and a known fill pattern.
 
-Each case/block-size combination runs six trials. Block-size order rotates so each
-occupies every position twice; backend order alternates, three times each. Seeds change between trials
-and match between backends and block sizes. Each
+By default, each case/block-size combination runs six trials. Backend and block-size
+orders rotate; seeds change between trials and match across backends and block sizes.
+The full comparison uses twelve trials and four participants (baseline, current,
+identical-current control and RocksDB), balancing all backend/block-size positions. Each
 fresh process makes two identical seeded passes of 500,000 random successful
 Get calls, validating the entire returned value every time. No sequential Get
 pass is performed. The first pass starts with a fresh block cache; the second
@@ -77,15 +78,16 @@ memory is not reported because fixtures/page-cache pages were allocated outside
 the measured child process.
 
 This fixed-layout, OS-cache-warm, single-client hit workload differs from the
-previous organically generated write/compaction workload. The old baseline was
-removed because it cannot read version 03 fixtures; do not directly subtract old
-benchmark numbers. Results do not establish cold-device, concurrent, missing-key,
+previous organically generated write/compaction workload. Earlier baselines that could not read newer shared fixtures were removed from
+old runs. The current `--baseline` mode generates native fixtures separately for
+each revision. Do not directly subtract historical benchmark numbers. These random
+read results do not establish cold-device, concurrent, missing-key,
 write, range-scan or durability performance. Earlier runs used RocksDB pinned Get; the engine
 returns independently owned values.
 
 Before measured trials, a separate ignored test samples 10,000 random uncached
 blocks for each library fixture. It times positional file reads,
-CRC/validation, and lookup/value copying. Version 03 fully validates the first
+CRC/validation, and lookup/value copying. The indexed block format fully validates the first
 touch of each block and reuses validation fingerprints on later matching CRCs;
 the fingerprint starts empty in every measured process. This is not a full-record
 parse on every miss, and the persisted directory is included in file/cache bytes.
@@ -103,8 +105,8 @@ RSS and SST bytes rather than reporting only the fastest configuration.
 ## Paired workload and audit suite
 
 The separate write-comparison workflow builds the same workloads harness
-against the selected baseline, current engine and RocksDB. Unlike the older
-random-read runner above, this suite returns owned values on all backends.
+against the selected baseline, current engine and RocksDB. Both this suite and
+the current random-read runner return independently owned values on all backends.
 Paired durable batch cases now use at least 1,024 commits and an explicit 64 MiB
 memtable budget; flush pressure remains a separate case. These larger cases
 must not be compared directly to historical 32-commit / 4 MiB measurements.
@@ -331,3 +333,25 @@ machine-code defect. Preserve older raw measurements, but do not attribute that
 native-path difference to a source optimization or compare absolute timings
 across the two methodologies. The explicit layout diagnostic retains its native
 paths so the issue remains reproducible.
+
+
+### Complete result validation
+
+The full workflow validates every expected public condition, trial pairing,
+revision, environment file and fixed measurement-path label before publishing
+its summary. It also verifies that the random-read control uses the identical
+current executable. All 263 conditions, including slower results, are exported
+to `all-public-conditions.csv` with absolute medians, paired speed ratios,
+bootstrap intervals, process peak RSS, SST bytes and exact revisions. Internal
+profiles remain separate from the public rankings.
+
+To summarize a downloaded complete artifact:
+
+```sh
+python3 benchmarks/rocksdb-compare/summarize_full.py ARTIFACT_DIR CURRENT_SHA BASELINE_SHA --fixed-paths
+python3 benchmarks/rocksdb-compare/export_results.py ARTIFACT_DIR/comparison-summary.json ARTIFACT_DIR/all-public-conditions.csv
+```
+
+Omit `--fixed-paths` only when inspecting a historical native-path artifact; the
+CSV explicitly labels that methodology. Missing data or a mismatched revision
+fails validation instead of silently generating an incomplete comparison.

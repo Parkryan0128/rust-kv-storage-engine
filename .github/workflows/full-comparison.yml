@@ -143,6 +143,10 @@ jobs:
           cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
           cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline-profile
           python3 benchmarks/rocksdb-compare/audit.py full-results/audit
+      - name: Validate and summarize all public comparisons
+        run: |
+          python3 benchmarks/rocksdb-compare/summarize_full.py full-results "${{ github.sha }}" "${{ steps.baseline.outputs.ref }}" --fixed-paths
+          python3 benchmarks/rocksdb-compare/export_results.py full-results/comparison-summary.json full-results/all-public-conditions.csv
       - name: Preserve raw measurements and exact harness
         if: always()
         uses: actions/upload-artifact@v4
