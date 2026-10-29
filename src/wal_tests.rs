@@ -406,7 +406,13 @@ fn mixed_small_batch_replay_preserves_duplicates_tombstones_and_torn_atomic_tail
             previous_seq = seq;
             prefix = bytes.len();
         }
-        let count = [1, 1, 3, 255, 256][frame % 5];
+        // Cross both the coalesced 256-record boundary and streaming 257.
+        // Keep the final torn frame at the exact coalescing boundary.
+        let count = if frame == 24 {
+            256
+        } else {
+            [1, 1, 3, 255, 257][frame % 5]
+        };
         let mut body = Vec::new();
         if frame % 5 != 0 {
             put_u64(&mut body, 0);
