@@ -287,3 +287,7 @@ impl ReplayBuffer {
         self.sorted = true;
     }
 }
+
+#[cfg(test)]
+#[path = "wal_profile.rs"]
+mod profile;
