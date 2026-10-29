@@ -36,6 +36,7 @@ struct Config {
     workload: String,
     throughput: bool,
     wal_pattern: String,
+    wal_individual: bool,
 }
 impl Config {
     fn parse(v: &Value) -> Self {
@@ -60,6 +61,7 @@ impl Config {
             throughput: v["throughput"].as_bool().unwrap_or(false),
             workload: v["workload"].as_str().unwrap_or("uniform").to_owned(),
             wal_pattern: v["wal_pattern"].as_str().unwrap_or("sorted").to_owned(),
+            wal_individual: v["wal_individual"].as_bool().unwrap_or(false),
         };
         assert!(c.keys > 0 && c.keys < u64::MAX / 2 && c.value >= 9 && c.value <= 4 * 1024 * 1024);
         assert!(
@@ -75,6 +77,7 @@ impl Config {
             c.wal_pattern.as_str(),
             "sorted" | "random" | "overwrite"
         ));
+        assert!(!c.wal_individual || c.batch == 1);
         assert!((1..=16).contains(&c.generations));
         assert!((8..=1024).contains(&c.merge_key_bytes));
         c
@@ -637,13 +640,19 @@ fn prepare_wal(path: &Path, c: &Config) -> Result<()> {
         }
     }
     let mut entries = Vec::new();
-    for i in order {
-        let i = if c.wal_pattern == "overwrite" {
-            i % (c.keys / 10).max(1)
+    for operation in order {
+        let (i, generation) = if c.wal_pattern == "overwrite" {
+            let distinct = (c.keys / 10).max(1);
+            (operation % distinct, (operation / distinct) as u8)
         } else {
-            i
+            (operation, 0)
         };
-        entries.push((key(i).to_vec(), Some(value(i, 0, c.value))));
+        let value = value(i, generation, c.value);
+        if c.wal_individual {
+            db.put(&key(i), &value)?;
+            continue;
+        }
+        entries.push((key(i).to_vec(), Some(value)));
         if entries.len() == c.batch {
             db.batch(&entries)?;
             entries.clear();
@@ -652,9 +661,15 @@ fn prepare_wal(path: &Path, c: &Config) -> Result<()> {
     if !entries.is_empty() {
         db.batch(&entries)?;
     }
+    let stats = db.stats()?;
+    assert_eq!(
+        stats["sst_files"].as_u64(),
+        Some(0),
+        "WAL fixture must not flush"
+    );
     println!(
         "WORKLOAD_PREPARED {}",
-        json!({"stats":db.stats()?,"metrics":metrics(path)?})
+        json!({"stats":stats,"metrics":metrics(path)?})
     );
     println!("WORKLOAD_VERIFIED");
     std::io::stdout().flush()?;
@@ -679,9 +694,14 @@ fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         c.keys
     };
     for i in 0..distinct {
+        let generation = if c.wal_pattern == "overwrite" {
+            ((c.keys - 1 - i) / distinct) as u8
+        } else {
+            0
+        };
         assert_eq!(
             db.get(&key(i))?.as_deref(),
-            Some(value(i, 0, c.value).as_slice())
+            Some(value(i, generation, c.value).as_slice())
         );
     }
     db.put(b"after-recovery", b"appended")?;

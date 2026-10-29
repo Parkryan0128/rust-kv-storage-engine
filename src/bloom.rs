@@ -3,6 +3,9 @@ use crate::{codec::*, error::corrupt, Result};
 pub(crate) struct Bloom {
     bits: Vec<u8>,
     probes: u32,
+    // Reciprocal is runtime-only; persisted positions still use h % bit_count.
+    bit_count: u64,
+    reciprocal: u64,
 }
 // Bloom format depends on this hash; bump the version if it changes.
 const HASH_SEED: u64 = 0xcbf29ce484222325;
@@ -85,9 +88,13 @@ fn delta(hash: u64) -> u64 {
 }
 impl Bloom {
     pub fn new(count: u64, bits_per_key: usize) -> Self {
+        let len = Self::byte_len(count, bits_per_key);
+        let bit_count = len as u64 * 8;
         Self {
-            bits: vec![0; Self::byte_len(count, bits_per_key)],
+            bits: vec![0; len],
             probes: ((bits_per_key as f64 * 0.69) as u32).clamp(1, 20),
+            bit_count,
+            reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
         }
     }
     fn byte_len(count: u64, bits_per_key: usize) -> usize {
@@ -103,9 +110,8 @@ impl Bloom {
     }
     pub fn insert_hash(&mut self, mut h: u64) {
         let delta = delta(h);
-        let n = self.bits.len() as u64 * 8;
         for _ in 0..self.probes {
-            let bit = (h % n) as usize;
+            let bit = self.bit_position(h);
             self.bits[bit / 8] |= 1 << (bit % 8);
             h = h.wrapping_add(delta);
         }
@@ -116,15 +122,27 @@ impl Bloom {
     }
     pub fn contains_hash(&self, mut h: u64) -> bool {
         let delta = delta(h);
-        let n = self.bits.len() as u64 * 8;
         for _ in 0..self.probes {
-            let bit = (h % n) as usize;
+            let bit = self.bit_position(h);
             if self.bits[bit / 8] & (1 << (bit % 8)) == 0 {
                 return false;
             }
             h = h.wrapping_add(delta);
         }
         true
+    }
+    #[inline]
+    fn bit_position(&self, hash: u64) -> usize {
+        // floor(2^64 / n) gives a quotient at most one below floor(hash / n).
+        // Thus the subtraction cannot overflow, and one correction is exact.
+        // n is in 64..=2^26, so the reciprocal always fits in u64.
+        let quotient = ((u128::from(hash) * u128::from(self.reciprocal)) >> 64) as u64;
+        let remainder = hash - quotient * self.bit_count;
+        (if remainder >= self.bit_count {
+            remainder - self.bit_count
+        } else {
+            remainder
+        }) as usize
     }
     pub fn encode(&self, out: &mut Vec<u8>) {
         put_u32(out, self.probes);
@@ -137,15 +155,82 @@ impl Bloom {
         if !(1..=20).contains(&probes) || !(8..=8 * 1024 * 1024).contains(&len) {
             return Err(corrupt("invalid Bloom filter"));
         }
+        let bit_count = len as u64 * 8;
         Ok(Self {
             bits: c.take(len)?.to_vec(),
             probes,
+            bit_count,
+            reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
         })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reciprocal_positions_match_remainder_and_persisted_filter_bytes() {
+        let mut state = 0xace123u64;
+        for bytes in [
+            8usize, 9, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1000, 125000, 8388607, 8388608,
+        ] {
+            let bit_count = bytes as u64 * 8;
+            // Avoid allocating the largest bitsets just to check the arithmetic.
+            let bloom = Bloom {
+                bits: Vec::new(),
+                probes: 6,
+                bit_count,
+                reciprocal: u64::MAX / bit_count + u64::from(bit_count.is_power_of_two()),
+            };
+            for hash in [
+                0,
+                1,
+                bit_count - 1,
+                bit_count,
+                bit_count + 1,
+                u64::MAX / 2,
+                u64::MAX - 1,
+                u64::MAX,
+            ] {
+                assert_eq!(bloom.bit_position(hash) as u64, hash % bit_count);
+            }
+            for _ in 0..10_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                assert_eq!(bloom.bit_position(state) as u64, state % bit_count);
+            }
+        }
+        for count in [0, 1, 7, 17, 63, 64, 65, 1000, 10001] {
+            for probes in [1, 6, 20] {
+                let mut bloom = Bloom::new(count, 10);
+                bloom.probes = probes;
+                let mut reference = vec![0u8; bloom.bits.len()];
+                for key in 0..512u64 {
+                    let hash = hash(&key.to_be_bytes());
+                    bloom.insert_hash(hash);
+                    let delta = delta(hash);
+                    let mut h = hash;
+                    for _ in 0..probes {
+                        let bit = (h % (reference.len() as u64 * 8)) as usize;
+                        reference[bit / 8] |= 1 << (bit % 8);
+                        h = h.wrapping_add(delta);
+                    }
+                }
+                assert_eq!(bloom.bits, reference);
+                let mut encoded = Vec::new();
+                bloom.encode(&mut encoded);
+                let decoded = Bloom::decode(&mut Cursor { b: &encoded }).unwrap();
+                for key in 0..1024u64 {
+                    let h = hash(&key.to_be_bytes());
+                    assert_eq!(decoded.contains_hash(h), bloom.contains_hash(h));
+                    if key < 512 {
+                        assert!(decoded.contains_hash(h));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn prefix_hash_preserves_format_across_lengths_prefix_changes_and_binary_keys() {
         // Independent reference for the original persisted hash algorithm.

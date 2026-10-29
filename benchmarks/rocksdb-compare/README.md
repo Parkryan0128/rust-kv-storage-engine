@@ -195,3 +195,9 @@ complete logical checks after compact and reopen remain mandatory.
 The recovery guards include single-operation WriteBatch frames, random key order, overwrites, and 256-operation frames. Small validated WAL frames share a bounded replay buffer (256 records / 64 KiB logical charge), sorted by key and sequence only when the input is not already ordered. Large batches still stream directly. This affects unpublished recovery state only; live writes and WAL commit order are unchanged.
 
 The memory-page optimization keeps key ownership directly in each page, alongside the independent value base, so normal lookup/routing does not traverse the value base to reach keys. Production overwrites return only the prior payload charge; they do not clone an old shared value solely for accounting. The internal volatile-write profiles guard both snapshot-retained and ordinary writes.
+
+Recovery coverage distinguishes a single operation in `write_batch` from the
+public `put` WAL frame. The regression loop also replays 100,000 shuffled keys
+written with individual puts and 32-operation batches. Fixtures assert that no
+SST was flushed before the simulated process exit, and overwrite values carry
+a generation byte so recovery must return the latest operation, not any version.
