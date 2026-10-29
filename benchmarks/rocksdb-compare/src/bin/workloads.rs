@@ -140,6 +140,20 @@ fn metrics(path: &Path) -> Result<Value> {
         }
         Ok(size)
     }
+    // comm may contain spaces or parentheses; numeric fields follow its last ')'.
+    // proc_pid_stat(5): minflt=10, majflt=12; suffix begins at field 3.
+    let proc_stat = fs::read_to_string("/proc/self/stat")?;
+    let stat_fields: Vec<_> = proc_stat
+        .rsplit_once(')')
+        .ok_or("invalid /proc/self/stat")?
+        .1
+        .split_whitespace()
+        .collect();
+    let stat_number = |field: usize| {
+        stat_fields
+            .get(field - 3)
+            .and_then(|v| v.parse::<u64>().ok())
+    };
     let (logical, allocated) = disk(path)?;
     let io = fs::read_to_string("/proc/self/io")?;
     let number = |label| {
@@ -149,7 +163,7 @@ fn metrics(path: &Path) -> Result<Value> {
         })
     };
     Ok(
-        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:"),"write_syscalls":number("syscw:"),"read_syscalls":number("syscr:"),"voluntary_switches":kb("voluntary_ctxt_switches:"),"involuntary_switches":kb("nonvoluntary_ctxt_switches:")}),
+        json!({"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"directory_bytes":logical,"allocated_bytes":allocated,"read_bytes":number("read_bytes:"),"write_bytes":number("write_bytes:"),"rchar":number("rchar:"),"wchar":number("wchar:"),"write_syscalls":number("syscw:"),"read_syscalls":number("syscr:"),"minor_faults":stat_number(10),"major_faults":stat_number(12),"voluntary_switches":kb("voluntary_ctxt_switches:"),"involuntary_switches":kb("nonvoluntary_ctxt_switches:")}),
     )
 }
 fn distribution(samples: &mut [u64]) -> Value {
@@ -812,10 +826,42 @@ fn memory_scan(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     );
     Ok(())
 }
+fn memory_get_throughput(db: &Backend, path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    let before = metrics(path)?;
+    let mut rng = c.seed;
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let k = random(&mut rng) % c.keys;
+        black_box(db.get(&key(k))?.expect("memory value"));
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let after = metrics(path)?;
+    let stats = db.stats()?;
+    // Validate the exact same seeded trace, outside the throughput timer.
+    let mut rng = c.seed;
+    for _ in 0..c.queries {
+        let k = random(&mut rng) % c.keys;
+        assert_eq!(
+            db.get(&key(k))?.as_deref(),
+            Some(value(k, 0, c.value).as_slice())
+        );
+    }
+    report(
+        "memory-get",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"before":before,"after":after,
+        "stats":stats,"verification_timed":false}),
+    );
+    Ok(())
+}
 fn memory_get(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     assert!(!path.exists() && !c.churn && c.threads == 1);
     let db = Backend::open(path, c)?;
     populate_memory(&db, c)?;
+    if c.throughput {
+        return memory_get_throughput(&db, path, c, raw);
+    }
     let before = metrics(path)?;
     let mut rng = c.seed;
     let start = Instant::now();

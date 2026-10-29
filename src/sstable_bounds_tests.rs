@@ -206,3 +206,45 @@ fn version_three_learns_bounds_lazily_and_merges_with_version_four() {
         assert_eq!(&fs::read(entry.unwrap().path()).unwrap()[..8], MAGIC);
     }
 }
+
+#[test]
+fn version_three_scan_bounds_work_before_maximum_is_known() {
+    use crate::scan::KeyRange;
+    let dir = tempfile::tempdir().unwrap();
+    let keys = [b"a".as_slice(), b"b", b"c", b"d", b"e"];
+    for block in [64, 4096] {
+        let path = dir.path().join(format!("{block}.sst"));
+        drop(table(&path, &keys, block));
+        rewrite_summary(&path, INDEXED_MAGIC, |summary| {
+            summary.truncate(maximum_offset(summary));
+        });
+        for end in [b"".as_slice(), b"a", b"bb", b"d", b"e", b"z"] {
+            for included in [false, true] {
+                let table = Arc::new(Table::open(&path, 2).unwrap());
+                assert!(table.last_key.get().is_none());
+                let range = if included {
+                    KeyRange::new(..=end).unwrap()
+                } else {
+                    KeyRange::new(..end).unwrap()
+                };
+                let mut scan = table.scan(Arc::new(range));
+                let counters = Counters::default();
+                let mut rows = Vec::new();
+                while let Some(key) = scan.advance(&counters, |r| r.key.to_vec()).unwrap() {
+                    rows.push(key);
+                }
+                let expected: Vec<_> = keys
+                    .iter()
+                    .copied()
+                    .filter(|key| if included { *key <= end } else { *key < end })
+                    .map(<[u8]>::to_vec)
+                    .collect();
+                assert_eq!(
+                    rows, expected,
+                    "block={block}, end={end:?}, included={included}"
+                );
+                assert!(scan.advance(&counters, |_| ()).unwrap().is_none());
+            }
+        }
+    }
+}

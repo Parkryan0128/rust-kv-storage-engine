@@ -68,6 +68,10 @@ def main():
             ("memory-get20k", "memory-get", dict(common, queries=200000), None),
             ("memory-get100k", "memory-get", dict(common, keys=100000, queries=200000), None),
         ])
+    # Opt-in memory Get throughput separates validation from the timed API loop.
+    for keys, label in [(20000, "memory-get20k-throughput"), (100000, "memory-get100k-throughput")]:
+        if args.cases and label in args.cases:
+            cases.append((label, "memory-get", dict(common, keys=keys, queries=2000000, throughput=True), None))
     # Opt-in guard: 100k live keys followed by 100k writes to a shuffled 1k-key hotspot.
     # Keep historical default matrices unchanged.
     if args.cases and "wal-large-hotspot" in args.cases:
