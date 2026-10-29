@@ -327,7 +327,7 @@ impl Table {
         if cache.is_disabled() {
             counters.reads.fetch_add(1, Ordering::Relaxed);
             let block = self.read_stream_block(n, None)?;
-            return if block.frame_capacity() >= SHARE_LARGE_VALUE_AT {
+            return if block.frame_capacity() >= SHARE_LARGE_VALUE_AT && block.record_count() == 1 {
                 Arc::new(block).lookup_shared_large(key)
             } else {
                 block.lookup(key)
@@ -370,7 +370,7 @@ impl Table {
             );
             b
         };
-        if i.len as usize >= SHARE_LARGE_VALUE_AT {
+        if i.len as usize >= SHARE_LARGE_VALUE_AT && block.record_count() == 1 {
             block.lookup_shared_large(key)
         } else {
             block.lookup(key)
