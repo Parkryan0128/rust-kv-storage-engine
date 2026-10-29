@@ -146,31 +146,38 @@ pub(crate) fn read_frame_into(
     allow_tail: bool,
     b: &mut Vec<u8>,
 ) -> Result<bool> {
-    b.clear();
     let mut head = [0u8; HEADER];
     let mut n = 0;
     while n < head.len() {
         match r.read(&mut head[n..]) {
             Ok(0) => {
+                b.clear();
                 return if n == 0 || allow_tail {
                     Ok(false)
                 } else {
                     Err(corrupt("truncated frame header"))
-                }
+                };
             }
             Ok(k) => n += k,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                b.clear();
+                return Err(e.into());
+            }
         }
     }
     if crc32fast::hash(&head[..4]) != u32::from_le_bytes(head[4..8].try_into().unwrap()) {
+        b.clear();
         return Err(corrupt("frame header checksum"));
     }
     let len = u32::from_le_bytes(head[..4].try_into().unwrap()) as usize;
     if len > MAX_FRAME {
+        b.clear();
         return Err(corrupt("frame length exceeds limit"));
     }
-    b.reserve_exact(len);
+    // Keep initialized bytes across frames: read_exact overwrites the entire
+    // payload before it can be accepted. Only a growing tail needs zeroing.
+    b.reserve_exact(len.saturating_sub(b.len()));
     b.resize(len, 0);
     if let Err(e) = r.read_exact(b) {
         if allow_tail && e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -273,5 +280,57 @@ mod tests {
                 Err(EngineError::Io(e)) if e.kind() == ErrorKind::WriteZero
             ));
         }
+    }
+    #[test]
+    fn reused_frame_buffer_never_accepts_stale_bytes_after_truncation() {
+        let payload = vec![37; 4096];
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &payload).unwrap();
+        // Old contents deliberately match the missing suffix and checksum.
+        for cut in 0..frame.len() {
+            for allow_tail in [false, true] {
+                let mut buffer = payload.clone();
+                let result = read_frame_into(&mut &frame[..cut], allow_tail, &mut buffer);
+                if cut == 0 || allow_tail {
+                    assert!(!result.unwrap(), "cut {cut}");
+                } else {
+                    assert!(
+                        matches!(result, Err(EngineError::Corruption(_))),
+                        "cut {cut}"
+                    );
+                }
+                if cut < HEADER {
+                    assert!(buffer.is_empty());
+                }
+            }
+        }
+        let mut buffer = payload.clone();
+        let address = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        for size in [4096, 31, 4096, 0, 1, 4096] {
+            let expected = vec![size as u8; size];
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, &expected).unwrap();
+            let mut reader = Fragmented {
+                inner: encoded.as_slice(),
+                interrupt: false,
+            };
+            assert!(read_frame_into(&mut reader, false, &mut buffer).unwrap());
+            assert_eq!(buffer, expected);
+            assert_eq!(buffer.as_ptr(), address);
+            assert_eq!(buffer.capacity(), capacity);
+        }
+        let mut broken = frame;
+        broken[HEADER + 5] ^= 1;
+        buffer = payload;
+        assert!(matches!(
+            read_frame_into(&mut broken.as_slice(), true, &mut buffer),
+            Err(EngineError::Corruption(_))
+        ));
+        assert!(matches!(
+            read_frame_into(&mut FailedRead, true, &mut buffer),
+            Err(EngineError::Io(_))
+        ));
+        assert!(buffer.is_empty());
     }
 }
