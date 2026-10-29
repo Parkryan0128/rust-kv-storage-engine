@@ -85,6 +85,35 @@ impl PrefixHasher {
     }
 }
 
+// Immutable per-table acceleration for long keys. The prefix bytes already
+// belong to the first index key; only their unfinished hash state is retained.
+// Every lookup verifies the prefix, so unrelated keys use the original hash.
+pub(crate) struct ReadPrefixHash {
+    len: u8,
+    state: u64,
+}
+impl ReadPrefixHash {
+    pub fn new(first: &[u8]) -> Self {
+        let len = if first.len() >= 64 {
+            (first.len() - 8).min(128)
+        } else {
+            0
+        };
+        Self {
+            len: len as u8,
+            state: extend_hash(HASH_SEED, &first[..len]),
+        }
+    }
+    pub fn hash(&self, key: &[u8], first: &[u8]) -> u64 {
+        if self.len != 0 {
+            if let Some(suffix) = key.strip_prefix(&first[..usize::from(self.len)]) {
+                return finish_hash(extend_hash(self.state, suffix));
+            }
+        }
+        hash(key)
+    }
+}
+
 fn delta(hash: u64) -> u64 {
     hash.rotate_left(31).wrapping_mul(0xc4ceb9fe1a85ec53) | 1
 }
@@ -246,6 +275,28 @@ mod tests {
                         assert!(decoded.contains_hash(h));
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn immutable_read_prefix_matches_original_hash_for_hits_misses_and_short_keys() {
+        for len in [0, 8, 31, 63, 64, 65, 127, 128, 136, 1024] {
+            let first: Vec<_> = (0..len).map(|n| (n % 251) as u8).collect();
+            let cached = ReadPrefixHash::new(&first);
+            assert_eq!(cached.hash(&first, &first), hash(&first));
+            for cut in 0..=first.len() {
+                assert_eq!(cached.hash(&first[..cut], &first), hash(&first[..cut]));
+            }
+            for n in 0..first.len() {
+                let mut key = first.clone();
+                key[n] ^= 255;
+                assert_eq!(cached.hash(&key, &first), hash(&key));
+            }
+            for suffix in [vec![], vec![0], vec![255; 8], vec![0; 1024]] {
+                let mut key = first.clone();
+                key.extend(suffix);
+                assert_eq!(cached.hash(&key, &first), hash(&key));
             }
         }
     }

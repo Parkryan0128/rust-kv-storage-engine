@@ -5,7 +5,7 @@ use crate::{
         encode_prefix_frame, expand_prefix_frame, indexed_records, BlockCursor, ReadBlock,
         SHARE_LARGE_VALUE_AT,
     },
-    bloom::Bloom,
+    bloom::{Bloom, ReadPrefixHash},
     cache::{BlockCache, CacheKey, Counters},
     codec::*,
     error::corrupt,
@@ -57,6 +57,7 @@ pub(crate) struct Table {
     file: File,
     index: Vec<Index>,
     bloom: Bloom,
+    read_prefix_hash: ReadPrefixHash,
     pub count: u64,
     pub file_bytes: u64,
     pub max_seq: u64,
@@ -236,11 +237,14 @@ impl Table {
         let compaction_buffer_bytes = (frame + offsets) * 2
             + expanded_frame_limit.unwrap_or(0)
             + std::mem::size_of::<ReadBlock>();
+        let read_prefix_hash =
+            ReadPrefixHash::new(index.first().map_or(&[], |entry| entry.first.as_slice()));
         Ok(Self {
             id,
             file,
             index,
             bloom,
+            read_prefix_hash,
             count,
             file_bytes: len,
             max_seq,
@@ -346,10 +350,9 @@ impl Table {
         {
             return Ok(None);
         }
-        if !self
-            .bloom
-            .contains_hash(*hash.get_or_insert_with(|| crate::bloom::hash(key)))
-        {
+        if !self.bloom.contains_hash(
+            *hash.get_or_insert_with(|| self.read_prefix_hash.hash(key, &self.index[0].first)),
+        ) {
             counters.bloom_negatives.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }

@@ -245,11 +245,17 @@ impl TableWriter {
         // its metadata after durable publication instead of reading it back.
         let frame = self.index.iter().map(|i| i.len as usize).max().unwrap_or(0);
         let file = self.file.into_inner().map_err(|e| e.into_error())?;
+        let read_prefix_hash = ReadPrefixHash::new(
+            self.index
+                .first()
+                .map_or(&[], |entry| entry.first.as_slice()),
+        );
         Ok(Table {
             id,
             file,
             index: self.index,
             bloom: self.bloom,
+            read_prefix_hash,
             count: self.count,
             max_seq: self.max_seq,
             file_bytes: self.position + meta_len + FOOTER as u64,
