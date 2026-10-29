@@ -160,6 +160,19 @@ verification and output digests while allowing new metadata bytes.
 
 ## Complete comparison
 
+To reduce noise in a short first-range measurement, repeat the same first-pass
+trace with a freshly opened database handle each time:
+
+```sh
+python3 benchmarks/rocksdb-compare/workloads.py reopened-results --baseline --reads-only --profile 0 --scenario scan-t1-span32 --trials 12 --reopens 32
+```
+
+Each trace starts with fresh engine block-cache and validation state. The timed
+result sums the scan traces; opening, closing and full result verification stay
+outside that timer. The OS page cache is warm, so this does not measure physical
+cold-device reads. Per-trace and separate open times are retained in the raw output.
+`--reopens` requires a scan scenario and accepts 1 through 128 traces.
+
 The opt-in `full-comparison` workflow runs every public workload profile, large
 random reads, native-format first ranges, durable writes, recovery, snapshots,
 cache pressure, memory scans, compaction matrices and internal diagnostics on one

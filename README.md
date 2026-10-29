@@ -117,7 +117,8 @@ boundary slice of at most four pages retains only those pages; larger boundary
 groups can still retain pages outside the requested range. Shared-page updates
 copy a bounded delta (16–32 records, depending on page occupancy), sharing unchanged keys and values.
 Once a base is exclusively owned again, the next update folds pending deltas in place and releases superseded payloads. Sorted appends fill pages before allocating the next page; middle inserts retain balanced splitting.
-Structural edits and shared delta folds copy the page contents, so retaining a snapshot
+Shared delta folds copy value handles while keeping the ordered keys and routing
+prefixes shared. Structural edits also detach the key arrays, so retaining a snapshot
 can still increase write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
 except that one larger key occupies its own page.
 Iteration buffers one block and candidate record per SST, rather than all disk
