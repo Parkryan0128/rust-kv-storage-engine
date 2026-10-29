@@ -13,7 +13,7 @@ permissions:
   contents: read
 concurrency:
   # Unrequested pushes must not replace a queued requested comparison.
-  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}${{ contains(github.event.head_commit.message, '[large-frame-guard]') && '-large-frame' || '' }}${{ contains(github.event.head_commit.message, '[cache-policy-guard]') && '-cache-policy' || '' }}${{ contains(github.event.head_commit.message, '[prefix-block-guard]') && '-prefix' || '' }}${{ contains(github.event.head_commit.message, '[long-key-guard]') && '-long-key' || '' }}${{ contains(github.event.head_commit.message, '[merge-guard]') && '-merge' || '' }}${{ contains(github.event.head_commit.message, '[published-read-guard]') && '-published' || '' }}${{ contains(github.event.head_commit.message, '[prefix-budget-guard]') && '-prefix-budget' || '' }}
+  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}${{ contains(github.event.head_commit.message, '[large-frame-guard]') && '-large-frame' || '' }}${{ contains(github.event.head_commit.message, '[cache-policy-guard]') && '-cache-policy' || '' }}${{ contains(github.event.head_commit.message, '[prefix-block-guard]') && '-prefix' || '' }}${{ contains(github.event.head_commit.message, '[long-key-guard]') && '-long-key' || '' }}${{ contains(github.event.head_commit.message, '[merge-guard]') && '-merge' || '' }}${{ contains(github.event.head_commit.message, '[published-read-guard]') && '-published' || '' }}${{ contains(github.event.head_commit.message, '[prefix-budget-guard]') && '-prefix-budget' || '' }}${{ contains(github.event.head_commit.message, '[page-prefix-guard]') && '-page-prefix' || '' }}
   cancel-in-progress: false
 jobs:
   compare:
@@ -161,6 +161,13 @@ jobs:
       - name: Compare default and tuned RocksDB cache policies with equal total capacity
         if: ${{ contains(github.event.head_commit.message, '[cache-policy-guard]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/cache-policy --trials 12 --case policy-lru-default-oversized2m --case policy-lru-default-mixed2m --case policy-lru-default-mixed4m --case policy-lru-default-small-4096 --case policy-lru-default-small-16384 --case policy-lru-single-oversized2m --case policy-lru-single-mixed2m --case policy-lru-single-mixed4m --case policy-lru-single-small-4096 --case policy-lru-single-small-16384 --case policy-hyperclock-oversized2m --case policy-hyperclock-mixed2m --case policy-hyperclock-mixed4m --case policy-hyperclock-small-4096 --case policy-hyperclock-small-16384
+      - name: Shared page-prefix searches and mutation guards
+        if: ${{ contains(github.event.head_commit.message, '[page-prefix-guard]') }}
+        timeout-minutes: 20
+        run: |
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/page-prefix-read --trials 12 --case keys-variable-memory --case keys-common128-memory --case memory-get20k-throughput --case memory-get100k-throughput --case snapshot-write32 --case snapshot-narrow-write32
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/page-prefix-ranges --scan-focus --trials 12 --case memory-early10 --case memory-early10-100k --case memory-full20k --case memory-middle10-100k --case memory-narrow10-100k
+          python3 benchmarks/rocksdb-compare/focused.py focused-results/page-prefix-write
       - name: Variable and common-prefix memory keys
         if: ${{ contains(github.event.head_commit.message, '[memory-key-guard]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-keys --trials 12 --case keys-variable-memory --case keys-common128-memory

@@ -55,8 +55,35 @@ struct PageKeys {
     rows: Vec<Bytes>,
     prefixes: Vec<u64>,
     key_bytes: usize,
+    // A conservative prefix shared by every key, capped at two cache lines.
+    // Subsets may keep a shorter proof; structural insertion only shrinks it.
+    shared_prefix: usize,
 }
 impl PageKeys {
+    fn observe_key(&mut self, key: &[u8]) {
+        if key.len() < 16 {
+            self.shared_prefix = 0;
+            return;
+        }
+        if self.rows.is_empty() {
+            self.shared_prefix = key.len().min(128);
+        } else if self.shared_prefix != 0 {
+            let limit = self.shared_prefix.min(key.len());
+            let first = &self.rows[0][..limit];
+            self.shared_prefix = if first == &key[..limit] {
+                limit
+            } else {
+                first
+                    .iter()
+                    .zip(&key[..limit])
+                    .position(|(a, b)| a != b)
+                    .unwrap()
+            };
+            if self.shared_prefix < 16 {
+                self.shared_prefix = 0;
+            }
+        }
+    }
     fn position(&self, key: &[u8], prefix: u64) -> std::result::Result<usize, usize> {
         let lo = self.prefixes.partition_point(|p| *p < prefix);
         if self.prefixes.get(lo) != Some(&prefix) {
@@ -79,10 +106,14 @@ impl PageKeys {
         } else {
             lo + 1
         };
-        self.rows[lo..hi]
-            .binary_search_by(|k| k.as_ref().cmp(key))
-            .map(|i| lo + i)
-            .map_err(|i| lo + i)
+        let shared = self.shared_prefix;
+        let found = if shared != 0 && hi - lo > 1 && key.starts_with(&self.rows[lo][..shared]) {
+            let suffix = &key[shared..];
+            self.rows[lo..hi].binary_search_by(|k| k[shared..].cmp(suffix))
+        } else {
+            self.rows[lo..hi].binary_search_by(|k| k.as_ref().cmp(key))
+        };
+        found.map(|i| lo + i).map_err(|i| lo + i)
     }
 }
 
@@ -108,6 +139,7 @@ impl PageData {
     }
     fn insert_at(&mut self, row: usize, key: Vec<u8>, record: Record, prefix: u64) {
         let keys = Arc::make_mut(&mut self.keys);
+        keys.observe_key(&key);
         keys.key_bytes += key.len();
         keys.rows.insert(row, Bytes::from(key));
         keys.prefixes.insert(row, prefix);
@@ -156,6 +188,7 @@ impl PageData {
                     *bytes -= old.memory_size(&key);
                 }
                 Err(row) => {
+                    keys.observe_key(&key);
                     keys.key_bytes += key.len();
                     keys.rows.insert(row, Bytes::from(key));
                     keys.prefixes.insert(row, prefix);
@@ -408,6 +441,7 @@ impl PageGroup {
                         let page = Arc::make_mut(&mut self.pages[cursor]).materialize();
                         let middle = page.rows.len() / 2;
                         let keys = Arc::make_mut(&mut page.keys);
+                        let shared_prefix = keys.shared_prefix;
                         let rows = keys.rows.split_off(middle);
                         let prefixes = keys.prefixes.split_off(middle);
                         let records = page.records.split_off(middle);
@@ -430,6 +464,7 @@ impl PageGroup {
                                         rows,
                                         prefixes,
                                         key_bytes,
+                                        shared_prefix,
                                     }),
                                     records,
                                     value_bytes,
@@ -748,6 +783,11 @@ impl MemIndex {
                     let target = Arc::make_mut(&mut group.pages[left]).materialize();
                     let removed_keys = Arc::make_mut(&mut removed.keys);
                     let target_keys = Arc::make_mut(&mut target.keys);
+                    target_keys.shared_prefix =
+                        target_keys.shared_prefix.min(removed_keys.shared_prefix);
+                    if let Some(first) = removed_keys.rows.first() {
+                        target_keys.observe_key(first);
+                    }
                     target_keys.rows.append(&mut removed_keys.rows);
                     target_keys.prefixes.append(&mut removed_keys.prefixes);
                     target_keys.key_bytes += removed_keys.key_bytes;
@@ -1028,6 +1068,84 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn shared_prefix_search_preserves_inserts_splits_merges_and_old_snapshots() {
+        use std::collections::BTreeMap;
+        let key = |n: u64| {
+            let mut key = vec![b'x'; 128];
+            key.extend_from_slice(&n.to_be_bytes());
+            key
+        };
+        let value = |seq: u64| Record {
+            seq,
+            value: Some(Bytes::copy_from_slice(&seq.to_be_bytes())),
+        };
+        let check = |map: &MemIndex, model: &BTreeMap<Vec<u8>, Record>| {
+            for page in map.groups.iter().flat_map(|group| &group.pages) {
+                let shared = page.shared_prefix;
+                assert!(shared <= 128);
+                assert!(page
+                    .rows
+                    .iter()
+                    .all(|row| row.starts_with(&page.rows[0][..shared])));
+            }
+            for (key, record) in model {
+                assert_eq!(map.get(key), Some(record));
+            }
+            for missing in [key(1400), key(1401), key(2000), vec![b'x'; 127]] {
+                assert_eq!(map.get(&missing), model.get(&missing));
+            }
+            let expected: Vec<_> = model.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+            assert_eq!(map.snapshot(all()).unwrap().collect::<Vec<_>>(), expected);
+        };
+        let mut map = MemIndex::default();
+        let mut model = BTreeMap::new();
+        for n in (0..1400u64).step_by(2) {
+            let entry = (key(n), value(n + 1));
+            map.insert(entry.0.clone(), entry.1.clone());
+            model.insert(entry.0, entry.1);
+        }
+        assert!(map
+            .groups
+            .iter()
+            .flat_map(|group| &group.pages)
+            .all(|page| page.shared_prefix == 128));
+        let old = map.snapshot(all()).unwrap();
+        let old_expected: Vec<_> = model.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+        let inserts: Vec<_> = (1..1400u64)
+            .step_by(2)
+            .map(|n| (key(n), value(2000 + n)))
+            .collect();
+        let mut bytes = map.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>();
+        map.apply(inserts.iter().cloned(), false, &mut bytes);
+        model.extend(inserts);
+        assert_eq!(
+            bytes,
+            map.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+        );
+        check(&map, &model);
+
+        let mut diverging = vec![b'x'; 64];
+        diverging.push(b'w');
+        let exceptional = [Vec::new(), vec![b'x'; 8], diverging, vec![b'y'; 16]];
+        for (i, key) in exceptional.iter().enumerate() {
+            let record = value(4000 + i as u64);
+            map.insert(key.clone(), record.clone());
+            model.insert(key.clone(), record);
+        }
+        check(&map, &model);
+        let pages_before = map.page_count();
+        for n in 0..1300u64 {
+            assert_eq!(map.remove(&key(n)), model.remove(&key(n)));
+        }
+        for key in &exceptional {
+            assert_eq!(map.remove(key), model.remove(key));
+        }
+        assert!(map.page_count() < pages_before);
+        check(&map, &model);
+        assert_eq!(old.collect::<Vec<_>>(), old_expected);
     }
 
     #[test]
