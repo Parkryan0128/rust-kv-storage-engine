@@ -36,8 +36,8 @@ impl MemTable {
     pub fn insert<K: AsRef<[u8]> + Into<Vec<u8>>>(&mut self, key: K, record: Record) {
         self.bytes += record.memory_size(key.as_ref());
         let key_len = key.as_ref().len();
-        if let Some(old) = self.data.insert(key, record) {
-            self.bytes -= RECORD_CHARGE + key_len + old.value.as_ref().map_or(0, Bytes::len);
+        if let Some(old) = self.data.upsert(key, record) {
+            self.bytes -= RECORD_CHARGE + key_len + old;
         }
     }
     pub fn remove(&mut self, key: &[u8]) {

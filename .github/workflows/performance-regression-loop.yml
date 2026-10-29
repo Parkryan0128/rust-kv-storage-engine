@@ -86,6 +86,7 @@ jobs:
         run: |
           python3 benchmarks/rocksdb-compare/workloads.py focused-results/reopened --baseline --reads-only --profile 0 --scenario scan-t1-span32 --trials 12 --reopens 32
           python3 benchmarks/rocksdb-compare/workloads.py focused-results/ranges --baseline --reads-only --scenario scan-t1-span32
+          python3 benchmarks/rocksdb-compare/workloads.py focused-results/open-guard --baseline --reads-only --profile 0 --scenario scan-t1-span32 --trials 12
       - name: Snapshot writes, release and memory lookup guards
         run: |
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/snapshot --trials 12 --case snapshot-write32 --case snapshot-narrow-write32 --case snapshot-release --case keys-variable-memory --case keys-common128-memory
