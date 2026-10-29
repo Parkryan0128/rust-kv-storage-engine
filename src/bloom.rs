@@ -114,7 +114,9 @@ impl Bloom {
         let delta = delta(h);
         for _ in 0..self.probes {
             let bit = self.bit_position(h);
-            self.bits[bit / 8] |= 1 << (bit % 8);
+            // bit_count is a multiple of eight, so reduction preserves the
+            // low three hash bits. Keep the mask independent of the quotient.
+            self.bits[bit / 8] |= 1 << (h & 7);
             h = h.wrapping_add(delta);
         }
     }
@@ -127,7 +129,7 @@ impl Bloom {
         let delta = delta(h);
         for _ in 0..self.probes {
             let bit = self.bit_position(h);
-            if self.bits[bit / 8] & (1 << (bit % 8)) == 0 {
+            if self.bits[bit / 8] & (1 << (h & 7)) == 0 {
                 return false;
             }
             h = h.wrapping_add(delta);
