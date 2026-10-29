@@ -79,7 +79,7 @@ jobs:
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bins --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
           cp benchmarks/rocksdb-compare/target/release/kv-compare comparison-bin/rocksdb
-      - name: Preserve optimized point-read assembly
+      - name: Preserve optimized read-path assembly
         if: ${{ contains(github.event.head_commit.message, '[read-codegen]') }}
         run: |
           python3 - <<'PY'
@@ -87,7 +87,7 @@ jobs:
           from pathlib import Path
           output = Path("focused-results/read-codegen")
           output.mkdir(parents=True, exist_ok=True)
-          targets = ("contains_hash", "get_hashed")
+          targets = ("contains_hash", "get_hashed", "read_next", "next_live")
           for name in ["baseline", "engine"]:
               binary = Path("comparison-bin/workloads-" + name)
               symbols = subprocess.check_output(["nm", "-S", "-C", str(binary)], text=True)
@@ -144,6 +144,7 @@ jobs:
             python3 benchmarks/rocksdb-compare/workloads.py focused-results/range-profile-${profile} --baseline --reads-only --profile ${profile} --scenario scan-t1-span512 --trials 12
           done
           python3 benchmarks/rocksdb-compare/bounds.py focused-results/range-bounds --trials 12
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/range-memory --scan-focus --trials 12
       - name: Recovery shapes beyond sequential ingestion
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite --case wal-put-sorted --case wal-put-random100k --case wal-batch32-random100k
       - name: Large-index clustered overwrite guard
