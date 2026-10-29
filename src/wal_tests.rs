@@ -518,3 +518,50 @@ fn replay_staging_is_bounded_and_oversized_rows_do_not_stay_buffered() {
         model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
     );
 }
+
+#[test]
+fn replay_order_sample_does_not_assume_the_entire_batch_is_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sampled.wal");
+    for ordered_prefix in [false, true] {
+        let mut body = Vec::new();
+        put_u64(&mut body, 0);
+        put_u32(&mut body, BATCH_VERSION);
+        put_u32(&mut body, 1024);
+        let mut model = std::collections::BTreeMap::new();
+        for i in 0..1024u64 {
+            let key = if ordered_prefix && i < 8 {
+                i
+            } else {
+                (i * 7919) % 809
+            };
+            let key = key.to_be_bytes().to_vec();
+            let record = Record {
+                seq: i + 1,
+                value: (i % 11 != 0).then(|| Bytes::from(vec![i as u8; (i % 47) as usize])),
+            };
+            encode_record(&key, &record, &mut body);
+            model.insert(key, record);
+        }
+        let (count, records, _) = validate_batch(&body, 0).unwrap();
+        assert_eq!(disordered_replay_prefix(records, count), !ordered_prefix);
+        let mut file = MAGIC.to_vec();
+        write_frame(&mut file, &body).unwrap();
+        std::fs::write(&path, &file).unwrap();
+        let mut sequence = 0;
+        let (_, table) = Wal::recover(&path, 1, false, &mut sequence).unwrap();
+        assert_eq!(sequence, 1024);
+        assert_eq!(
+            table
+                .data
+                .iter()
+                .map(|(k, r)| (k.to_vec(), r.clone()))
+                .collect::<Vec<_>>(),
+            model.clone().into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.bytes,
+            model.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+        );
+    }
+}

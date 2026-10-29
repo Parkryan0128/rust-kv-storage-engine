@@ -85,13 +85,20 @@ impl Wal {
                     pending.push(entry, &mut table);
                 } else {
                     // Validate the complete atomic frame before staging any of
-                    // its operations. Replay every frame in bounded chunks;
-                    // large batches do not require a batch-sized owned copy.
+                    // its operations. Small frames share bounded replay chunks.
+                    // A short disorder sample selects chunk sorting for large
+                    // frames; the streaming fallback accepts any key order.
                     let (count, records, end_seq) = validate_batch(&buffer, *last_seq)?;
                     let mut cursor = Cursor { b: records };
-                    for _ in 0..count {
-                        let entry = decode_record(&mut cursor).expect("validated WAL batch");
-                        pending.push(entry, &mut table);
+                    let entries = (0..count)
+                        .map(|_| decode_record(&mut cursor).expect("validated WAL batch"));
+                    if count > REPLAY_RECORDS && !disordered_replay_prefix(records, count) {
+                        pending.flush(&mut table);
+                        table.apply(entries, false);
+                    } else {
+                        for entry in entries {
+                            pending.push(entry, &mut table);
+                        }
                     }
                     *last_seq = end_seq;
                 }
@@ -224,6 +231,25 @@ fn validate_batch(payload: &[u8], last_seq: u64) -> Result<(usize, &[u8], u64)> 
     }
     c.done()?;
     Ok((count, records, end_seq))
+}
+
+// This bounded sample is only a performance hint, never proof of full ordering.
+// Missing later disorder simply retains the general streaming apply path.
+fn disordered_replay_prefix(records: &[u8], count: usize) -> bool {
+    let mut cursor = Cursor { b: records };
+    let mut previous = decode_record_ref(&mut cursor)
+        .expect("validated WAL batch")
+        .key;
+    for _ in 1..count.min(8) {
+        let key = decode_record_ref(&mut cursor)
+            .expect("validated WAL batch")
+            .key;
+        if previous > key {
+            return true;
+        }
+        previous = key;
+    }
+    false
 }
 
 #[cfg(test)]
