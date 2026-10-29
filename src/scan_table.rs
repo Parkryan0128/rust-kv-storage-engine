@@ -44,8 +44,16 @@ impl Table {
 }
 
 impl TableScan {
+    pub(crate) fn has_prefix_blocks(&self) -> bool {
+        self.table.expanded_frame_limit.is_some()
+    }
     pub fn current(&self) -> Option<RecordRef<'_>> {
-        self.block.as_ref().and_then(BlockCursor::current)
+        self.current_for::<true>()
+    }
+    pub(crate) fn current_for<const PREFIX: bool>(&self) -> Option<RecordRef<'_>> {
+        self.block
+            .as_ref()
+            .and_then(BlockCursor::current_for::<PREFIX>)
     }
 
     pub fn advance<T>(
@@ -62,11 +70,12 @@ impl TableScan {
         }
     }
 
-    fn advance_for<const PREFIX: bool, T>(
+    pub(crate) fn advance_for<const PREFIX: bool, T>(
         &mut self,
         counters: &Counters,
         consume: impl FnOnce(RecordRef<'_>) -> T,
     ) -> Result<Option<T>> {
+        debug_assert!(PREFIX || !self.has_prefix_blocks());
         if let Some(block) = &mut self.block {
             block.advance_for::<PREFIX>()?;
         }
