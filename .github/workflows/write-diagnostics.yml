@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   diagnose:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-diag]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[write-diag]') || contains(github.event.head_commit.message, '[snapshot-write-diag]')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -16,11 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev strace
       - uses: actions/cache@v4
         with:
           path: benchmarks/rocksdb-compare/target
-          key: rocksdb-compare-${{ runner.os }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
+          key: rocksdb-compare-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('benchmarks/rocksdb-compare/Cargo.lock') }}
       - name: Build normal and instrumented engines
         run: |
           mkdir -p comparison-bin
@@ -33,7 +34,13 @@ jobs:
           cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features rocks
           cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-rocksdb
       - name: Diagnose batch tails and file allocation
+        if: ${{ !contains(github.event.head_commit.message, '[snapshot-write-diag]') }}
         run: python3 benchmarks/rocksdb-compare/write_diagnostics.py write-diagnostics
+        env:
+          KV_BENCH_DIR: ${{ runner.temp }}
+      - name: Attribute full and narrow snapshot write phases
+        if: ${{ contains(github.event.head_commit.message, '[snapshot-write-diag]') }}
+        run: python3 benchmarks/rocksdb-compare/snapshot_write_diagnostics.py write-diagnostics/snapshot
         env:
           KV_BENCH_DIR: ${{ runner.temp }}
       - uses: actions/upload-artifact@v4

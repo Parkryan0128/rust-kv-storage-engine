@@ -292,3 +292,16 @@ this control. Preserve both executable hashes and the same rotated trial order.
 An identical-source difference is not an optimization gain and must not be
 subtracted mechanically from another run; use it to decide whether a source
 change needs a more controlled experiment.
+
+
+`[read-layout-diag] [baseline:<sha>]` runs only the two 16-file hit-range fixtures
+(128 B and 16 KiB values), on two Linux runner images. Each compares native
+backend-specific paths with one identical path reused sequentially, plus the
+exact current executable under the baseline-length path. Twelve rotated trials
+retain all three bounds stages and full untimed verification. Image labels do
+not guarantee a CPU model; inspect each artifact’s CPU metadata.
+
+`[snapshot-write-diag]` runs six rotated trials of full and narrow retained
+snapshots with 32-operation durable batches. Normal engine and RocksDB timings
+are separate from the instrumented engine’s validate/lock/WAL/sync/apply phase
+report. Instrumented percentages locate costs; they are not speed scores.

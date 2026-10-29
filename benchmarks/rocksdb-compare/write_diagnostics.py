@@ -17,8 +17,8 @@ def distribution(ns):
             "p99_us": ns[(len(ns)-1)*99//100] / 1e3, "max_us": ns[-1] / 1e3}
 
 
-def run(binary, directory, config, output, trace=None):
-    command = [str(binary), "write", str(directory), json.dumps(config)]
+def run(binary, directory, config, output, trace=None, mode="write"):
+    command = [str(binary), mode, str(directory), json.dumps(config)]
     if trace:
         command = ["strace", "-f", "-yy", "-qq", "-T", "-s", "32", "-o", str(trace),
                    "-e", "trace=write,pwrite64,fsync,fdatasync,fallocate,ftruncate"] + command
