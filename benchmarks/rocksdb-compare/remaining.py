@@ -130,6 +130,16 @@ def main():
             if args.cases and label in args.cases:
                 cases.append((label, "shaped-keys", dict(common, queries=2000,
                     common_prefix=common_prefix, disk=True, block=block), None))
+    # Large live memory indexes expose group-copy costs without flush timing.
+    for label, mode, keys, queries, extra in [
+        ("snapshot-write32-100k", "snapshot-write", 100000, 2000, {"batch":32}),
+        ("snapshot-write32-1m", "snapshot-write", 1000000, 2000, {"batch":32}),
+        ("memory-get1m-throughput", "memory-get", 1000000, 2000000, {"throughput":True}),
+        ("memory-early10-1m", "memory-scan", 1000000, 5000, {}),
+    ]:
+        if args.cases and label in args.cases:
+            cases.append((label, mode, dict(common, keys=keys, queries=queries,
+                memtable=536870912, **extra), None))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

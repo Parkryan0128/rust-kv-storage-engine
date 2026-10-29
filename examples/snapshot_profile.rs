@@ -9,7 +9,14 @@ fn main() -> Result<()> {
         .unwrap_or(1);
     for (retain_snapshot, repeated_fold) in [(false, false), (true, false), (true, true)] {
         let db = Engine::new();
-        let keys = if repeated_fold { 256u64 } else { 20_000 };
+        let keys = if repeated_fold {
+            256u64
+        } else {
+            std::env::var("KV_PROFILE_KEYS")
+                .ok()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(20_000)
+        };
         let batch_size = if repeated_fold { 64 } else { 32 };
         let mut initial = WriteBatch::new();
         for k in 0..keys {
@@ -18,7 +25,10 @@ fn main() -> Result<()> {
         db.write_batch(initial)?;
         let mut model = vec![0u8; keys as usize];
         let mut write_ns = 0;
-        let queries = 40_000u64;
+        let queries = std::env::var("KV_PROFILE_QUERIES")
+            .ok()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(40_000);
         let warmup = 2_000u64;
         let mut start = None;
         for round in 0..warmup + queries {
