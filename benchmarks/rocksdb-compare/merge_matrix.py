@@ -135,7 +135,14 @@ def main():
                         assert row["backend"] == ("rocksdb" if name == "rocksdb" else "engine")
                         row.update(backend=name, case=case, trial=trial+1, order=order)
                         if name != "rocksdb":
-                            assert row["metrics"]["stats_after"]["max_compaction_inputs"] == config["generations"]
+                            maximum = row["metrics"]["stats_after"]["max_compaction_inputs"]
+                            if case.endswith("-16k"):
+                                # These opt-in cases measure whether the input memory budget
+                                # requires extra merge rounds; do not assume one round.
+                                assert 2 <= maximum <= config["generations"]
+                                assert row["metrics"]["stats_after"]["sst_files"] == 1
+                            else:
+                                assert maximum == config["generations"]
                             digests[name] = sst_digest(directory)
                             row["output_sst_digest"] = digests[name]
                         records.append(row)
@@ -144,7 +151,11 @@ def main():
                         print("MERGE_MATRIX_RESULT " + json.dumps(row), flush=True)
                         shutil.rmtree(directory)
                     if not args.allow_format_change:
-                        assert digests["baseline"] == digests["engine"], "SST output differs from baseline"
+                        # Extra merge rounds allocate a different final file ID.
+                        # Compare every content byte while retaining names in the raw result.
+                        normalized = {name: sorted((size, digest) for _, size, digest in files)
+                                      for name, files in digests.items()} if case.endswith("-16k") else digests
+                        assert normalized["baseline"] == normalized["engine"], "SST output differs from baseline"
     summary = []
     for case, _ in cases:
         for name in names:
