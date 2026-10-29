@@ -1,8 +1,8 @@
 # Benchmarks
 
-The [2026-10-29 complete comparison](performance-results-2026-10-29.md) includes all 263 public conditions, process memory, SST sizes, slower results and independent controls. See also [cache-policy results](cache-policy-results.md) for tuned RocksDB caches. The older reports below retain their original dates and methodology.
+The [2026-10-29 optimization continuation](performance-results-2026-10-29-continuation.md) is the latest comparison. It preserves all 263 public conditions, process memory, SST sizes, slower results and independent controls, with additional native-prefix and snapshot checks. The [earlier same-day comparison](performance-results-2026-10-29.md) retains its original measured revisions. See also [cache-policy results](cache-policy-results.md) for tuned RocksDB caches. The older reports below retain their original dates and methodology.
 
-These are small workloads on container storage (overlayfs). Its very short sync times do not represent physical-disk durability latency.
+The older workloads below used container storage (overlayfs). Its very short sync times do not represent physical-disk durability latency.
 
 ## Reads and writes
 

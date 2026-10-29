@@ -1,5 +1,7 @@
 # Performance comparison — 2026-10-29
 
+**Historical checkpoint:** the [optimization continuation](performance-results-2026-10-29-continuation.md) supersedes this report for the later implementation. Measurements below remain unchanged and belong to the revisions listed here.
+
 The corrected full run contains **263 public conditions, 5,283 public measurement records and 5,673 records including internal diagnostics**. Random reads are faster than RocksDB in this matrix and use less process memory; synced writes are close. Long common-prefix compactions and some retained-snapshot workloads remain weaker. This is not evidence that every workload is faster. Every public result, including losses and open times, is in the [complete CSV](performance-results-2026-10-29.csv).
 
 ## Revisions and measurement
