@@ -189,7 +189,7 @@ jobs:
           python3 benchmarks/rocksdb-compare/snapshot_scaling.py focused-results/snapshot-cpu
       - name: Native prefix compaction fan-in with 16 KiB blocks
         if: ${{ contains(github.event.head_commit.message, '[prefix-budget-guard]') }}
-        run: python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/merge-prefix-budget --trials 12 --case n8-k8-distinct-16k --case n8-k136-distinct-16k --case n16-k8-distinct-16k --case n16-k136-distinct-16k
+        run: python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/merge-prefix-budget --trials 24 --case n8-k8-distinct-16k --case n8-k136-distinct-16k --case n16-k8-distinct-16k --case n16-k136-distinct-16k
       - name: Recovery shapes beyond sequential ingestion
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite --case wal-put-sorted --case wal-put-random100k --case wal-batch32-random100k
       - name: Large-index clustered overwrite guard
