@@ -131,6 +131,13 @@ def main():
                 cases.append((label, "shaped-keys", dict(common, queries=queries,
                     common_prefix=True, disk=True, block=block, cache=0,
                     span=span, range_queries=True), None))
+    # Repeat deletion-heavy scans independently without expanding the default matrix.
+    for disk in [False, True]:
+        for queries in [512, 2048]:
+            label = f"tombstones-{'sst' if disk else 'memory'}-{queries}"
+            if args.cases and label in args.cases:
+                cases.append((label, "tombstone-scan", dict(common, keys=8192,
+                    queries=queries, disk=disk), None))
     # First small query set on tables just published by flush, without reopen.
     for common_prefix in [False, True]:
         for block in [4096, 16384]:
@@ -187,7 +194,7 @@ def main():
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
                 "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
-            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release", "retained-large"]})
+            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release", "retained-large", "tombstone-scan"]})
             stages = ["shaped-ranges"] if mode == "shaped-keys" and config.get("range_queries") else expected[mode]
             assert [r["stage"] for r in rows] == stages
             return rows

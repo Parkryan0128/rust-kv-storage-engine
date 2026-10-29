@@ -93,13 +93,13 @@ jobs:
           Path("residual-results/identical-source.json").write_text(json.dumps(hashes, indent=2))
           PY
       - name: Repeat the flagged million-key block size with identical-executable control
-        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') && !contains(github.event.head_commit.message, '[tombstone-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/run.py residual-results/random --baseline --trials 24 --engine-control --case 1000000-128-5 --block-bytes 8192
       - name: Repeat cache admission and snapshot retention costs
-        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') && !contains(github.event.head_commit.message, '[tombstone-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/cache-snapshot --trials 24 --case phase-20000-2m --case phase-20000-4m --case snapshot-release --case snapshot-write32 --case snapshot-narrow-write32
       - name: Repeat the flagged open and empty bounds
-        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[directory-confirm]') && !contains(github.event.head_commit.message, '[tombstone-confirm]') }}
         run: |
           python3 benchmarks/rocksdb-compare/workloads.py residual-results/open --baseline --reads-only --profile 2 --scenario uniform-t4-span0 --trials 24
           python3 benchmarks/rocksdb-compare/bounds.py residual-results/bounds --trials 24 --case 16files-128b-above
@@ -109,6 +109,9 @@ jobs:
       - name: Independently repeat volatile snapshot and ordinary writes
         if: ${{ contains(github.event.head_commit.message, '[directory-confirm]') }}
         run: python3 benchmarks/rocksdb-compare/snapshot_scaling.py residual-results/snapshot-cpu --trials 24
+      - name: Independently repeat deletion-heavy range flags
+        if: ${{ contains(github.event.head_commit.message, '[tombstone-confirm]') }}
+        run: python3 benchmarks/rocksdb-compare/remaining.py residual-results/tombstones --trials 24 --case tombstones-memory-512 --case tombstones-memory-2048 --case tombstones-sst-512 --case tombstones-sst-2048
       - name: Preserve every result and control
         if: always()
         uses: actions/upload-artifact@v4
