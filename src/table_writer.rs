@@ -403,7 +403,29 @@ mod tests {
                         );
                     }
                 }
-                let mut cursor = TableCursor::new(Arc::new(table)).unwrap();
+                let table = Arc::new(table);
+                for excluded in [false, true] {
+                    let start = if excluded {
+                        std::ops::Bound::Excluded(expected[13].0.clone())
+                    } else {
+                        std::ops::Bound::Included(expected[13].0.clone())
+                    };
+                    let range = Arc::new(crate::scan::KeyRange {
+                        start,
+                        end: std::ops::Bound::Included(expected[225].0.clone()),
+                    });
+                    let mut scan = table.scan(range);
+                    let counters = Counters::default();
+                    let mut rows = Vec::new();
+                    while let Some(row) = scan
+                        .advance(&counters, |r| (r.key.to_vec(), r.to_owned()))
+                        .unwrap()
+                    {
+                        rows.push(row);
+                    }
+                    assert_eq!(rows, expected[13 + usize::from(excluded)..=225]);
+                }
+                let mut cursor = TableCursor::new(table).unwrap();
                 for (key, record) in &expected {
                     let got = cursor.current().unwrap();
                     assert_eq!(got.key, key);

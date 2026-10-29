@@ -259,7 +259,7 @@ impl Table {
         (0..block.record_count())
             .map(|n| {
                 let record = block.record_at(n)?;
-                Ok((record.key.to_vec(), record.to_owned()))
+                Ok((block.full_key_at(n)?, record.to_owned()))
             })
             .collect()
     }
@@ -281,12 +281,18 @@ impl Table {
     fn decode(&self, n: usize, bytes: Vec<u8>, offsets: Vec<u32>) -> Result<ReadBlock> {
         let i = &self.index[n];
         let next = self.index.get(n + 1).map(|next| next.first.as_slice());
-        let bytes = if let Some(limit) = self.expanded_frame_limit {
-            expand_prefix_frame(bytes, limit)?
-        } else {
-            bytes
-        };
-        let block = if self.indexed {
+        let block = if let Some(limit) = self.expanded_frame_limit {
+            let (block, fingerprint) = ReadBlock::decode_prefix_indexed(
+                bytes,
+                &i.first,
+                next,
+                self.max_seq,
+                i.validated.load(Ordering::Relaxed),
+                limit,
+            )?;
+            i.validated.store(fingerprint, Ordering::Relaxed);
+            block
+        } else if self.indexed {
             let (block, fingerprint) = ReadBlock::decode_indexed(
                 bytes,
                 &i.first,
@@ -302,7 +308,10 @@ impl Table {
         if n + 1 == self.index.len() {
             let last = block.key_at(block.record_count() - 1)?;
             if let Some(maximum) = self.last_key.get() {
-                if maximum.as_slice() != last {
+                if !block
+                    .compare_key_at(block.record_count() - 1, maximum)?
+                    .is_eq()
+                {
                     return Err(corrupt("SST maximum key disagrees with data"));
                 }
             } else {

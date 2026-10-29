@@ -142,6 +142,111 @@ pub(crate) fn expand_prefix_frame(bytes: Vec<u8>, maximum: usize) -> Result<Vec<
     Ok(output)
 }
 
+pub(super) fn compare_key(prefix: &[u8], suffix: &[u8], key: &[u8]) -> std::cmp::Ordering {
+    let shared = prefix.len().min(key.len());
+    match prefix[..shared].cmp(&key[..shared]) {
+        std::cmp::Ordering::Equal if key.len() < prefix.len() => std::cmp::Ordering::Greater,
+        std::cmp::Ordering::Equal => suffix.cmp(&key[shared..]),
+        order => order,
+    }
+}
+
+impl ReadBlock {
+    // Keep prefix blocks encoded in the cache. Get compares only the suffix
+    // after checking the shared prefix once; cursors reconstruct one head key.
+    pub(crate) fn decode_prefix_indexed(
+        bytes: Vec<u8>,
+        first: &[u8],
+        next: Option<&[u8]>,
+        max_seq: u64,
+        validated: u64,
+        maximum: usize,
+    ) -> Result<(Self, u64)> {
+        if bytes.len() > maximum {
+            return Err(corrupt("SST expanded block limit"));
+        }
+        let footer = bytes
+            .get(bytes.len().saturating_sub(4)..)
+            .filter(|f| f.len() == 4)
+            .ok_or_else(|| corrupt("SST prefix footer"))?;
+        let tagged_count = u32::from_le_bytes(footer.try_into().unwrap());
+        if tagged_count & PREFIX_FLAG == 0 {
+            return Self::decode_indexed(bytes, first, next, max_seq, validated);
+        }
+        let payload = frame_payload(&bytes)?;
+        let count = (tagged_count & !PREFIX_FLAG) as usize;
+        let mut cursor = Cursor { b: payload };
+        let decoded_len = cursor.u32()? as usize;
+        let prefix_len = cursor.u32()? as usize;
+        if count < 2
+            || count > payload.len().saturating_sub(12) / 21
+            || prefix_len == 0
+            || prefix_len > MAX_RECORD - 17
+            || decoded_len > MAX_FRAME
+            || decoded_len + HEADER > maximum
+        {
+            return Err(corrupt("SST prefix header"));
+        }
+        let prefix = cursor.take(prefix_len)?;
+        let expected = payload.len().checked_sub(8 + prefix_len).and_then(|n| {
+            count
+                .checked_mul(prefix_len)
+                .and_then(|added| n.checked_add(added))
+        });
+        if expected != Some(decoded_len) {
+            return Err(corrupt("SST prefix expansion length"));
+        }
+        let directory_len = count * 4 + 4;
+        let record_len = cursor
+            .b
+            .len()
+            .checked_sub(directory_len)
+            .ok_or_else(|| corrupt("SST prefix directory"))?;
+        let (records, directory) = cursor.b.split_at(record_len);
+        let fingerprint =
+            (1u64 << 32) | u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64;
+        if fingerprint != validated {
+            let mut cursor = Cursor { b: records };
+            let mut previous: Option<&[u8]> = None;
+            for offset in directory[..directory.len() - 4].chunks_exact(4) {
+                if u32::from_le_bytes(offset.try_into().unwrap()) as usize
+                    != record_len - cursor.b.len()
+                {
+                    return Err(corrupt("SST prefix offset"));
+                }
+                let record = decode_record_ref(&mut cursor)?;
+                if prefix_len + 17 + record.key.len() + record.value.map_or(0, <[u8]>::len)
+                    > MAX_RECORD
+                    || record.seq > max_seq
+                    || previous.is_some_and(|key| key >= record.key)
+                {
+                    return Err(corrupt("SST prefix record order/sequence/length"));
+                }
+                if previous.is_none() && !compare_key(prefix, record.key, first).is_eq() {
+                    return Err(corrupt("SST first key mismatch"));
+                }
+                previous = Some(record.key);
+            }
+            cursor.done()?;
+            let last = previous.ok_or_else(|| corrupt("empty SST prefix block"))?;
+            if next.is_some_and(|key| !compare_key(prefix, last, key).is_lt()) {
+                return Err(corrupt("SST record order/sequence"));
+            }
+        }
+        let record_start = HEADER + 8 + prefix_len;
+        let index_start = bytes.len() - directory_len;
+        Ok((
+            Self {
+                bytes,
+                offsets: Vec::new(),
+                index_start,
+                record_start,
+            },
+            fingerprint,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +279,68 @@ mod tests {
         let header = frame_header(&bytes[HEADER..]).unwrap();
         bytes[..HEADER].copy_from_slice(&header);
         (bytes, first, last, offsets)
+    }
+
+    #[test]
+    fn native_prefix_lookup_cursor_and_cached_validation_match_full_records() {
+        let (bytes, first, last, mut offsets) = fixture();
+        let mut encoded = Vec::new();
+        encode_prefix_frame(&bytes, &first, &last, &mut offsets, &mut encoded).unwrap();
+        let (plain, _) = ReadBlock::decode_indexed(bytes.clone(), &first, None, 73, 0).unwrap();
+        let (native, fingerprint) =
+            ReadBlock::decode_prefix_indexed(encoded.clone(), &first, None, 73, 0, bytes.len())
+                .unwrap();
+        assert!(native.allocated_bytes() < plain.allocated_bytes());
+        let (warm, _) = ReadBlock::decode_prefix_indexed(
+            encoded.clone(),
+            &first,
+            None,
+            73,
+            fingerprint,
+            bytes.len(),
+        )
+        .unwrap();
+        let mut probes = vec![vec![], vec![b'x'; 128], vec![b'w'; 140], vec![b'y'; 140]];
+        for n in 0..plain.record_count() {
+            let key = plain.key_at(n).unwrap();
+            assert_eq!(native.full_key_at(n).unwrap(), key);
+            probes.push(key.to_vec());
+            let mut after = key.to_vec();
+            after.push(0);
+            probes.push(after);
+            probes.push(key[..key.len() - 1].to_vec());
+        }
+        for key in probes {
+            assert_eq!(native.lookup(&key).unwrap(), plain.lookup(&key).unwrap());
+            assert_eq!(warm.lookup(&key).unwrap(), plain.lookup(&key).unwrap());
+            for n in [0, 1, 35, 72] {
+                assert_eq!(
+                    native.compare_key_at(n, &key).unwrap(),
+                    plain.key_at(n).unwrap().cmp(&key)
+                );
+            }
+        }
+        let mut cursor = BlockCursor::new(native, 3).unwrap();
+        for n in 3..plain.record_count() {
+            let row = cursor.current().unwrap();
+            assert_eq!(row.key, plain.key_at(n).unwrap());
+            assert_eq!(row.to_owned(), plain.record_at(n).unwrap().to_owned());
+            cursor.advance().unwrap();
+        }
+        assert!(cursor.current().is_none());
+        for index in 0..encoded.len() {
+            let mut damaged = encoded.clone();
+            damaged[index] ^= 1;
+            assert!(ReadBlock::decode_prefix_indexed(
+                damaged,
+                &first,
+                None,
+                73,
+                fingerprint,
+                bytes.len()
+            )
+            .is_err());
+        }
     }
 
     #[test]

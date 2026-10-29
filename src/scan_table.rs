@@ -100,8 +100,8 @@ impl TableScan {
                     let (mut lo, mut hi) = (0, block.record_count());
                     while lo < hi {
                         let mid = lo + (hi - lo) / 2;
-                        let key = block.key_at(mid)?;
-                        if key < start.as_slice() || (excluded && key == start.as_slice()) {
+                        let order = block.compare_key_at(mid, start)?;
+                        if order.is_lt() || (excluded && order.is_eq()) {
                             lo = mid + 1;
                         } else {
                             hi = mid;

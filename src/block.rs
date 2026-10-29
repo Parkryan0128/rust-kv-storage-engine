@@ -15,6 +15,8 @@ pub(crate) struct ReadBlock {
     offsets: Vec<u32>,
     // Zero for legacy blocks; otherwise the persisted offset directory starts here.
     index_start: usize,
+    // Ordinary records begin at HEADER; prefix records follow their shared prefix.
+    record_start: usize,
 }
 
 // The owner contains no file or engine handle. Holding a returned value can
@@ -76,6 +78,7 @@ impl ReadBlock {
             bytes,
             offsets,
             index_start: 0,
+            record_start: HEADER,
         })
     }
 
@@ -120,6 +123,7 @@ impl ReadBlock {
                 bytes,
                 offsets: Vec::new(),
                 index_start,
+                record_start: HEADER,
             },
             fingerprint,
         ))
@@ -161,6 +165,15 @@ impl ReadBlock {
     }
 
     pub fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
+        let key = if self.record_start != HEADER {
+            let prefix = &self.bytes[HEADER + 8..self.record_start];
+            let Some(suffix) = key.strip_prefix(prefix) else {
+                return Ok(None);
+            };
+            suffix
+        } else {
+            key
+        };
         if self.index_start != 0 {
             let (mut left, mut right) = (0, self.record_count());
             while left < right {
@@ -235,6 +248,26 @@ impl ReadBlock {
         bytes.get(17..end).ok_or_else(|| corrupt("SST key bounds"))
     }
 
+    pub fn compare_key_at(&self, index: usize, key: &[u8]) -> Result<std::cmp::Ordering> {
+        let suffix = self.key_at(index)?;
+        Ok(if self.record_start == HEADER {
+            suffix.cmp(key)
+        } else {
+            prefix_block::compare_key(&self.bytes[HEADER + 8..self.record_start], suffix, key)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn full_key_at(&self, index: usize) -> Result<Vec<u8>> {
+        let mut key = if self.record_start == HEADER {
+            Vec::new()
+        } else {
+            self.bytes[HEADER + 8..self.record_start].to_vec()
+        };
+        key.extend_from_slice(self.key_at(index)?);
+        Ok(key)
+    }
+
     #[inline]
     pub fn record_at(&self, index: usize) -> Result<RecordRef<'_>> {
         decode_record_ref(&mut Cursor {
@@ -251,7 +284,8 @@ impl ReadBlock {
             self.offsets[index] as usize
         } else {
             let start = self.index_start + index * 4;
-            HEADER + u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
+            self.record_start
+                + u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
         };
         let end = if self.index_start == 0 {
             self.bytes.len()
@@ -275,6 +309,7 @@ impl ReadBlock {
 pub(crate) struct BlockCursor {
     block: ReadBlock,
     head: Option<RecordPosition>,
+    prefix_key: Vec<u8>,
 }
 struct RecordPosition {
     key_start: usize,
@@ -295,7 +330,11 @@ impl BlockCursor {
             };
             Some(end - block.record_bytes(index)?.len())
         };
-        let mut out = Self { block, head: None };
+        let mut out = Self {
+            block,
+            head: None,
+            prefix_key: Vec::new(),
+        };
         if let Some(offset) = offset {
             out.decode_at(offset)?;
         }
@@ -316,6 +355,12 @@ impl BlockCursor {
             .ok_or_else(|| corrupt("SST cursor offset"))?;
         let mut c = Cursor { b: bytes };
         let record = decode_record_ref(&mut c)?;
+        if self.block.record_start != HEADER {
+            self.prefix_key.clear();
+            self.prefix_key
+                .extend_from_slice(&self.block.bytes[HEADER + 8..self.block.record_start]);
+            self.prefix_key.extend_from_slice(record.key);
+        }
         let key_start = offset + 17;
         let key_end = key_start + record.key.len();
         self.head = Some(RecordPosition {
@@ -330,7 +375,11 @@ impl BlockCursor {
     pub fn current(&self) -> Option<RecordRef<'_>> {
         let head = self.head.as_ref()?;
         Some(RecordRef {
-            key: &self.block.bytes[head.key_start..head.key_end],
+            key: if self.prefix_key.is_empty() {
+                &self.block.bytes[head.key_start..head.key_end]
+            } else {
+                &self.prefix_key
+            },
             seq: head.seq,
             value: head
                 .has_value

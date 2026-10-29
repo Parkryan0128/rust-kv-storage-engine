@@ -324,11 +324,12 @@ length u32, prefix bytes, records with suffix-only keys using the existing
 17-byte record header, one u32 offset per record relative to the suffix-record
 region, and the tagged record count. The entire encoded payload is checksummed.
 The reader validates expansion length, directory, full record limits and CRC,
-expands once, then applies normal ordering, sequence and table-bound checks.
-Cached reads use the existing full-key block representation.
+then applies normal ordering, sequence and table-bound checks. Blocks remain
+prefix encoded in the cache. Point reads check the shared prefix once and
+search suffix keys; sequential cursors reconstruct only their current key.
 
 The writer uses this representation only with at least two records, a first
 key of at least 32 bytes, a common prefix of at least 16 bytes, and at least
 12.5% payload savings. Prefix sharing reduces storage and write traffic; it
-does add reconstruction work on a cache miss. It is not general value
+does add current-key reconstruction work for sequential cursors. It is not general value
 compression and does not change WAL durability or logical block boundaries.
