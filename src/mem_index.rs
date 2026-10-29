@@ -88,6 +88,23 @@ impl PageKeys {
             self.shared_prefix = 0;
         }
     }
+    // Appended rows are sorted, so the final endpoint proves the common
+    // prefix for the entire appended run. Never grow an existing proof.
+    fn refresh_appended_prefix(&mut self) {
+        let limit = self.shared_prefix.min(self.rows.last().unwrap().len());
+        if limit < 16 {
+            self.shared_prefix = 0;
+            return;
+        }
+        let first = &self.rows[0][..limit];
+        let last = &self.rows.last().unwrap()[..limit];
+        let shared = if first == last {
+            limit
+        } else {
+            first.iter().zip(last).position(|(a, b)| a != b).unwrap()
+        };
+        self.shared_prefix = if shared >= 16 { shared } else { 0 };
+    }
     fn position(&self, key: &[u8], prefix: u64) -> std::result::Result<usize, usize> {
         let lo = self.prefixes.partition_point(|p| *p < prefix);
         if self.prefixes.get(lo) != Some(&prefix) {
@@ -163,6 +180,7 @@ impl PageData {
         len: &mut usize,
     ) {
         let keys = Arc::make_mut(&mut self.keys);
+        let mut appended_prefix_dirty = false;
         while let Some((key, record)) = entries.peek() {
             if (remove_deletes && record.value.is_none())
                 || key.as_slice() < keys.rows[0].as_ref()
@@ -174,6 +192,10 @@ impl PageData {
             let position = if key.as_slice() > keys.rows.last().unwrap().as_ref() {
                 Err(keys.rows.len())
             } else {
+                if appended_prefix_dirty {
+                    keys.refresh_appended_prefix();
+                    appended_prefix_dirty = false;
+                }
                 keys.position(key, prefix)
             };
             if position.is_err()
@@ -192,7 +214,11 @@ impl PageData {
                     *bytes -= old.memory_size(&key);
                 }
                 Err(row) => {
-                    keys.observe_key(&key);
+                    if row == keys.rows.len() {
+                        appended_prefix_dirty |= keys.shared_prefix != 0;
+                    } else {
+                        keys.observe_key(&key);
+                    }
                     keys.key_bytes += key.len();
                     keys.rows.insert(row, Bytes::from(key));
                     keys.prefixes.insert(row, prefix);
@@ -200,6 +226,9 @@ impl PageData {
                     *len += 1;
                 }
             }
+        }
+        if appended_prefix_dirty {
+            keys.refresh_appended_prefix();
         }
     }
     fn fold(&mut self, updates: &mut PageUpdates) {
@@ -1072,6 +1101,61 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn appended_prefix_proofs_survive_out_of_order_batches_and_capacity_breaks() {
+        use std::collections::BTreeMap;
+        let key = |n: u64| {
+            let mut key = vec![b'x'; 128];
+            key.extend_from_slice(&n.to_be_bytes());
+            key
+        };
+        for initial in [3u64, 250] {
+            let mut map = MemIndex::default();
+            let mut model = BTreeMap::new();
+            for n in 0..initial {
+                let k = key(n * 2);
+                let r = record(n + 1);
+                map.insert(k.clone(), r.clone());
+                model.insert(k, r);
+            }
+            let old = map.snapshot(all()).unwrap();
+            let expected_old: Vec<_> = model.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+            let mut keys = vec![key(1000), key(1001), vec![b'y'; 24], key(1), key(1002)];
+            keys.extend((0..32u64).map(|n| {
+                let mut k = vec![b'z'; 24];
+                k.extend_from_slice(&n.to_be_bytes());
+                k
+            }));
+            keys.extend([vec![b'x'; 127], key(3)]);
+            let entries: Vec<_> = keys
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (k, record(10000 + i as u64)))
+                .collect();
+            let mut bytes = map.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>();
+            map.apply(entries.iter().cloned(), false, &mut bytes);
+            model.extend(entries);
+            assert_eq!(
+                bytes,
+                map.iter().map(|(k, r)| r.memory_size(k)).sum::<usize>()
+            );
+            for (k, r) in &model {
+                assert_eq!(map.get(k), Some(r));
+            }
+            for page in map.groups.iter().flat_map(|g| &g.pages) {
+                assert!(page
+                    .rows
+                    .iter()
+                    .all(|k| k.starts_with(&page.rows[0][..page.shared_prefix])));
+            }
+            assert_eq!(
+                map.snapshot(all()).unwrap().collect::<Vec<_>>(),
+                model.into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(old.collect::<Vec<_>>(), expected_old);
+        }
     }
 
     #[test]
