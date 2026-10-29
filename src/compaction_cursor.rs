@@ -23,6 +23,16 @@ impl TableCursor {
         self.block.as_ref().and_then(BlockCursor::current)
     }
 
+    pub(crate) fn has_prefix_blocks(&self) -> bool {
+        self.table.expanded_frame_limit.is_some()
+    }
+
+    pub(crate) fn current_for<const PREFIX: bool>(&self) -> Option<RecordRef<'_>> {
+        self.block
+            .as_ref()
+            .and_then(BlockCursor::current_for::<PREFIX>)
+    }
+
     pub fn advance(&mut self) -> Result<()> {
         if let Some(block) = &mut self.block {
             block.advance()?;

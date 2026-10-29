@@ -13,7 +13,7 @@ permissions:
   contents: read
 concurrency:
   # Unrequested pushes must not replace a queued requested comparison.
-  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}${{ contains(github.event.head_commit.message, '[large-frame-guard]') && '-large-frame' || '' }}${{ contains(github.event.head_commit.message, '[cache-policy-guard]') && '-cache-policy' || '' }}${{ contains(github.event.head_commit.message, '[prefix-block-guard]') && '-prefix' || '' }}${{ contains(github.event.head_commit.message, '[long-key-guard]') && '-long-key' || '' }}
+  group: performance-regression-loop-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[performance-regression-loop]')) && github.ref || github.sha }}${{ contains(github.event.head_commit.message, '[recovery-only]') && '-recovery' || '' }}${{ contains(github.event.head_commit.message, '[large-frame-guard]') && '-large-frame' || '' }}${{ contains(github.event.head_commit.message, '[cache-policy-guard]') && '-cache-policy' || '' }}${{ contains(github.event.head_commit.message, '[prefix-block-guard]') && '-prefix' || '' }}${{ contains(github.event.head_commit.message, '[long-key-guard]') && '-long-key' || '' }}${{ contains(github.event.head_commit.message, '[merge-guard]') && '-merge' || '' }}
   cancel-in-progress: false
 jobs:
   compare:
@@ -168,7 +168,7 @@ jobs:
         if: ${{ contains(github.event.head_commit.message, '[durable-write-guard]') && contains(github.event.head_commit.message, '[recovery-only]') }}
         run: python3 benchmarks/rocksdb-compare/writes.py focused-results/writes-guard --trials 12
       - name: Prefix-frame merge and cached or uncached read guards
-        if: ${{ contains(github.event.head_commit.message, '[prefix-block-guard]') }}
+        if: ${{ contains(github.event.head_commit.message, '[prefix-block-guard]') || contains(github.event.head_commit.message, '[merge-guard]') }}
         run: |
           python3 benchmarks/rocksdb-compare/merge_matrix.py focused-results/prefix-merge --allow-format-change --trials 12
       - name: Long common-prefix cached and uncached read guards

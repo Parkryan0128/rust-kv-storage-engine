@@ -373,9 +373,15 @@ impl BlockCursor {
         Ok(())
     }
     pub fn current(&self) -> Option<RecordRef<'_>> {
+        self.current_for::<true>()
+    }
+    // Compaction selects a plain-only specialization once for its input set.
+    // That loop need not branch on key representation for every candidate.
+    pub(crate) fn current_for<const PREFIX: bool>(&self) -> Option<RecordRef<'_>> {
+        debug_assert!(PREFIX || self.prefix_key.is_empty());
         let head = self.head.as_ref()?;
         Some(RecordRef {
-            key: if self.prefix_key.is_empty() {
+            key: if !PREFIX || self.prefix_key.is_empty() {
                 &self.block.bytes[head.key_start..head.key_end]
             } else {
                 &self.prefix_key

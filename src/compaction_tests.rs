@@ -51,7 +51,11 @@ fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
                         source as u64,
                         rows.iter().cloned().map(Ok),
                         rows.len() as u64,
-                        256,
+                        if long_keys && source % 2 == 1 {
+                            1024
+                        } else {
+                            256
+                        },
                         10,
                     )
                     .unwrap(),
@@ -60,6 +64,7 @@ fn tournament_and_linear_publish_identical_bytes_across_merge_shapes() {
             }
             for count in [2, 4, 8, 9, 16] {
                 let inputs = &tables[..count];
+                assert_eq!(Merge::new(inputs, false).unwrap().prefix_inputs, long_keys);
                 let mut model = BTreeMap::<Vec<u8>, Record>::new();
                 for (key, record) in versions[..count].iter().flatten() {
                     if model.get(key).is_none_or(|old| record.seq > old.seq) {

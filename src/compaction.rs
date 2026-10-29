@@ -95,6 +95,7 @@ pub(crate) struct Merge {
     #[cfg(test)]
     finished: bool,
     drop_tombstones: bool,
+    prefix_inputs: bool,
 }
 impl Merge {
     pub fn new(tables: &[Arc<Table>], drop_tombstones: bool) -> Result<Self> {
@@ -111,6 +112,7 @@ impl Merge {
             .cloned()
             .map(TableCursor::new)
             .collect::<Result<Vec<_>>>()?;
+        let prefix_inputs = cursors.iter().any(TableCursor::has_prefix_blocks);
         let tournament = tournament.then(|| Box::new(Tournament::new(&cursors)));
         Ok(Self {
             cursors,
@@ -119,10 +121,11 @@ impl Merge {
             #[cfg(test)]
             finished: false,
             drop_tombstones,
+            prefix_inputs,
         })
     }
 
-    fn consume_next<T>(
+    fn consume_next<const PREFIX: bool, T>(
         &mut self,
         consume: impl FnOnce(crate::codec::RecordRef<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
@@ -142,21 +145,21 @@ impl Merge {
                 }
                 if dense {
                     tree.invalidate();
-                    Self::select_linear(&self.cursors, &mut self.pending)
+                    Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
                 } else {
                     if rebuild {
-                        tree.rebuild(&self.cursors);
+                        tree.rebuild::<PREFIX>(&self.cursors);
                     } else {
-                        tree.repair(dirty, &self.cursors);
+                        tree.repair::<PREFIX>(dirty, &self.cursors);
                     }
                     tree.selected(&mut self.pending)
-                        .and_then(|i| self.cursors[i].current())
+                        .and_then(|i| self.cursors[i].current_for::<PREFIX>())
                 }
             } else {
                 while let Some(i) = self.pending.pop() {
                     self.cursors[i].advance()?;
                 }
-                Self::select_linear(&self.cursors, &mut self.pending)
+                Self::select_linear::<PREFIX>(&self.cursors, &mut self.pending)
             };
             let Some(newest) = newest else {
                 return Ok(None);
@@ -170,13 +173,13 @@ impl Merge {
     }
 
     #[inline]
-    fn select_linear<'a>(
+    fn select_linear<'a, const PREFIX: bool>(
         cursors: &'a [TableCursor],
         pending: &mut Vec<usize>,
     ) -> Option<crate::codec::RecordRef<'a>> {
         let mut newest: Option<crate::codec::RecordRef<'_>> = None;
         for (i, cursor) in cursors.iter().enumerate() {
-            if let Some(record) = cursor.current() {
+            if let Some(record) = cursor.current_for::<PREFIX>() {
                 let order = newest
                     .as_ref()
                     .map_or(std::cmp::Ordering::Less, |old| record.key.cmp(old.key));
@@ -200,9 +203,17 @@ impl Merge {
         }
         newest
     }
-    pub fn write_into(mut self, writer: &mut TableWriter) -> Result<()> {
+    pub fn write_into(self, writer: &mut TableWriter) -> Result<()> {
+        if self.prefix_inputs {
+            self.write_selected::<true>(writer)
+        } else {
+            self.write_selected::<false>(writer)
+        }
+    }
+
+    fn write_selected<const PREFIX: bool>(mut self, writer: &mut TableWriter) -> Result<()> {
         while self
-            .consume_next(|record| writer.push(record.key, record.seq, record.value))?
+            .consume_next::<PREFIX, _>(|record| writer.push(record.key, record.seq, record.value))?
             .is_some()
         {}
         Ok(())
@@ -216,7 +227,7 @@ impl Iterator for Merge {
         if self.finished {
             return None;
         }
-        match self.consume_next(|record| Ok((record.key.to_vec(), record.to_owned()))) {
+        match self.consume_next::<true, _>(|record| Ok((record.key.to_vec(), record.to_owned()))) {
             Ok(Some(record)) => Some(Ok(record)),
             result => {
                 self.finished = true;
