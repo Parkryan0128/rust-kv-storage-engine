@@ -89,11 +89,19 @@ jobs:
       - name: Snapshot writes, release and memory lookup guards
         run: |
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/snapshot --trials 12 --case snapshot-write32 --case snapshot-narrow-write32 --case snapshot-release --case keys-variable-memory --case keys-common128-memory
-          python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory --scan-focus --case memory-early10-100k --case memory-middle10-100k --case memory-get20k --case memory-get100k
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory --scan-focus
+          python3 benchmarks/rocksdb-compare/bounds.py focused-results/bounds
       - name: Durable writes and isolated snapshot CPU profiles
         run: |
           python3 benchmarks/rocksdb-compare/writes.py focused-results/writes
           python3 benchmarks/rocksdb-compare/internal.py focused-results/internal
+      - name: Tombstone scan regressions and separately timed write phases
+        run: |
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-engine-profile
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads --features write-profiling
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-baseline-profile
+          python3 benchmarks/rocksdb-compare/audit.py focused-results/audit
       - name: Preserve raw results
         if: always()
         uses: actions/upload-artifact@v4

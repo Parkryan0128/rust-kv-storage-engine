@@ -630,7 +630,8 @@ impl MemIndex {
         }
         // Copy one handle per group and retain only the current page directly.
         let current = Some(self.groups[start].pages[page].clone());
-        if !range.allows_end(current.as_ref().unwrap().rows.last().unwrap()) {
+        let page_end = MemScan::page_end(current.as_ref().unwrap(), &range);
+        if page_end < current.as_ref().unwrap().records.len() {
             // A range wholly inside one page needs no synthetic group or
             // directory allocation; the current page is the complete snapshot.
             return Some(MemScan {
@@ -638,6 +639,7 @@ impl MemIndex {
                 current,
                 page: 0,
                 row,
+                page_end,
                 range,
             });
         }
@@ -678,6 +680,7 @@ impl MemIndex {
             current,
             page,
             row,
+            page_end,
             range,
         })
     }
@@ -685,72 +688,78 @@ impl MemIndex {
 
 pub(crate) struct MemScan {
     groups: VecDeque<Arc<PageGroup>>,
-    // Cache the current page so each returned row avoids directory traversal.
     current: Option<Arc<Page>>,
     page: usize,
     row: usize,
+    // Exclusive end within this immutable page. Resolve bounds once per page,
+    // so skipped tombstones never fetch a key or repeat a byte comparison.
+    page_end: usize,
     range: Arc<KeyRange>,
 }
 impl MemScan {
-    // The merge keeps a borrowed head; losing versions never clone their values.
-    pub(crate) fn current(&self) -> Option<(&Bytes, &Record)> {
-        let page = self.current.as_ref()?;
-        let key = &page.rows[self.row];
-        self.range
-            .allows_end(key)
-            .then(|| (key, page.record(self.row)))
-    }
-    pub(crate) fn advance(&mut self) {
-        let Some(page) = self.current.as_ref() else {
-            return;
-        };
-        self.row += 1;
-        if self.row == page.rows.len() {
-            if self.groups.is_empty() {
-                self.current = None;
-                return;
-            }
-            self.page += 1;
-            self.row = 0;
-            if self.page == self.groups.front().unwrap().pages.len() {
-                self.groups.pop_front();
-                self.page = 0;
-            }
-            self.current = self.groups.front().map(|g| g.pages[self.page].clone());
+    fn page_end(page: &Page, range: &KeyRange) -> usize {
+        if range.allows_end(page.rows.last().unwrap()) {
+            return page.records.len();
+        }
+        match &range.end {
+            Bound::Included(end) => page
+                .rows
+                .partition_point(|key| key.as_ref() <= end.as_slice()),
+            Bound::Excluded(end) => page
+                .rows
+                .partition_point(|key| key.as_ref() < end.as_slice()),
+            Bound::Unbounded => page.records.len(),
         }
     }
-}
-// Keep the live-only projection inline: a consumed live row should not pass
-// through an intermediate Record or an additional out-of-line wrapper.
-impl MemScan {
+    fn finish_page(&mut self) {
+        let page = self.current.as_ref().unwrap();
+        if self.page_end < page.records.len() || self.groups.is_empty() {
+            self.current = None;
+            self.groups.clear();
+            return;
+        }
+        self.page += 1;
+        self.row = 0;
+        if self.page == self.groups.front().unwrap().pages.len() {
+            self.groups.pop_front();
+            self.page = 0;
+        }
+        self.current = self.groups.front().map(|g| g.pages[self.page].clone());
+        if let Some(page) = &self.current {
+            self.page_end = Self::page_end(page, &self.range);
+            if self.page_end == 0 {
+                self.current = None;
+                self.groups.clear();
+            }
+        }
+    }
+    // All current rows are already known to satisfy the snapshot bounds.
+    pub(crate) fn current(&self) -> Option<(&Bytes, &Record)> {
+        let page = self.current.as_ref()?;
+        Some((&page.rows[self.row], page.record(self.row)))
+    }
+    pub(crate) fn advance(&mut self) {
+        if self.current.is_none() {
+            return;
+        }
+        self.row += 1;
+        if self.row == self.page_end {
+            self.finish_page();
+        }
+    }
     #[inline]
     pub(crate) fn next_live(&mut self) -> Option<(Vec<u8>, Bytes)> {
         loop {
             let page = self.current.as_ref()?;
-            let key = &page.rows[self.row];
-            let record = page.record(self.row);
-            if !self.range.allows_end(key) {
-                self.current = None;
-                self.groups.clear();
-                return None;
-            }
-            let out = record
-                .value
-                .as_ref()
-                .map(|value| (crate::scan::copy_scan_key(key), value.clone()));
+            let out = page.record(self.row).value.as_ref().map(|value| {
+                (
+                    crate::scan::copy_scan_key(&page.rows[self.row]),
+                    value.clone(),
+                )
+            });
             self.row += 1;
-            if self.row == page.rows.len() {
-                if self.groups.is_empty() {
-                    self.current = None;
-                    return out;
-                }
-                self.page += 1;
-                self.row = 0;
-                if self.page == self.groups.front().unwrap().pages.len() {
-                    self.groups.pop_front();
-                    self.page = 0;
-                }
-                self.current = self.groups.front().map(|g| g.pages[self.page].clone());
+            if self.row == self.page_end {
+                self.finish_page();
             }
             if out.is_some() {
                 return out;
@@ -758,33 +767,14 @@ impl MemScan {
         }
     }
 }
-// Keep the single-source iterator in one body; borrowed merge traversal uses
-// the cursor methods above without forcing this hot path through them.
 impl Iterator for MemScan {
     type Item = (Vec<u8>, Record);
     fn next(&mut self) -> Option<Self::Item> {
         let page = self.current.as_ref()?;
-        let key = &page.rows[self.row];
-        let record = page.record(self.row);
-        if !self.range.allows_end(key) {
-            self.current = None;
-            self.groups.clear();
-            return None;
-        }
-        let out = (key.to_vec(), record.clone());
+        let out = (page.rows[self.row].to_vec(), page.record(self.row).clone());
         self.row += 1;
-        if self.row == page.rows.len() {
-            if self.groups.is_empty() {
-                self.current = None;
-                return Some(out);
-            }
-            self.page += 1;
-            self.row = 0;
-            if self.page == self.groups.front().unwrap().pages.len() {
-                self.groups.pop_front();
-                self.page = 0;
-            }
-            self.current = self.groups.front().map(|g| g.pages[self.page].clone());
+        if self.row == self.page_end {
+            self.finish_page();
         }
         Some(out)
     }
@@ -801,6 +791,75 @@ mod tests {
     }
     fn all() -> Arc<KeyRange> {
         Arc::new(KeyRange::new(..).unwrap())
+    }
+
+    #[test]
+    fn live_cursor_bounds_cross_pages_and_stop_amid_tombstones() {
+        let mut map = MemIndex::default();
+        let rows: Vec<_> = (0..2048u64)
+            .map(|n| {
+                let key = n.to_be_bytes().to_vec();
+                let record = Record {
+                    seq: n + 1,
+                    value: (n % 17 == 0 || n % 257 == 0)
+                        .then(|| Bytes::copy_from_slice(&n.to_be_bytes())),
+                };
+                map.insert(key.clone(), record.clone());
+                (key, record)
+            })
+            .collect();
+        for (lo, hi) in [
+            (0, 0),
+            (0, 1),
+            (0, 255),
+            (0, 256),
+            (255, 257),
+            (257, 768),
+            (1024, 1600),
+            (2047, 2048),
+        ] {
+            for include_start in [false, true] {
+                for include_end in [false, true] {
+                    let lo = (lo as u64).to_be_bytes();
+                    let hi = (hi as u64).to_be_bytes();
+                    let start = if include_start {
+                        Bound::Included(lo.as_slice())
+                    } else {
+                        Bound::Excluded(lo.as_slice())
+                    };
+                    let end = if include_end {
+                        Bound::Included(hi.as_slice())
+                    } else {
+                        Bound::Excluded(hi.as_slice())
+                    };
+                    let range = Arc::new(KeyRange::new((start, end)).unwrap());
+                    let expected: Vec<_> = rows
+                        .iter()
+                        .filter(|(key, _)| {
+                            (key.as_slice() > lo.as_slice()
+                                || (include_start && key.as_slice() == lo))
+                                && (key.as_slice() < hi.as_slice()
+                                    || (include_end && key.as_slice() == hi))
+                        })
+                        .cloned()
+                        .collect();
+                    let all: Vec<_> = map.snapshot(range.clone()).into_iter().flatten().collect();
+                    assert_eq!(all, expected);
+                    let mut scan = map.snapshot(range);
+                    let actual: Vec<_> =
+                        std::iter::from_fn(|| scan.as_mut()?.next_live()).collect();
+                    let expected: Vec<_> = expected
+                        .into_iter()
+                        .filter_map(|(key, record)| record.value.map(|value| (key, value)))
+                        .collect();
+                    assert_eq!(actual, expected);
+                    if let Some(scan) = scan {
+                        assert!(scan.current.is_none());
+                        assert!(scan.groups.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

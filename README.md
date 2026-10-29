@@ -121,6 +121,8 @@ Shared delta folds copy value handles while keeping the ordered keys and routing
 prefixes shared. Structural edits also detach the key arrays, so retaining a snapshot
 can still increase write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
 except that one larger key occupies its own page.
+The memory cursor resolves the upper bound once per page; live-only traversal
+skips tombstones without loading their keys or repeating the bound comparison.
 Iteration buffers one block and candidate record per SST, rather than all disk
 results. `.take(n)` limits consumption; `.collect()` allocates the full result.
 Drop or exhaust scans promptly: they retain the database lock and old SST handles,
