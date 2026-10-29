@@ -235,6 +235,9 @@ fn validate_batch(payload: &[u8], last_seq: u64) -> Result<(usize, &[u8], u64)> 
 
 // This bounded sample is only a performance hint, never proof of full ordering.
 // Missing later disorder simply retains the general streaming apply path.
+// Keep sampled decoding out of the hot frame loop, including small frames
+// that never invoke this hint.
+#[inline(never)]
 fn disordered_replay_prefix(records: &[u8], count: usize) -> bool {
     let mut cursor = Cursor { b: records };
     let mut previous = decode_record_ref(&mut cursor)
