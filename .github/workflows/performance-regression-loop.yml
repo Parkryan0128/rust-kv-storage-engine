@@ -196,6 +196,11 @@ jobs:
         run: |
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-large-range --trials 12 --case memory-early10-1m
           python3 benchmarks/rocksdb-compare/snapshot_scaling.py focused-results/snapshot-cpu
+      - name: Native prefix ranges and unchanged short-key range guards
+        if: ${{ contains(github.event.head_commit.message, '[prefix-range-guard]') }}
+        run: |
+          python3 benchmarks/rocksdb-compare/remaining.py focused-results/prefix-ranges --trials 12 --case prefix-range-4096-10 --case prefix-range-4096-512 --case prefix-range-4096-20000 --case prefix-range-16384-10 --case prefix-range-16384-512 --case prefix-range-16384-20000
+          python3 benchmarks/rocksdb-compare/workloads.py focused-results/short-range --baseline --reads-only --profile 1 --scenario scan-t1-span512 --trials 12
       - name: Recovery shapes beyond sequential ingestion
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite --case wal-put-sorted --case wal-put-random100k --case wal-batch32-random100k
       - name: Large-index clustered overwrite guard

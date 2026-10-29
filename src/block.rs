@@ -376,18 +376,24 @@ impl BlockCursor {
         let mut c = Cursor { b: bytes };
         let record = decode_record_ref(&mut c)?;
         if self.block.record_start != HEADER {
-            self.prefix_key.clear();
-            let key_len = self.block.record_start - HEADER - 8 + record.key.len();
+            let prefix_len = self.block.record_start - HEADER - 8;
+            // This block never changes. Preserve its common prefix and replace
+            // only the variable suffix as the cursor advances.
+            self.prefix_key.truncate(prefix_len);
+            let key_len = prefix_len + record.key.len();
             if self.prefix_key.capacity() < key_len {
                 // The encoded payload already contains the entire shared prefix
                 // and this suffix. A complete key fits within that payload, so
                 // no expanded-block allocation allowance is needed.
                 let maximum = self.block.bytes.len() - HEADER;
-                self.prefix_key
-                    .reserve_exact(key_len.next_power_of_two().min(maximum));
+                self.prefix_key.reserve_exact(
+                    key_len.next_power_of_two().min(maximum) - self.prefix_key.len(),
+                );
             }
-            self.prefix_key
-                .extend_from_slice(&self.block.bytes[HEADER + 8..self.block.record_start]);
+            if self.prefix_key.is_empty() {
+                self.prefix_key
+                    .extend_from_slice(&self.block.bytes[HEADER + 8..self.block.record_start]);
+            }
             self.prefix_key.extend_from_slice(record.key);
         }
         let key_start = offset + 17;

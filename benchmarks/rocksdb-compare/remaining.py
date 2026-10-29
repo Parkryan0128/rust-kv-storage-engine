@@ -123,6 +123,14 @@ def main():
             if args.cases and label in args.cases:
                 cases.append((label, "shaped-keys", dict(common, queries=50000,
                     common_prefix=True, disk=True, block=block, cache=cache), None))
+    # Native long-key scans validate every sampled range after the timed loop.
+    for block in [4096, 16384]:
+        for span, queries in [(10, 5000), (512, 500), (20000, 10)]:
+            label = f"prefix-range-{block}-{span}"
+            if args.cases and label in args.cases:
+                cases.append((label, "shaped-keys", dict(common, queries=queries,
+                    common_prefix=True, disk=True, block=block, cache=0,
+                    span=span, range_queries=True), None))
     # First small query set on tables just published by flush, without reopen.
     for common_prefix in [False, True]:
         for block in [4096, 16384]:

@@ -1105,6 +1105,9 @@ fn shaped_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     if raw["disk"].as_bool().unwrap_or(false) {
         db.flush()?;
     }
+    if raw["range_queries"].as_bool().unwrap_or(false) {
+        return shaped_ranges(path, &db, &keys, c, raw);
+    }
     let before = metrics(path)?;
     let stats_before = db.stats()?;
     let mut rng = c.seed;
@@ -1128,6 +1131,60 @@ fn shaped_keys(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         "shaped-keys",
         raw,
         json!({"seconds":seconds,"operations":c.queries,"ops_per_second":c.queries as f64/seconds,"latency":distribution(&mut latencies),"before":before,"after":metrics(path)?,"stats_before":stats_before,"stats_after":db.stats()?}),
+    );
+    Ok(())
+}
+
+// Native long-key range guard. Setup and full key/value validation are outside
+// the aggregate timer; both engines return independently owned keys and values.
+fn shaped_ranges(
+    path: &Path,
+    db: &Backend,
+    keys: &[Vec<u8>],
+    c: &Config,
+    raw: &Value,
+) -> Result<()> {
+    let span = c.span as usize;
+    assert!(span > 0 && span <= keys.len());
+    let mut upper = keys.last().unwrap().clone();
+    upper.push(0);
+    let bounds = |i: usize| {
+        let hi = keys.get(i + span).map_or(upper.as_slice(), Vec::as_slice);
+        (keys[i].as_slice(), hi)
+    };
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let mut rng = c.seed;
+    let start = Instant::now();
+    for _ in 0..c.queries {
+        let i = random(&mut rng) as usize % (keys.len() - span + 1);
+        let (lo, hi) = bounds(i);
+        for row in db.scan(lo, hi)? {
+            drop(black_box(row?));
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let after = metrics(path)?;
+    let stats_after = db.stats()?;
+    // Replay every sampled range after timing, including its exact exclusive end.
+    let mut rng = c.seed;
+    for _ in 0..c.queries {
+        let i = random(&mut rng) as usize % (keys.len() - span + 1);
+        let (lo, hi) = bounds(i);
+        let mut scan = db.scan(lo, hi)?;
+        for (j, expected_key) in keys[i..i + span].iter().enumerate() {
+            let (key, got) = scan.next().transpose()?.expect("range row");
+            assert_eq!(&key, expected_key);
+            assert_eq!(got.as_ref(), value((i + j) as u64, 0, c.value));
+        }
+        assert!(scan.next().is_none());
+    }
+    report(
+        "shaped-ranges",
+        raw,
+        json!({"seconds":seconds,"operations":c.queries,
+        "ops_per_second":c.queries as f64/seconds,"rows_per_query":span,
+        "before":before,"after":after,"stats_before":stats_before,"stats_after":stats_after}),
     );
     Ok(())
 }
