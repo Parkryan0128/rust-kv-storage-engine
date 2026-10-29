@@ -106,6 +106,13 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         run: python3 benchmarks/rocksdb-compare/remaining.py full-results/remaining
+      - name: Preserve completed read, write and recovery checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-comparison-read-recovery-checkpoint
+          path: full-results/
+          if-no-files-found: error
       - name: Memory scan scaling and point lookups
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 12
