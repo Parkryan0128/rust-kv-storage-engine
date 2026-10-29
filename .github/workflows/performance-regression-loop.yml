@@ -110,6 +110,9 @@ jobs:
           python3 benchmarks/rocksdb-compare/audit.py focused-results/audit
       - name: Recovery shapes beyond sequential ingestion
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery --trials 12 --case wal-single --case wal-batch256 --case wal-random --case wal-overwrite --case wal-put-sorted --case wal-put-random100k --case wal-batch32-random100k
+      - name: Large-index clustered overwrite guard
+        if: ${{ contains(github.event.head_commit.message, '[recovery-hotspot]') }}
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/recovery-hotspot --trials 12 --case wal-large-hotspot
       - name: Preserve completed write and recovery checkpoint
         uses: actions/upload-artifact@v4
         with:

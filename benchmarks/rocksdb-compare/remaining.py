@@ -68,6 +68,11 @@ def main():
             ("memory-get20k", "memory-get", dict(common, queries=200000), None),
             ("memory-get100k", "memory-get", dict(common, keys=100000, queries=200000), None),
         ])
+    # Opt-in guard: 100k live keys followed by 100k writes to a shuffled 1k-key hotspot.
+    # Keep historical default matrices unchanged.
+    if args.cases and "wal-large-hotspot" in args.cases:
+        cases.append(("wal-large-hotspot", "recover",
+                      dict(common, keys=200000, batch=32, wal_pattern="hotspot"), "prepare-wal"))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

@@ -77,8 +77,12 @@ impl Config {
         assert!(c.memtable > 0 && (1..=256).contains(&c.scan_repeat_passes));
         assert!(matches!(
             c.wal_pattern.as_str(),
-            "sorted" | "random" | "overwrite"
+            "sorted" | "random" | "overwrite" | "hotspot"
         ));
+        if c.wal_pattern == "hotspot" {
+            // Complete 1,000-key cycles make every final generation explicit.
+            assert!((2_000..=510_000).contains(&c.keys) && c.keys.is_multiple_of(2_000));
+        }
         assert!(!c.wal_individual || c.batch == 1);
         assert!((1..=16).contains(&c.generations));
         assert!((8..=1024).contains(&c.merge_key_bytes));
@@ -646,6 +650,14 @@ fn prepare_wal(path: &Path, c: &Config) -> Result<()> {
         let (i, generation) = if c.wal_pattern == "overwrite" {
             let distinct = (c.keys / 10).max(1);
             (operation % distinct, (operation / distinct) as u8)
+        } else if c.wal_pattern == "hotspot" {
+            let distinct = c.keys / 2;
+            if operation < distinct {
+                (operation, 0)
+            } else {
+                let update = operation - distinct;
+                ((update * 7919) % 1_000, (update / 1_000 + 1) as u8)
+            }
         } else {
             (operation, 0)
         };
@@ -700,12 +712,16 @@ fn recover(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     );
     let distinct = if c.wal_pattern == "overwrite" {
         (c.keys / 10).max(1)
+    } else if c.wal_pattern == "hotspot" {
+        c.keys / 2
     } else {
         c.keys
     };
     for i in 0..distinct {
         let generation = if c.wal_pattern == "overwrite" {
             ((c.keys - 1 - i) / distinct) as u8
+        } else if c.wal_pattern == "hotspot" && i < 1_000 {
+            (distinct / 1_000) as u8
         } else {
             0
         };
