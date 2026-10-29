@@ -92,7 +92,8 @@ impl Wal {
                     let mut cursor = Cursor { b: records };
                     let entries = (0..count)
                         .map(|_| decode_record(&mut cursor).expect("validated WAL batch"));
-                    if count > REPLAY_RECORDS && !disordered_replay_prefix(records, count) {
+                    if count > REPLAY_STREAM_THRESHOLD && !disordered_replay_prefix(records, count)
+                    {
                         pending.flush(&mut table);
                         table.apply(entries, false);
                     } else {
@@ -267,7 +268,11 @@ fn replay_batch(payload: &[u8], table: &mut MemTable, last_seq: &mut u64) -> Res
     Ok(())
 }
 
-const REPLAY_RECORDS: usize = 256;
+// The large-frame streaming threshold is independent of staging capacity.
+const REPLAY_STREAM_THRESHOLD: usize = 256;
+const REPLAY_RECORDS: usize = 1024;
+// Temporary replay payload is bounded separately from retained WAL I/O buffers.
+const REPLAY_BYTES: usize = 256 * 1024;
 struct ReplayBuffer {
     entries: Vec<(Vec<u8>, Record)>,
     bytes: usize,
@@ -285,7 +290,7 @@ impl Default for ReplayBuffer {
 impl ReplayBuffer {
     fn push(&mut self, entry: (Vec<u8>, Record), table: &mut MemTable) {
         let bytes = entry.1.memory_size(&entry.0);
-        if self.bytes + bytes > MAX_RETAINED_BUFFER {
+        if self.bytes + bytes > REPLAY_BYTES {
             self.flush(table);
         }
         if self.sorted && self.entries.last().is_some_and(|last| last.0 > entry.0) {
@@ -293,7 +298,7 @@ impl ReplayBuffer {
         }
         self.entries.push(entry);
         self.bytes += bytes;
-        if self.entries.len() == REPLAY_RECORDS || self.bytes >= MAX_RETAINED_BUFFER {
+        if self.entries.len() == REPLAY_RECORDS || self.bytes >= REPLAY_BYTES {
             self.flush(table);
         }
     }

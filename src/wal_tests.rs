@@ -480,18 +480,14 @@ fn replay_staging_is_bounded_and_oversized_rows_do_not_stay_buffered() {
     let mut buffer = ReplayBuffer::default();
     let mut table = MemTable::default();
     let mut model = std::collections::BTreeMap::new();
-    for seq in 1..=1200u64 {
+    for seq in 1..=(REPLAY_RECORDS as u64 * 3 + 19) {
         let key = ((seq * 7919) % 509).to_be_bytes().to_vec();
         let record = Record {
             seq,
             value: (seq % 11 != 0).then(|| {
                 Bytes::from(vec![
                     seq as u8;
-                    if seq == 17 {
-                        MAX_RETAINED_BUFFER * 3
-                    } else {
-                        17
-                    }
+                    if seq == 17 { REPLAY_BYTES * 3 } else { 17 }
                 ])
             }),
         };
@@ -499,7 +495,7 @@ fn replay_staging_is_bounded_and_oversized_rows_do_not_stay_buffered() {
         buffer.push((key, record), &mut table);
         assert!(buffer.entries.len() < REPLAY_RECORDS);
         assert!(buffer.entries.capacity() <= REPLAY_RECORDS);
-        assert!(buffer.bytes < MAX_RETAINED_BUFFER);
+        assert!(buffer.bytes < REPLAY_BYTES);
         if seq == 17 {
             assert!(buffer.entries.is_empty());
         }
@@ -570,7 +566,8 @@ fn replay_order_sample_does_not_assume_the_entire_batch_is_sorted() {
 fn sparse_replay_chunks_keep_latest_values_and_accounting_without_sorting() {
     let mut table = MemTable::default();
     let mut model = std::collections::BTreeMap::new();
-    for key in 0..33_000u64 {
+    let keys = (REPLAY_RECORDS as u64 / 2 + 1) * 256;
+    for key in 0..keys {
         let bytes = key.to_be_bytes().to_vec();
         let record = single(b"initial", key + 1);
         table.insert(bytes.clone(), record.clone());
@@ -578,10 +575,10 @@ fn sparse_replay_chunks_keep_latest_values_and_accounting_without_sorting() {
     }
     assert!(table.data.page_count() > REPLAY_RECORDS / 2);
     let mut pending = ReplayBuffer::default();
-    for n in 0..1025u64 {
+    for n in 0..(REPLAY_RECORDS as u64 + 1) {
         let key = ((n * 7919) % 997).to_be_bytes().to_vec();
         let record = Record {
-            seq: 33_001 + n,
+            seq: keys + 1 + n,
             value: (n % 7 != 0).then(|| Bytes::from(vec![n as u8; (n % 71) as usize])),
         };
         model.insert(key.clone(), record.clone());
