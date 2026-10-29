@@ -20,12 +20,21 @@ fn prefix(key: &[u8]) -> u64 {
 }
 
 fn preceding(prefixes: &[u64], needle: u64, before: impl Fn(usize) -> bool) -> usize {
+    if prefixes.len() <= 1 {
+        return 0;
+    }
     let right = prefixes.partition_point(|p| *p <= needle);
     let last = right.saturating_sub(1);
     if right == 0 || prefixes[last] != needle || before(last) {
         return last;
     }
-    let mut left = prefixes[..right].partition_point(|p| *p < needle);
+    // With a shared prefix the lower bound is already known. Keep complete
+    // key comparisons for ordering; the prefix is only a routing hint.
+    let mut left = if prefixes[0] == needle {
+        0
+    } else {
+        prefixes[..right].partition_point(|p| *p < needle)
+    };
     let mut right = right;
     while left < right {
         let middle = left + (right - left) / 2;
@@ -53,7 +62,13 @@ impl PageKeys {
             return Err(lo);
         }
         let hi = if self.prefixes.get(lo + 1) == Some(&prefix) {
-            lo + self.prefixes[lo..].partition_point(|p| *p == prefix)
+            // Common-prefix keys often fill the rest of the page. The last
+            // prefix gives the upper bound without another binary search.
+            if self.prefixes.last() == Some(&prefix) {
+                self.prefixes.len()
+            } else {
+                lo + self.prefixes[lo..].partition_point(|p| *p == prefix)
+            }
         } else {
             lo + 1
         };
@@ -1693,6 +1708,26 @@ mod tests {
         }
         for (key, value) in &model {
             assert_eq!(map.get(key), Some(value));
+        }
+        // Missing keys inside an equal-prefix run must preserve full byte
+        // order at page/group boundaries, including an exclusive lower bound.
+        for n in [0u32, 1, 255, 256, 257, 16_383, 16_384, 19_999, 20_000] {
+            let mut probe = b"abcdefgh".to_vec();
+            probe.extend_from_slice(&n.to_be_bytes());
+            probe.push(0);
+            assert_eq!(map.get(&probe), model.get(&probe));
+            let upper = b"abcdefgi".as_slice();
+            let expected: Vec<_> = model
+                .iter()
+                .filter(|(key, _)| key.as_slice() > probe.as_slice() && key.as_slice() < upper)
+                .take(17)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let range = Arc::new(
+                KeyRange::new((Bound::Excluded(probe.as_slice()), Bound::Excluded(upper))).unwrap(),
+            );
+            let actual: Vec<_> = map.snapshot(range).into_iter().flatten().take(17).collect();
+            assert_eq!(actual, expected);
         }
         let snapshot = map.snapshot(all()).unwrap();
         for key in keys.iter().step_by(3) {

@@ -217,3 +217,9 @@ and memtable budgets are unchanged. Historical runs without this config used
 RocksDB's default flush-on-recovery policy, so those RocksDB ratios also include
 SST creation and must not be presented as a pure WAL replay speed difference.
 See [RocksDB WAL recovery options](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log).
+
+Memory routing skips searches whose bounds are already known: a directory with
+one entry needs no search, and an equal-prefix suffix ends at the last entry.
+Complete key-byte comparisons still decide ordering when prefixes collide.
+The variable/common-prefix memory workloads and boundary/model tests guard
+these shortcuts without adding an index, cache, or retained allocation.
