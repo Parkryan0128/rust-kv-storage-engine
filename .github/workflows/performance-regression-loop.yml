@@ -151,6 +151,9 @@ jobs:
         run: |
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/mixed-size --trials 12 --case mixed-small-large --case mixed-pressure-4m
           python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-throughput --trials 12 --case memory-get20k-throughput --case memory-get100k-throughput
+      - name: Large owned values with and without caching and retained after eviction
+        if: ${{ contains(github.event.head_commit.message, '[large-value-guard]') }}
+        run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/large-values --trials 12 --case oversized-2m --case oversized-2m-no-cache --case retained-large-0 --case retained-large-1048576
       - name: Variable and common-prefix memory keys
         if: ${{ contains(github.event.head_commit.message, '[memory-key-guard]') }}
         run: python3 benchmarks/rocksdb-compare/remaining.py focused-results/memory-keys --trials 12 --case keys-variable-memory --case keys-common128-memory

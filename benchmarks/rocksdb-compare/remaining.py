@@ -86,6 +86,17 @@ def main():
         if args.cases and label in args.cases:
             cases.append((label, "recover", dict(common, keys=keys, value=value,
                           wal_pattern=pattern, batch=batch), "prepare-wal"))
+    # Opt-in immutable large-value lifetime and disabled-cache resource guards.
+    large_guards = [
+        ("oversized-2m-no-cache", "read", dict(common, keys=2, value=2097152,
+            span=1, queries=512, cache=0), "prepare"),
+        *[(f"retained-large-{cache}", "retained-large", dict(common, keys=64,
+            value=262144, queries=64, span=1, cache=cache), "prepare")
+          for cache in [0, 1048576]],
+    ]
+    for case in large_guards:
+        if args.cases and case[0] in args.cases:
+            cases.append(case)
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]
@@ -124,7 +135,7 @@ def main():
                     rows.append(row)
             expected = {"prepare": [], "prepare-wal": [], "read": ["open", "first", "repeat"],
                 "recover": ["recover"], "memory-scan": ["memory-scan"], "memory-get": ["memory-get"], "mixed-large": ["first", "repeat"], "cache-phase": ["first", "repeat"], "snapshot-write": ["snapshot-write"]}
-            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release"]})
+            expected.update({mode: [mode] for mode in ["shaped-keys", "disjoint-range", "mixed-steady", "snapshot-release", "retained-large"]})
             assert [r["stage"] for r in rows] == expected[mode]
             return rows
         fixtures = {}

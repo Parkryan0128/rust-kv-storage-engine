@@ -103,7 +103,7 @@ impl Backend {
             write,
         })
     }
-    // Owned values on both sides; do not compare engine copies against pinned
+    // Independently owned immutable values on both sides; do not compare against pinned
     // RocksDB cache slices with a different ownership/lifetime contract.
     pub fn get(&self, key: &[u8]) -> Result<Option<bytes::Bytes>> {
         Ok(self.db.get(key)?.map(bytes::Bytes::from))

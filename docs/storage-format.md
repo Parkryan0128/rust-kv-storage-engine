@@ -57,8 +57,15 @@ every disk read still verifies the entire frame CRC. A changed CRC triggers full
 validation again. This uses the existing CRC32 corruption model, not authentication
 against deliberate checksum collisions. Search-path record decoding remains checked.
 Versions 01/02 rebuild and validate their offset arrays on each cache miss.
-Only the requested value is copied out, so retaining a
-small returned value does not retain the whole block. Cache accounting includes
+Small returned values are copied out and cannot retain a whole block. A value
+of at least 64 KiB may share a validated immutable block if it is the only
+record and the allocated frame/index plus block metadata exceed its length by
+at most 256 bytes (excluding allocator, Arc and Bytes bookkeeping). Other
+values are copied. Shared values survive cache eviction and engine shutdown
+without retaining files or the database lock. Retaining a short slice of a
+large value can retain that large value, as with other shared `Bytes`; converting
+a shared value into mutable storage requires a copy. Caller-held values are
+outside the cache capacity. Cache accounting includes
 the allocated frame/index capacities and an allowance for cache bookkeeping;
 it is not a hard bound on process RSS. Table inspection reads one encoded block
 at a time and copies only the preview's first 128 bytes of each key/value.

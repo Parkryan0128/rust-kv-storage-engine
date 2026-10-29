@@ -920,6 +920,46 @@ fn mixed_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     Ok(())
 }
 
+// Each returned value is distinct and is retained past cache eviction and
+// database shutdown. The fixture is prepared in another process, so setup
+// allocation reuse does not hide retained-value RSS.
+fn retained_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
+    assert!(path.exists() && c.value >= 64 * 1024 && c.queries == c.keys as usize);
+    let db = Backend::open(path, c)?;
+    let mut order: Vec<u64> = (0..c.keys).collect();
+    let mut rng = c.seed;
+    for i in (1..order.len()).rev() {
+        order.swap(i, random(&mut rng) as usize % (i + 1));
+    }
+    let mut held = Vec::with_capacity(order.len());
+    let before = metrics(path)?;
+    let stats_before = db.stats()?;
+    let start = Instant::now();
+    for &i in &order {
+        held.push(db.get(&key(i))?.ok_or("missing retained value")?);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let after = metrics(path)?;
+    let stats_after = db.stats()?;
+    #[cfg(not(feature = "rocks"))]
+    assert!(stats_after["cache_bytes"].as_u64().unwrap() <= c.cache as u64);
+    drop(db);
+    let after_close = metrics(path)?;
+    for (&i, bytes) in order.iter().zip(&held) {
+        assert_eq!(bytes.as_ref(), value(i, 0, c.value));
+    }
+    drop(held);
+    report(
+        "retained-large",
+        raw,
+        json!({"seconds":seconds,"operations":c.keys,
+        "retained_value_bytes":c.keys * c.value as u64,"verification_timed":false,
+        "before":before,"after":after,"after_close":after_close,
+        "after_release":metrics(path)?,"stats_before":stats_before,"stats_after":stats_after}),
+    );
+    Ok(())
+}
+
 fn cache_phase(path: &Path, c: &Config, raw: &Value) -> Result<()> {
     assert!(!path.exists());
     let db = Backend::open(path, c)?;
@@ -1412,6 +1452,7 @@ fn main() -> Result<()> {
         "memory-scan" => memory_scan(path, &c, &raw)?,
         "memory-get" => memory_get(path, &c, &raw)?,
         "mixed-large" => mixed_large(path, &c, &raw)?,
+        "retained-large" => retained_large(path, &c, &raw)?,
         "cache-phase" => cache_phase(path, &c, &raw)?,
         "snapshot-write" => snapshot_write(path, &c, &raw)?,
         "shaped-keys" => shaped_keys(path, &c, &raw)?,

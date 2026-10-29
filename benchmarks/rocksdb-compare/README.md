@@ -257,3 +257,9 @@ The default public read probe uses modulo after the four-binary API diagnostic f
 `[read-variance-guard]` adds 12-trial 2/4 MiB mixed-size reads and two-million-query memory Get passes at 20,000/100,000 keys. The opt-in memory throughput cases consume and drop owned values, then validate the identical seeded trace outside timing; historical memory-get cases keep their original timed validation. Resource snapshots also retain process minor/major page faults from [proc_pid_stat(5)](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html), sampled outside the timer like RSS and I/O counters. Mixed-size cases keep their timed value verification and do not measure concurrent writes.
 
 `[memory-key-guard]` adds variable-length and 128-byte common-prefix memory lookups with 12 trials. `[durable-write-guard]` adds the four 12-trial synced-write cases to a recovery-only comparison. These guard short-key routing optimizations against longer keys, normal writes and flush pressure; no durability setting changes.
+
+[large-value-guard] adds 12-trial 2 MiB reads with and without caching,
+plus 64 distinct 256 KiB values retained past eviction and database shutdown
+with zero/1 MiB cache. Resource snapshots precede untimed value verification;
+fixture preparation runs in a separate process. Retained values are owned
+Bytes on all backends, though the engine may share a bounded immutable block.

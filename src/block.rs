@@ -1,12 +1,26 @@
 use crate::{codec::*, error::corrupt, memtable::Record, Result};
+use bytes::Bytes;
+use std::sync::Arc;
 
-// The frame and offsets stay immutable after validation. Only the selected
-// value is copied out, so a caller retaining a small value cannot pin a block.
+pub(crate) const SHARE_LARGE_VALUE_AT: usize = 64 * 1024;
+const MAX_SHARED_OVERHEAD: usize = 256;
+
+// The frame and offsets stay immutable after validation. Small values are
+// copied out; a lone large value may share its block with bounded overhead.
 pub(crate) struct ReadBlock {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
     // Zero for legacy blocks; otherwise the persisted offset directory starts here.
     index_start: usize,
+}
+
+// The owner contains no file or engine handle. Holding a returned value can
+// retain only this immutable allocation, and prevents cache buffer recycling.
+struct SharedReadBlock(Arc<ReadBlock>);
+impl AsRef<[u8]> for SharedReadBlock {
+    fn as_ref(&self) -> &[u8] {
+        &self.0.bytes
+    }
 }
 
 impl ReadBlock {
@@ -171,6 +185,30 @@ impl ReadBlock {
                 .expect("immutable validated record")
                 .to_owned(),
         ))
+    }
+
+    // Keep ordinary block lookup unchanged. Sharing is worthwhile only when
+    // one large value accounts for essentially the entire allocation.
+    #[inline(never)]
+    pub fn lookup_shared_large(self: &Arc<Self>, key: &[u8]) -> Result<Option<Record>> {
+        if self.record_count() != 1 {
+            return self.lookup(key);
+        }
+        let record = self.record_at(0)?;
+        if record.key != key {
+            return Ok(None);
+        }
+        if let Some(value) = record.value {
+            if value.len() >= SHARE_LARGE_VALUE_AT
+                && self.allocated_bytes().saturating_sub(value.len()) <= MAX_SHARED_OVERHEAD
+            {
+                return Ok(Some(Record {
+                    seq: record.seq,
+                    value: Some(Bytes::from_owner(SharedReadBlock(self.clone())).slice_ref(value)),
+                }));
+            }
+        }
+        Ok(Some(record.to_owned()))
     }
 
     pub fn record_count(&self) -> usize {
@@ -660,5 +698,80 @@ mod tests {
             assert!(ReadBlock::decode(bytes.clone(), b"a", Some(next), 3).is_err());
         }
         assert!(ReadBlock::decode(bytes, b"a", Some(b"zz"), 3).is_ok());
+    }
+    fn shared_test_block(records: &[TestRecord<'_>], indexed: bool) -> ReadBlock {
+        let mut bytes = if indexed {
+            indexed_frame(records)
+        } else {
+            frame(records)
+        };
+        bytes.shrink_to_fit();
+        if indexed {
+            ReadBlock::decode_indexed(bytes, records[0].0, None, u64::MAX, 0)
+                .unwrap()
+                .0
+        } else {
+            ReadBlock::decode(bytes, records[0].0, None, u64::MAX).unwrap()
+        }
+    }
+
+    #[test]
+    fn lone_large_value_shares_immutable_storage_until_last_slice_is_dropped() {
+        for indexed in [false, true] {
+            for length in [SHARE_LARGE_VALUE_AT, SHARE_LARGE_VALUE_AT + 37] {
+                let value: Vec<u8> = (0..length).map(|n| (n % 251) as u8).collect();
+                let block = Arc::new(shared_test_block(&[(b"key", 7, Some(&value))], indexed));
+                let weak = Arc::downgrade(&block);
+                let source = block.record_at(0).unwrap().value.unwrap().as_ptr();
+                assert!(block.lookup_shared_large(b"missing").unwrap().is_none());
+                let result = block.lookup_shared_large(b"key").unwrap().unwrap();
+                assert_eq!(result.seq, 7);
+                let bytes = result.value.unwrap();
+                assert_eq!(bytes.as_ptr(), source);
+                assert_eq!(bytes.as_ref(), value);
+                let middle = bytes.slice(31..length - 7);
+                let mut mutable = bytes::BytesMut::from(bytes.clone());
+                mutable[31] ^= 255;
+                assert_eq!(bytes[31], value[31]);
+                drop(block);
+                drop(bytes);
+                assert!(weak.upgrade().is_some());
+                assert_eq!(middle.as_ref(), &value[31..length - 7]);
+                drop(middle);
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sharing_rejects_small_values_large_overhead_and_multiple_records() {
+        let large = vec![93; SHARE_LARGE_VALUE_AT];
+        let long_key = vec![b'a'; MAX_SHARED_OVERHEAD + 1];
+        for indexed in [false, true] {
+            let cases: Vec<Vec<TestRecord<'_>>> = vec![
+                vec![(b"a", 1, Some(&large[..large.len() - 1]))],
+                vec![(&long_key, 2, Some(&large))],
+                vec![(b"a", 3, Some(&large)), (b"b", 4, None)],
+                vec![(b"a", 5, None)],
+                vec![(b"a", 6, Some(b""))],
+            ];
+            for records in cases {
+                let block = Arc::new(shared_test_block(&records, indexed));
+                let weak = Arc::downgrade(&block);
+                let result = block.lookup_shared_large(records[0].0).unwrap().unwrap();
+                assert_eq!(result.seq, records[0].1);
+                drop(block);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(result.value.as_deref(), records[0].2);
+            }
+            let mut block = shared_test_block(&[(b"a", 7, Some(&large))], indexed);
+            block.bytes.reserve_exact(MAX_SHARED_OVERHEAD + 1);
+            let block = Arc::new(block);
+            let weak = Arc::downgrade(&block);
+            let result = block.lookup_shared_large(b"a").unwrap().unwrap();
+            drop(block);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(result.value.as_deref(), Some(large.as_slice()));
+        }
     }
 }

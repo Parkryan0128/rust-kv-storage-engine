@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::cache::Cache;
 use crate::{
-    block::{indexed_records, BlockCursor, ReadBlock},
+    block::{indexed_records, BlockCursor, ReadBlock, SHARE_LARGE_VALUE_AT},
     bloom::Bloom,
     cache::{BlockCache, CacheKey, Counters},
     codec::*,
@@ -326,7 +326,12 @@ impl Table {
         let n = p - 1;
         if cache.is_disabled() {
             counters.reads.fetch_add(1, Ordering::Relaxed);
-            return self.read_stream_block(n, None)?.lookup(key);
+            let block = self.read_stream_block(n, None)?;
+            return if block.frame_capacity() >= SHARE_LARGE_VALUE_AT {
+                Arc::new(block).lookup_shared_large(key)
+            } else {
+                block.lookup(key)
+            };
         }
         // Drop the cache lock before reading from disk.
         let i = &self.index[n];
@@ -365,7 +370,11 @@ impl Table {
             );
             b
         };
-        block.lookup(key)
+        if i.len as usize >= SHARE_LARGE_VALUE_AT {
+            block.lookup_shared_large(key)
+        } else {
+            block.lookup(key)
+        }
     }
     // Mark before purging all cache shards. Once each shard's purge finishes,
     // an old snapshot can still read the file but cannot refill that shard.
