@@ -123,6 +123,13 @@ def main():
             if args.cases and label in args.cases:
                 cases.append((label, "shaped-keys", dict(common, queries=50000,
                     common_prefix=True, disk=True, block=block, cache=cache), None))
+    # First small query set on tables just published by flush, without reopen.
+    for common_prefix in [False, True]:
+        for block in [4096, 16384]:
+            label = f"published-{'common' if common_prefix else 'variable'}-{block}"
+            if args.cases and label in args.cases:
+                cases.append((label, "shaped-keys", dict(common, queries=2000,
+                    common_prefix=common_prefix, disk=True, block=block), None))
     # Both engines return with the replayed data in memory, before an SST flush.
     cases = [(label, mode, dict(config, recover_to_memtable=True) if mode == "recover" else config, preparation)
              for label, mode, config, preparation in cases]

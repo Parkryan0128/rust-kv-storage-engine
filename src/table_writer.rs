@@ -138,11 +138,16 @@ impl TableWriter {
         // Coalesce frames while retaining the same logical block boundaries.
         self.file.write_all(published)?;
         let published_len = published.len();
+        let validated =
+            (1u64 << 32) | u32::from_le_bytes(published[8..12].try_into().unwrap()) as u64;
         self.index.push(Index {
             first: std::mem::take(&mut self.first),
             offset: self.position,
             len: published_len as u32,
-            validated: AtomicU64::new(0),
+            // push() checked every record and the writer constructed offsets
+            // and CRC. A later read still checks CRC; changed frames are fully
+            // revalidated. Reopened tables start without this in-memory proof.
+            validated: AtomicU64::new(validated),
         });
         self.position += published_len as u64;
         // A large record should not pin scratch space for the rest of a long merge.
@@ -351,6 +356,50 @@ mod tests {
             cursor.advance().unwrap();
         }
         assert!(cursor.current().is_none());
+    }
+
+    #[test]
+    fn published_validation_rechecks_changed_crc_before_and_after_first_read() {
+        for prefix_len in [0, 128] {
+            for warmed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("changed.sst");
+                let mut writer = TableWriter::new(&path, 3, 4096, 10, false).unwrap();
+                let mut first = vec![b'x'; prefix_len];
+                first.extend_from_slice(&0u64.to_be_bytes());
+                for n in 0..3u64 {
+                    let mut key = vec![b'x'; prefix_len];
+                    key.extend_from_slice(&n.to_be_bytes());
+                    writer.push(&key, n + 1, Some(&[42; 16])).unwrap();
+                }
+                let table = writer.finish(&path, 1, 10).unwrap();
+                let cache = BlockCache::new(0);
+                let counters = Counters::default();
+                if warmed {
+                    assert!(table.get(&first, &cache, &counters).unwrap().is_some());
+                }
+                let mut bytes = fs::read(&path).unwrap();
+                let entry = &table.index[0];
+                let block =
+                    &mut bytes[entry.offset as usize..entry.offset as usize + entry.len as usize];
+                let start = if prefix_len == 0 {
+                    HEADER
+                } else {
+                    HEADER
+                        + 8
+                        + u32::from_le_bytes(block[HEADER + 4..HEADER + 8].try_into().unwrap())
+                            as usize
+                };
+                block[start..start + 8].fill(0); // Invalid sequence, with a valid new CRC.
+                let header = frame_header(&block[HEADER..]).unwrap();
+                block[..HEADER].copy_from_slice(&header);
+                fs::write(&path, bytes).unwrap();
+                assert!(matches!(
+                    table.get(&first, &cache, &counters),
+                    Err(crate::EngineError::Corruption(_))
+                ));
+            }
+        }
     }
 
     #[test]
