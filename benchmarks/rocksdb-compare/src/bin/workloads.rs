@@ -954,6 +954,7 @@ fn retained_large(path: &Path, c: &Config, raw: &Value) -> Result<()> {
         raw,
         json!({"seconds":seconds,"operations":c.keys,
         "retained_value_bytes":c.keys * c.value as u64,"verification_timed":false,
+        "ops_per_second":c.keys as f64 / seconds,
         "before":before,"after":after,"after_close":after_close,
         "after_release":metrics(path)?,"stats_before":stats_before,"stats_after":stats_after}),
     );
