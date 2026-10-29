@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_key_capacity_stays_inside_the_expanded_frame_charge() {
+    fn cursor_key_capacity_stays_inside_the_encoded_frame_charge() {
         let mut first = vec![b'x'; 128];
         first.push(0);
         let mut last = vec![b'x'; 128];
@@ -313,13 +313,14 @@ mod tests {
         put_u32(&mut full, 2);
         let mut encoded = Vec::new();
         assert!(encode_prefix_frame(&full, &first, &last, &mut offsets, &mut encoded).unwrap());
+        let encoded_size = encoded.len();
         let (block, _) =
             ReadBlock::decode_prefix_indexed(encoded, &first, None, 2, 0, full.len()).unwrap();
         let mut cursor = BlockCursor::new(block, 0).unwrap();
         assert_eq!(cursor.current().unwrap().key, first);
         cursor.advance().unwrap();
         assert_eq!(cursor.current().unwrap().key, last);
-        assert!(cursor.prefix_key.capacity() <= full.len() - HEADER);
+        assert!(cursor.prefix_key.capacity() <= encoded_size - HEADER);
     }
 
     #[test]

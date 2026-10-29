@@ -232,7 +232,11 @@ impl Table {
             return Err(corrupt("SST encoded frame exceeds expanded limit"));
         }
         let compaction_buffer_bytes = (frame + offsets) * 2
-            + expanded_frame_limit.unwrap_or(0)
+            + if expanded_frame_limit.is_some() {
+                frame
+            } else {
+                0
+            }
             + std::mem::size_of::<ReadBlock>();
         let read_prefix_hash =
             ReadPrefixHash::new(index.first().map_or(&[], |entry| entry.first.as_slice()));

@@ -47,6 +47,13 @@ def main():
             if args.selected_cases and label in args.selected_cases:
                 cases.append((label, dict(keys=16384, value=128, generations=n,
                     block=4096, merge_key_bytes=key_bytes, churn=True, merge_deletes=False)))
+    # Native prefix cursors budget encoded frames and one current key.
+    for n in [8, 16]:
+        for key_bytes in [8, 136]:
+            label = f"n{n}-k{key_bytes}-distinct-16k"
+            if args.selected_cases and label in args.selected_cases:
+                cases.append((label, dict(keys=32768, value=128, generations=n,
+                    block=16384, merge_key_bytes=key_bytes, churn=False, merge_deletes=False)))
     if args.selected_cases:
         selected = set(args.selected_cases)
         available = {name for name, _ in cases}

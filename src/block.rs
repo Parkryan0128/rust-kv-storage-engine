@@ -379,13 +379,12 @@ impl BlockCursor {
             self.prefix_key.clear();
             let key_len = self.block.record_start - HEADER - 8 + record.key.len();
             if self.prefix_key.capacity() < key_len {
-                let decoded_len =
-                    u32::from_le_bytes(self.block.bytes[HEADER..HEADER + 4].try_into().unwrap())
-                        as usize;
-                // Grow geometrically for ordinary suffixes, but never exceed
-                // the decoded-frame bound charged to compaction inputs.
+                // The encoded payload already contains the entire shared prefix
+                // and this suffix. A complete key fits within that payload, so
+                // no expanded-block allocation allowance is needed.
+                let maximum = self.block.bytes.len() - HEADER;
                 self.prefix_key
-                    .reserve_exact(key_len.next_power_of_two().min(decoded_len));
+                    .reserve_exact(key_len.next_power_of_two().min(maximum));
             }
             self.prefix_key
                 .extend_from_slice(&self.block.bytes[HEADER + 8..self.block.record_start]);

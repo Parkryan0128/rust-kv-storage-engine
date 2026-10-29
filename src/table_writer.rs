@@ -271,11 +271,7 @@ impl TableWriter {
             max_seq: self.max_seq,
             file_bytes: self.position + meta_len + FOOTER as u64,
             compaction_buffer_bytes: frame * 2
-                + if self.prefix_encoded {
-                    self.expanded_frame_limit
-                } else {
-                    0
-                }
+                + if self.prefix_encoded { frame } else { 0 }
                 + std::mem::size_of::<ReadBlock>(),
             cacheable: AtomicBool::new(true),
             indexed: true,
@@ -289,6 +285,35 @@ impl TableWriter {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn native_prefix_inputs_fit_full_fan_in_without_expanded_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.sst");
+        let mut writer = TableWriter::new(&path, 300, 16384, 10, false).unwrap();
+        for n in 0..300u64 {
+            let mut key = vec![b'x'; 128];
+            key.extend_from_slice(&n.to_be_bytes());
+            writer.push(&key, n + 1, Some(&[42; 128])).unwrap();
+        }
+        let published = writer.finish(&path, 1, 10).unwrap();
+        let reopened = Table::open(&path, 1).unwrap();
+        for table in [published, reopened] {
+            assert!(table.expanded_frame_limit.is_some());
+            assert_eq!(
+                crate::compaction::input_count(std::iter::repeat(table.compaction_buffer_bytes)),
+                crate::compaction::MAX_INPUTS
+            );
+            let mut cursor = TableCursor::new(Arc::new(table)).unwrap();
+            for n in 0..300u64 {
+                let record = cursor.current().unwrap();
+                assert_eq!(&record.key[128..], &n.to_be_bytes());
+                assert_eq!(record.value.unwrap(), &[42; 128]);
+                cursor.advance().unwrap();
+            }
+            assert!(cursor.current().is_none());
+        }
+    }
 
     #[test]
     fn alternating_large_and_small_output_preserves_records_and_reclaims_scratch() {
