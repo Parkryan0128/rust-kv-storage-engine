@@ -1,0 +1,60 @@
+name: sync-diagnostics
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: contains(github.event.head_commit.message, '[sync-diag]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 3
+      KV_BENCH_DIR: /tmp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: baseline
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the unchanged production reference
+        run: |
+          mkdir -p comparison-bin sync-diagnostics
+          cargo build --locked --release --manifest-path baseline/benchmarks/rocksdb-compare/Cargo.toml --bin workloads
+          cp baseline/benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-fsync
+      - name: Prepare an uncommitted experimental append-sync variant
+        run: |
+          python3 - <<'PY'
+          import difflib, hashlib, json
+          from pathlib import Path
+          source = Path("src/wal.rs")
+          before = source.read_text()
+          assert before == Path("baseline/src/wal.rs").read_text()
+          old = "write_timed!(WalSync, self.file.sync_all())?;"
+          new = "write_timed!(WalSync, self.file.sync_data())?;"
+          assert before.count(old) == 1
+          after = before.replace(old, new)
+          source.write_text(after)
+          evidence = dict(kind="experimental uncommitted Linux candidate; not production main",
+                          replacement=dict(before=old, after=new),
+                          baseline_wal_sha256=hashlib.sha256(before.encode()).hexdigest(),
+                          candidate_wal_sha256=hashlib.sha256(after.encode()).hexdigest())
+          Path("sync-diagnostics/candidate.json").write_text(json.dumps(evidence, indent=2))
+          Path("sync-diagnostics/candidate.patch").write_text("".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile="production/src/wal.rs", tofile="candidate/src/wal.rs")))
+          PY
+      - name: Verify and build the experimental variant
+        run: |
+          cargo fmt --check
+          cargo test --locked --release --all-features
+          cargo clippy --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads -- -D warnings
+          cargo build --locked --release --manifest-path benchmarks/rocksdb-compare/Cargo.toml --bin workloads
+          cp benchmarks/rocksdb-compare/target/release/workloads comparison-bin/workloads-fdatasync
+      - name: Alternate twelve trials of each sync policy
+        run: python3 benchmarks/rocksdb-compare/sync_policy.py sync-diagnostics
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-diagnostics
+          path: sync-diagnostics/
