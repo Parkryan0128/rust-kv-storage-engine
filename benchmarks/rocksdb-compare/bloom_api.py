@@ -76,6 +76,7 @@ rows = []
 with tempfile.TemporaryDirectory(prefix='kv-bloom-api-', dir=os.environ.get('KV_BENCH_DIR')) as tmp:
     root = Path(tmp)
     environment['filesystem'] = capture('findmnt', '-T', str(root), '-o', 'SOURCE,FSTYPE,OPTIONS')
+    environment["measurement_path_policy"] = "fixed-v1"
     (output / 'environment.json').write_text(json.dumps(environment, indent=2))
     with (output / 'results.jsonl').open('w') as sink:
         def run(name, mode, directory, config, case, trial, order):
@@ -103,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix='kv-bloom-api-', dir=os.environ.get('KV_
                 config = dict(profile, workload=workload, queries=500000, seed=7919 + trial * 104729)
                 offset = (trial - 1) % len(names)
                 for order, name in enumerate(names[offset:] + names[:offset], 1):
-                    copy = root / f'{case}-{trial}-{name}'
+                    copy = root / 'probe'
                     shutil.copytree(fixture, copy)
                     warm(copy)
                     run(name, 'read', copy, config, case, trial, order)

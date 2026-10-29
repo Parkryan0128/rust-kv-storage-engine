@@ -15,7 +15,7 @@ names = ["baseline", "engine", "rocksdb"]
 common = dict(keys=8192, value=128, batch=256, span=10, memtable=67108864, fixed=True)
 print("AUDIT_ENV " + json.dumps(dict(commit=capture("git", "rev-parse", "HEAD"),
     baseline=capture("git", "-C", "baseline", "rev-parse", "HEAD"), cpu=capture("lscpu"),
-    semantics="Normal binaries for throughput. Profiling builds for phase attribution only; no cross-comparison with normal rates. Warm OS cache; same harness and logical history.")), flush=True)
+    measurement_path_policy="fixed-v1", semantics="Normal binaries for throughput. Profiling builds for phase attribution only; no cross-comparison with normal rates. Warm OS cache; same harness and logical history.")), flush=True)
 
 def run(binary, mode, directory, config, label):
     result = subprocess.run([str(Path("comparison-bin", "workloads-" + binary).resolve()),
@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="kv-audit-", dir=os.environ.get("KV_BENC
             shift = (trial-1) % 3
             for order, name in enumerate(names[shift:] + names[:shift], 1):
                 label = f"{case}-{trial}-{name}"
-                row, _ = run(name, mode, root / label, config, label)
+                row, _ = run(name, mode, root / "probe", config, label)
                 row.update(backend=name, case=case, trial=trial, order=order)
                 rows.append(row)
                 print("AUDIT_RESULT " + json.dumps(row), flush=True)
@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix="kv-audit-", dir=os.environ.get("KV_BENC
         ]:
             for name in (["baseline", "engine"] if trial % 2 else ["engine", "baseline"]):
                 label = f"phases-{case}-{trial}-{name}"
-                _, timing = run(name + "-profile", mode, root / label, config, label)
+                _, timing = run(name + "-profile", mode, root / "probe", config, label)
                 assert timing is not None
                 samples = timing["samples"]
                 assert len(samples) == (2000 if mode == "snapshot-write" else 1024)

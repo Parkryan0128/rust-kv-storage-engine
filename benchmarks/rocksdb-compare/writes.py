@@ -47,6 +47,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kv-writes-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+        environment["measurement_path_policy"] = "fixed-v1"
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("WRITE_ENV " + json.dumps(environment), flush=True)
         with (args.output / "results.jsonl").open("w") as output:
@@ -61,7 +62,7 @@ def main():
                     for order, name in enumerate(names[backend_order:] + names[:backend_order], 1):
                         label = f"{case}-{trial+1}-{name}"
                         print("WRITE_CASE " + label, flush=True)
-                        done = subprocess.run([str(binaries[name]), "write", str(root / label), json.dumps(config)], text=True, capture_output=True, timeout=90)
+                        done = subprocess.run([str(binaries[name]), "write", str(root / "probe"), json.dumps(config)], text=True, capture_output=True, timeout=90)
                         (args.output / (label + ".log")).write_text(done.stdout + done.stderr)
                         if done.returncode:
                             print(done.stdout + done.stderr, flush=True)
@@ -77,7 +78,7 @@ def main():
                         output.write(json.dumps(row) + "\n")
                         output.flush()
                         print("WRITE_RESULT " + json.dumps(row), flush=True)
-                        shutil.rmtree(root / label)
+                        shutil.rmtree(root / "probe")
     summary = []
     for case, _ in cases:
         for name in names:

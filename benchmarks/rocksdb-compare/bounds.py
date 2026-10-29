@@ -38,6 +38,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kv-bounds-", dir=os.environ.get("KV_BENCH_DIR")) as temp:
         root = Path(temp)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+        environment["measurement_path_policy"] = "fixed-v1"
         (output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("BOUNDS_ENV " + json.dumps(environment), flush=True)
 
@@ -68,7 +69,7 @@ def main():
                     for rank, name in enumerate(names[order:] + names[:order], 1):
                         tag = f"{label}-{trial}-{name}"
                         print("BOUNDS_CASE " + tag, flush=True)
-                        directory = root / tag
+                        directory = root / "probe"
                         shutil.copytree(fixtures[config["generations"], config["value"], name], directory)
                         warm(directory)
                         stdout = run(name, "bounds-read", directory, config, tag)

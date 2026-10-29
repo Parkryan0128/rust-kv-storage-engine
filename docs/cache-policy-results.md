@@ -1,5 +1,7 @@
 # Owned-value reads and RocksDB cache policies
 
+Historical measurement: this run predates the fixed-path comparison correction. Its raw data is preserved; use the new fixed-path matrix for final claims. See [pathname control](measurement-paths.md).
+
 Measured on 2026-10-29 in [run 40875797178](https://github.com/Parkryan0128/rust-kv-storage-engine/actions/runs/40875797178), with engine revision `3b1296e9a5473e4bdfa0f2e314233ccc13c17df0` and pre-sharing baseline `1c9a3383a9e35bc7719344e85da22cbf0d384341`. This is a targeted diagnostic, not a claim that every database workload is faster.
 
 The same host (AMD EPYC 7763, Linux x86_64), 8 MiB total cache capacity, uncompressed data, independently owned Get results and rotated 12-trial order apply to every backend. RocksDB is 11.8.1 through rust-rocksdb 0.25.0. The default LRU is compared with a single-shard LRU and HyperClock with automatic entry-size estimation. Only the RocksDB cache policy changes between these cases. Engine repetitions across policies serve as additional controls.

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -32,6 +33,7 @@ def run(binary, directory, config, output, trace=None, mode="write"):
                if s.startswith("WORKLOAD_RESULT "))
     timing = next((json.loads(s.removeprefix("WRITE_TIMINGS ")) for s in done.stdout.splitlines()
                    if s.startswith("WRITE_TIMINGS ")), None)
+    shutil.rmtree(directory)
     return row, timing
 
 
@@ -93,13 +95,14 @@ def main():
                "filesystem": subprocess.check_output(["findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS"], text=True),
                "cpu": subprocess.check_output(["lscpu"], text=True),
                "limits": "Shared runner, 6 trials. Profiling and strace perturb timing. Synthetic allocation controls do not establish an engine fix or WAL compatibility."}
+        env["measurement_path_policy"] = "fixed-v1"
         (args.output / "environment.json").write_text(json.dumps(env, indent=2))
         print("DIAG_ENV " + json.dumps(env), flush=True)
         for trial in range(6):
             order = trial % 3
             for name in names[order:] + names[:order]:
                 label = f"batch32-{trial+1}-{name}"
-                row, timing = run(binaries[name], root / label, config, args.output / (label + ".log"))
+                row, timing = run(binaries[name], root / "probe", config, args.output / (label + ".log"))
                 emit("batch", {"backend": name, "trial": trial+1, "metrics": row["metrics"]})
                 if timing:
                     samples, phases = timing["samples"], timing["phases"]
@@ -112,12 +115,12 @@ def main():
         for trial in range(6):
             for allocation, sync in modes[trial:] + modes[:trial]:
                 label = f"probe-{trial+1}-{allocation}-{sync}"
-                row, raw = file_probe(root / label, allocation, sync)
+                row, raw = file_probe(root / "probe", allocation, sync)
                 (args.output / (label + ".json")).write_text(json.dumps(raw))
                 emit("file-probe", {"trial": trial+1, **row})
         for name in ["engine", "rocksdb"]:
             trace = args.output / (name + ".strace")
-            run(binaries[name], root / ("traced-" + name), config, args.output / (name + "-traced.log"), trace)
+            run(binaries[name], root / "probe", config, args.output / (name + "-traced.log"), trace)
             calls = []
             allocation = []
             for line in trace.read_text().splitlines():

@@ -19,6 +19,7 @@ def main():
     environment = {"commit": capture("git", "rev-parse", "HEAD"), "cpu": capture("lscpu"),
                    "binaries": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in binaries.items()},
                    "trials": 6, "limits": "Phase clocks perturb timing. Compare normal engine/RocksDB separately; phase percentages describe the instrumented engine only."}
+    environment["measurement_path_policy"] = "fixed-v1"
     (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
     common = dict(keys=20000, value=128, block=16384, cache=8388608, memtable=67108864,
                   span=10, batch=32, fixed=True, queries=2000)
@@ -31,7 +32,7 @@ def main():
                     order = (trial - 1) % len(names)
                     for rank, name in enumerate(names[order:] + names[:order], 1):
                         label = f"snapshot-{'narrow' if narrow else 'full'}-{trial}-{name}"
-                        row, timing = run(binaries[name], root / label, config,
+                        row, timing = run(binaries[name], root / "probe", config,
                                           args.output / (label + ".log"), mode="snapshot-write")
                         result = dict(case="narrow" if narrow else "full", trial=trial, backend=name,
                                       order=rank, config=config, metrics=row["metrics"])

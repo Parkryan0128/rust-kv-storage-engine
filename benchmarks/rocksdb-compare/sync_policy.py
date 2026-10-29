@@ -35,6 +35,7 @@ rows = []
 with tempfile.TemporaryDirectory(prefix="kv-sync-policy-", dir=os.environ.get("KV_BENCH_DIR")) as tmp:
     root = Path(tmp)
     environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+    environment["measurement_path_policy"] = "fixed-v1"
     (output / "environment.json").write_text(json.dumps(environment, indent=2))
     with (output / "results.jsonl").open("w") as sink:
         for trial in range(1, 13):
@@ -45,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="kv-sync-policy-", dir=os.environ.get("K
                 for position, name in enumerate(order, 1):
                     label = f"{case}-{trial}-{name}"
                     print("SYNC_CASE " + label, flush=True)
-                    run = subprocess.run([str(binaries[name]), "write", str(root / label), json.dumps(config)],
+                    run = subprocess.run([str(binaries[name]), "write", str(root / "probe"), json.dumps(config)],
                                          text=True, capture_output=True, timeout=90)
                     (output / (label + ".log")).write_text(run.stdout + run.stderr)
                     if run.returncode:
@@ -61,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix="kv-sync-policy-", dir=os.environ.get("K
                     rows.append(row)
                     sink.write(json.dumps(row) + "\n")
                     sink.flush()
-                    shutil.rmtree(root / label)
+                    shutil.rmtree(root / "probe")
 assert len(rows) == 96
 for case, _ in cases:
     paired = []

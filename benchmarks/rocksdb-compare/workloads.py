@@ -137,6 +137,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kv-workloads-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+        environment["measurement_path_policy"] = "fixed-v1"
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("WORKLOAD_ENV " + json.dumps(environment), flush=True)
         with (args.output / "results.jsonl").open("w") as output:
@@ -193,14 +194,14 @@ def main():
                         for order, name in enumerate(order_names, 1):
                             # Writable opens can rotate WALs/accumulate diagnostic
                             # logs. Keep every measured process at identical history.
-                            copy = root / f"read-{profile_index}-{trial}-{name}"
+                            copy = root / "probe"
                             shutil.copytree(fixtures[name], copy)
                             warm(copy)
                             run(name, "read-reopened" if args.reopens else "read", copy, config, case, label, trial, order)
                             shutil.rmtree(copy)
                     if profile["churn"] and not args.reads_only:
                         for order, name in enumerate(order_names, 1):
-                            copy = root / f"compact-{profile_index}-{trial}-{name}"
+                            copy = root / "probe"
                             shutil.copytree(fixtures[name], copy)
                             warm(copy)
                             run(name, "compact", copy, dict(profile, queries=query_count, seed=trial*7919), case, "compact", trial, order)
@@ -210,7 +211,7 @@ def main():
                     offset_backend = (trial - 1) % len(binaries)
                     order_names = list(binaries)[offset_backend:] + list(binaries)[:offset_backend]
                     for order, name in enumerate(order_names, 1):
-                        directory = root / f"write-{batch}-{trial}-{name}"
+                        directory = root / "probe"
                         config = {"keys": 64 if args.smoke else max(8192, batch * 1024), "value": 128, "batch": batch,
                                   "memtable": 67108864,
                                   "fixed": False, "workload": "put" if batch == 1 else "batch"}

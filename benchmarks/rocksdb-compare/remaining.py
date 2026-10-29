@@ -134,6 +134,7 @@ def main():
             "filesystem": capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS"),
             "binaries": {name: hashlib.sha256(p.read_bytes()).hexdigest() for name,p in binaries.items()},
             "semantics": "Same total cache/owned values/sync WAL. Baseline/current reuse identical SST and WAL bytes. OS file cache warmed. Recovery fixture exits without destructors after durable writes; recover_to_memtable=true enables RocksDB avoid_flush_during_recovery and asserts zero SST files after open on all backends. Memory/mixed setup outside timers; RSS includes setup. Read-mode throughput excludes worker startup/join, per-query timers and full validation; validation and warm latency are separate seeded passes. Other diagnostic modes retain validation/timers as reported. All include RNG/drop. Frozen internal microbenchmark is separate, not RocksDB-equivalent."}
+        environment["measurement_path_policy"] = "fixed-v1"
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("REMAINING_ENV " + json.dumps(environment), flush=True)
         def run(name, mode, directory, config, label, trial, order):
@@ -174,7 +175,7 @@ def main():
                     order_shift = (trial - 1) % len(names)
                     for order, name in enumerate(names[order_shift:] + names[:order_shift], 1):
                         print(f"REMAINING_CASE {label} trial={trial} backend={name}", flush=True)
-                        directory = root / f"run-{label}-{trial}-{name}"
+                        directory = root / "probe"
                         if preparation:
                             shutil.copytree(fixtures[label, name], directory)
                             warm(directory)

@@ -309,3 +309,25 @@ report. Instrumented percentages locate costs; they are not speed scores.
 Use `[read-layout-latest] [baseline:<sha>]` for a single standard-runner
 repeat of the same path control. This requests `ubuntu-latest`, not a particular
 CPU; retain its machine metadata and do not pool different hosts.
+
+
+### Fixed measurement pathname (v1)
+
+All normal comparison runners now give every backend exactly the same private
+DB pathname, reused sequentially. Log labels still record backend, case and
+trial. Copied fixtures remain independently synced and OS-warmed. The large
+read-only runner temporarily renames a fixture into that path and restores it
+in a finally block, avoiding a full dataset copy per trial; directory sync and
+warming happen before measurement. Fixture-preservation tests cover success,
+child failure and an existing destination. Environment records identify this
+methodology as `measurement_path_policy: fixed-v1`.
+
+This corrects a measured benchmark bias: on EPYC 7763 the exact same executable
+and fixture took about 64 ms versus 53 ms for 2,000 ten-row scans of 16 KiB
+values when only the DB pathname changed. With one fixed pathname, the original
+and current engine were statistically indistinguishable in that control.
+Path-dependent allocation layout is a possible mechanism, not a demonstrated
+machine-code defect. Preserve older raw measurements, but do not attribute that
+native-path difference to a source optimization or compare absolute timings
+across the two methodologies. The explicit layout diagnostic retains its native
+paths so the issue remains reproducible.

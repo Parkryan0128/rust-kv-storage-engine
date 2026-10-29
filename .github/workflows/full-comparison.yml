@@ -54,6 +54,7 @@ jobs:
           cargo test --locked --release
           cargo test --locked --release --all-features
           python3 -m compileall -q benchmarks/rocksdb-compare
+          python3 -m unittest discover -s benchmarks/rocksdb-compare -p test_measurement_paths.py
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - uses: actions/cache@v4
         with:

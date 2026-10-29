@@ -78,6 +78,7 @@ cases = [
 with tempfile.TemporaryDirectory(prefix="kv-focused-", dir=os.environ.get("KV_BENCH_DIR")) as tmp:
     root = Path(tmp)
     environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+    environment["measurement_path_policy"] = "fixed-v1"
     (output / "environment.json").write_text(json.dumps(environment, indent=2))
     print("FOCUSED_ENV " + json.dumps(environment), flush=True)
     with (output / "durable.jsonl").open("w") as sink:
@@ -89,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix="kv-focused-", dir=os.environ.get("KV_BE
                 for order, name in enumerate(names[offset:] + names[:offset], 1):
                     label = f"{case}-{trial}-{name}"
                     print("FOCUSED_CASE durable " + label, flush=True)
-                    done = subprocess.run([str(binaries[name]), "overwrite-keys", str(root / label),
+                    done = subprocess.run([str(binaries[name]), "overwrite-keys", str(root / "probe"),
                                            json.dumps(config)], text=True, capture_output=True, timeout=120)
                     (output / (label + ".log")).write_text(done.stdout + done.stderr)
                     if done.returncode:
@@ -107,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="kv-focused-", dir=os.environ.get("KV_BE
                     sink.write(json.dumps(row) + "\n")
                     sink.flush()
                     print("FOCUSED_RESULT " + json.dumps(row), flush=True)
-                    shutil.rmtree(root / label)
+                    shutil.rmtree(root / "probe")
 
 
 def identity(row):

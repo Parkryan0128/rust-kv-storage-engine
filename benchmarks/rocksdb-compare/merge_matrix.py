@@ -52,6 +52,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kv-merge-matrix-", dir=os.environ.get("KV_BENCH_DIR")) as root:
         root = Path(root)
         environment["filesystem"] = capture("findmnt", "-T", str(root), "-o", "SOURCE,FSTYPE,OPTIONS")
+        environment["measurement_path_policy"] = "fixed-v1"
         (args.output / "environment.json").write_text(json.dumps(environment, indent=2))
         print("MERGE_MATRIX_ENV " + json.dumps(environment), flush=True)
 
@@ -89,7 +90,7 @@ def main():
                     for order, name in enumerate(names[order_offset:] + names[:order_offset], 1):
                         label = f"{case}-{trial+1}-{name}"
                         print("MERGE_MATRIX_CASE " + label, flush=True)
-                        directory = root / label
+                        directory = root / "probe"
                         shutil.copytree(fixtures[case][name], directory)
                         warm(directory)
                         stdout = run(name, "compact-merge", directory, config, label)

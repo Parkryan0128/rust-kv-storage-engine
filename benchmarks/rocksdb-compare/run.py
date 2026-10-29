@@ -8,6 +8,7 @@ import platform
 import subprocess
 import tempfile
 import zlib
+from measurement_paths import fixed_fixture_path
 
 
 def capture(*args):
@@ -63,6 +64,7 @@ def main():
             name: {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
             for name, p in binaries.items()
         },
+        "measurement_path_policy": "fixed-v1",
         "settings": {
             "rocksdb": "11.8.1 (rust-rocksdb 0.25.0)",
             "block_cache_bytes": 8 * 1024 * 1024,
@@ -168,15 +170,15 @@ def main():
                     for block_bytes in blocks:
                         directories, env = fixtures[block_bytes]
                         for position, name in enumerate(order, 1):
-                            directory = directories[name]
-                            warm_files(directory)
                             label = f"{case}-{block_bytes}-{trial}-{name}"
                             print(f"READ_CASE {label}", flush=True)
-                            text = logged(
-                                [str(binaries[name]), "read", str(directory), str(keys),
-                                 str(size), str(tables), str(queries), str(seed)],
-                                env, output / f"{label}.log", 120,
-                            )
+                            with fixed_fixture_path(directories[name], root) as directory:
+                                warm_files(directory)
+                                text = logged(
+                                    [str(binaries[name]), "read", str(directory), str(keys),
+                                     str(size), str(tables), str(queries), str(seed)],
+                                    env, output / f"{label}.log", 120,
+                                )
                             seen = []
                             for line in text.splitlines():
                                 if line.startswith("READ_REPORT "):
