@@ -1,24 +1,19 @@
 # Rust Key-Value Storage Engine
 
-An embedded key-value storage engine written in Rust.
+An embedded, persistent key-value store built in Rust, with crash recovery, atomic batches, and snapshot scans.
 
-It writes changes to a log before updating memory, flushes sorted tables to disk, and merges them in the background. Reads use Bloom filters and a block cache.
+Writes go to a durable log and memory, then move into sorted files on disk. Background compaction merges those files. Reads check memory first, then use Bloom filters and a block cache to find data on disk.
 
-[Benchmarks and compaction results](docs/benchmarks.md)
+## Quick start
 
-## How it works
+Requires **Rust 1.85+** and **Linux or macOS** with a local filesystem.
 
-The engine:
+Add the library to your application's `Cargo.toml` (pin a reviewed commit for deployment):
 
-1. Appends each write or deletion to the write-ahead log and syncs it.
-2. Updates the ordered, copy-on-write paged memtable.
-3. Rotates to a new memtable before the next write once the memory or WAL limit is reached.
-4. Flushes frozen memtables to sorted SSTables in a background thread.
-5. Checks memory first on reads, then uses Bloom filters, block indexes, and the LRU cache to find records in SSTables.
-6. Merges similarly sized SSTables, keeping the newest record per key. Partial merges retain tombstones; full merges can remove them.
-7. Recovers on open by loading the manifest and replaying newer WAL records.
-
-Open a database directory:
+```toml
+[dependencies]
+rust-kv-storage-engine = { git = "https://github.com/Parkryan0128/rust-kv-storage-engine" }
+```
 
 ```rust
 use rust_kv_storage_engine::{Engine, Result};
@@ -34,234 +29,51 @@ fn main() -> Result<()> {
 }
 ```
 
-`get()` returns an owned, immutable `Bytes` value that remains valid after
-writes, cache eviction, compaction, or dropping the engine. Large single-record
-values may share validated storage; retained values are outside the block-cache
-capacity. See [value ownership](docs/storage-format.md) for memory details.
+Use `Engine::new()` for an in-memory store. Clone an engine to share it across threads; only one engine can open a database directory at a time.
 
-`Engine::new()` creates an in-memory store. `Engine::clone()` shares the same database and can be used across threads. Only one engine can open a database directory at a time.
+## Features
 
-In-memory deletes remove keys immediately. Persistent deletes retain tombstones until compaction can safely discard them, so older on-disk values do not reappear.
+- **Persistence and recovery** — writes are synced to the write-ahead log before returning.
+- **Atomic batches** — commit several puts and deletes together.
+- **Snapshot scans** — read a sorted range as it existed when the scan began.
+- **Background compaction** — merge sorted files and safely reclaim obsolete records.
+- **Read caching** — Bloom filters skip irrelevant files; a block cache speeds up repeated reads.
 
-Use it as a Rust library by adding the repository to your application's `Cargo.toml` (pin a reviewed commit for deployment):
+See the [usage guide](docs/usage.md) for batches, scans, and manual flushes.
 
-```toml
-[dependencies]
-rust-kv-storage-engine = { git = "https://github.com/Parkryan0128/rust-kv-storage-engine" }
-```
+## Try the demo
 
-There is no general-purpose `put/get/delete` CLI. The executable targets are the browser demo, benchmark reports, and a test-only crash worker.
-
-Flush pending records to SSTables and merge them explicitly:
-
-```rust
-db.flush()?;
-db.compact()?;
-```
-
-
-Explicit `compact()` flushes the writes before its writer barrier and requests one
-full merge, without first draining redundant automatic merges. An unchanged
-single SST already produced by a full merge during this open is reused, keeping
-its file and cache entries. This proof is cleared on reopen; the first explicit
-compaction then still rewrites the SST with the current options and format.
-New SST publication invalidates the proof.
-
-Persistent writes are synced to the WAL before returning. After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
-
-Commit several puts and deletes atomically with `WriteBatch`:
-
-```rust
-use rust_kv_storage_engine::WriteBatch;
-
-let mut batch = WriteBatch::new();
-batch.put(b"name", b"Ryan");
-batch.put(b"status", b"active");
-batch.delete(b"old-name");
-db.write_batch(batch)?;
-```
-
-A persistent batch uses one checksummed WAL frame and one `sync_all()`, then
-publishes all operations together. Operations run in insertion order; the last
-operation on a repeated key wins. Empty batches do nothing on a healthy engine.
-Validation rejects the whole batch before writing. After an I/O failure or crash,
-recovery includes the whole batch or none of it; a failed call may still have
-committed. Separate `get()` calls are not a snapshot or a read/write transaction.
-
-Each entry obeys the configured key/value limits, and the total encoded batch is
-limited to 64 MiB (including headers). A batch is never split across memtables and
-can exceed the memtable target. Older binaries cannot replay WALs containing
-batches; keep a closed-database backup before upgrading if rollback is needed.
-
-Read a range in ascending bytewise key order:
-
-```rust
-for row in db.scan(b"user:1".as_slice()..b"user:9".as_slice())?.take(100) {
-    let (key, value) = row?;
-    // Use this key/value pair.
-}
-```
-
-`scan(start..end)` includes the start and excludes the end. Use `..=end` for an
-inclusive end, `start..` or `..end` for an open end, and `scan(..)` for all keys.
-A pair of `std::ops::Bound` values also supports an excluded start. Reversed
-bounds return `InvalidConfig`; equal endpoints are empty unless both are included.
-Ordering uses raw bytes, so `user:10` sorts before `user:2`.
-
-Each owned `Scan` captures a snapshot when created, including whole atomic batches.
-A range proven empty at creation retains no database handles and stays empty
-even when later writes add keys in that range.
-Later puts, deletes, flushes and compactions do not change its results. Duplicate
-versions are merged and deleted keys are omitted. SST blocks are read lazily,
-bypassing the point-read cache. Each item is a `Result`; an I/O or corruption error
-ends the iterator after reporting the error, possibly after some successful rows.
-
-Snapshot creation shares overlapping groups of active/frozen memory pages and
-captures SST handles under the state lock. One group contains at most 64 pages;
-creation clones group handles instead of touching every page or matching key.
-Keys are copied when consumed; completed groups and sources are released. A
-boundary slice of at most four pages retains only those pages; larger boundary
-groups can still retain pages outside the requested range. Shared-page updates
-copy a bounded delta (16–32 records, depending on page occupancy), sharing unchanged keys and values.
-Once a base is exclusively owned again, the next update folds pending deltas in place and releases superseded payloads. Sorted appends fill pages before allocating the next page; middle inserts retain balanced splitting.
-Shared delta folds copy value handles while keeping the ordered keys and routing
-prefixes shared. Structural edits also detach the key arrays, so retaining a snapshot
-can still increase write latency and memory use. Pages are bounded by 256 records and 64 KiB of keys,
-except that one larger key occupies its own page.
-The memory cursor checks whether each whole page is within the range. On such
-pages, live-only traversal skips tombstones without loading their keys or
-repeating the bound comparison. Partial boundary pages keep per-row checks so
-short scans do not pay for an extra upper-bound search.
-Iteration buffers one block and candidate record per SST, rather than all disk
-results. `.take(n)` limits consumption; `.collect()` allocates the full result.
-Drop or exhaust scans promptly: they retain the database lock and old SST handles,
-which can delay reclaiming disk space after compaction. They also keep selected
-memory values alive. Transactions and replication are not implemented.
-
-`Stats::*_memtable_bytes` are logical rotation charges (key/value lengths plus
-48 bytes per entry), not RAM usage. `*_memtable_allocated_bytes` estimate reachable
-page/directory capacities and base/delta payload lengths. They exclude allocator
-headers, spare `Bytes` backing capacity, and old pages held only by scans; shared
-payload can also be counted more than once. Use process RSS/peak RSS for total
-memory comparisons. Use `Engine::activity_stats()` for frequent counter polling; it skips page allocation estimates. `stats()` retains the detailed estimates for compatibility. Both release the state lock before sampling cache shards, so cache and state counters are not one atomic snapshot. Allocation estimates still visit pages. The rotation policy continues to use logical charges.
-
-Background compaction uses size tiers to avoid rewriting large SSTs with every small flush. `compact()` still merges all tables and reclaims tombstones. `Options::compaction_style` can select `CompactionStyle::Full` to merge all tables. Size tiers trade lower write amplification for more retained versions and potentially slower reads.
-
-[Storage format and configuration](docs/storage-format.md)
-
-## Local demo
-
-Use the browser demo to write keys, inspect memory and SST files, and compare compaction policies:
+From a checkout of this repository:
 
 ```bash
 cargo run --locked --release --example demo
 ```
 
-Open **http://127.0.0.1:8080**. The server binds to loopback and uses a temporary database for each launch. **Close & reopen database** keeps the current files; stopping the server ends the session.
+Open [localhost:8080](http://127.0.0.1:8080) to write keys, inspect memory and disk files, and compare compaction policies. Each launch uses a temporary database. **Close & reopen database** keeps the current files; stopping the server ends the session.
 
-## Project structure
-
-```text
-src/        Engine, memtable, WAL, SSTables, compaction, and cache
-src/bin/    Crash-test subprocess
-tests/      API, recovery, corruption, concurrency, and stress tests
-benches/    Criterion benchmarks
-examples/   Local browser demo, latency and compaction reports
-docs/       Storage format and benchmark results
-```
-
-## Build
-
-Requirements:
-
-- Rust 1.85 or newer
-- Linux or macOS with a local filesystem
+## Build and test
 
 ```bash
 cargo build --locked
-```
-
-## Tests
-
-```bash
 cargo test --locked --all-features
-cargo test --locked --release --all-features
 ```
 
-Run the extended tests: five million overwrites of 100 keys, and growth to one million distinct keys with reopen, update, delete, and compaction checks:
+Tests cover recovery, corruption, concurrency, batches, and snapshots. See the [testing guide](docs/testing.md) for release tests, stress tests, lints, and benchmark commands.
 
-```bash
-cargo test --locked --release --all-features --test stress -- --ignored --nocapture
-```
+## Before using it
 
-To run the growing-database test on a chosen local disk, set `KV_STRESS_DIR` to an existing scratch directory on that disk:
+- After a write or maintenance I/O error, drop all handles and reopen the database. A failed write may still appear after recovery.
+- Drop or exhaust scans promptly: they can retain memory, old files, and the database directory lock.
+- Use a local filesystem. Network filesystems are unsupported, and physical power loss has not been tested.
+- Transactions and replication are not implemented. Keep the test-only `fault-injection` feature disabled in applications.
 
-```bash
-KV_STRESS_DIR=/mnt/test-disk/kv-scratch cargo test --locked --release --test stress million_distinct_keys -- --ignored --nocapture
-```
+## Documentation
 
-The test creates and cleans up its own temporary database there. This tests filesystem I/O and logical recovery, not physical power loss. Normal tests also check 20,000 distinct keys and compaction of 64 valid 1 MiB keys whose combined SST index exceeds 64 MiB. The dedicated million-key CI job runs on manual dispatch. The extended job runs both large acceptance tests on manual dispatch or an explicit `[extended-stress]` main-branch commit marker.
-
-Check formatting and lints:
-
-```bash
-cargo fmt --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-```
-
-Check the local demo:
-
-```bash
-cargo build --locked --release --example demo
-python3 scripts/test_demo.py
-```
-
-Tests cover crash recovery, corruption, concurrent operations, and compaction, including a merge that encounters corrupt input without publishing partial output or deleting its sources. They also check memory reclamation, cache eviction and accounting, interrupted/short I/O, empty keys and values, and directory locks through symlinks. CI checks all targets and features with Rust 1.85.0 in addition to stable Rust on Linux and macOS.
-
-Process-kill tests leave the OS cache intact; physical power loss has not been tested. The `fault-injection` feature is for tests; leave it disabled in applications.
-
-Batch tests cover repeated keys, validation and sequence limits, concurrent
-writes/flushes, every truncation boundary in a small WAL batch, corrupt batch
-payloads, and subprocess crashes or injected I/O errors before/after WAL sync
-and during memory application. They also cover acknowledged batches across
-flush/compaction publication failures, maintenance errors racing with writes,
-and sequence preservation after compacting a delete-only batch to an empty SST.
-
-Range tests cover binary and empty keys, inclusive/exclusive bounds, duplicate
-versions and tombstones across memory and disk, snapshots during writes and
-compaction, legacy SST formats, deferred corruption/I/O errors, cache isolation,
-and comparison with a filtered `BTreeMap` through batches, flushes and reopens.
-
-## Benchmarks
-
-RocksDB comparisons and extended acceptance tests are opt-in. Ordinary pushes
-run correctness checks; explicit commit markers or manual dispatch request the
-longer jobs. The [comparison guide](benchmarks/rocksdb-compare/README.md) describes
-`[full-comparison]`, `[performance-regression-loop]`, and exact baseline markers.
-
-A separate [bounded workload suite](benchmarks/rocksdb-compare/WORKLOADS.md) covers
-misses, hot keys, concurrent readers, ranges, durable batches and compaction, with
-memory/disk metrics. Default runs use four repetitions against RocksDB, or six
-when an explicit engine baseline is included. Its workflow is
-opt-in through manual dispatch or a `[perf-check]` main-branch commit message.
-
-Run the Criterion benchmarks:
-
-```bash
-cargo bench --locked --bench engine
-```
-
-Print throughput and p50/p99 latency as CSV:
-
-```bash
-cargo run --locked --release --example bench_report
-```
-
-Compare compaction policies on append, hot-set, and delete-heavy workloads:
-
-```bash
-cargo run --locked --release --example compaction_report -- 3
-```
+- [Usage](docs/usage.md) — values, batches, scans, and maintenance
+- [Storage design and format](docs/storage-format.md) — recovery, file compatibility, and configuration
+- [Memory and snapshots](docs/memory.md) — ownership, retention, and statistics
+- [Tests and benchmarks](docs/testing.md) — commands and CI coverage
+- [Performance results](docs/benchmarks.md) — RocksDB comparisons, compaction results, and measurement limits
 
 ## Contact
 
